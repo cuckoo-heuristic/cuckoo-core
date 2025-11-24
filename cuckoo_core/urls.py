@@ -21,8 +21,12 @@ from django.urls import path, include
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    path('', include('task.urls')),
-    path('', include('rsu.urls')),
-    path('', include('vehicle.urls')),
+    path('task/', include('task.urls')),
+    path('rsu/', include('rsu.urls')),
+    path('vehicle/', include('vehicle.urls')),
+    path('api/task/', include('task.urls')),
+    path('api/rsu/', include('rsu.urls')),
+    path('api/vehicle/', include('vehicle.urls')),
+
 
 ]

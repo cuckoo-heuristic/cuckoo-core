@@ -1,6 +1,7 @@
 from django.urls import path
-from .views import RSUListAPIView
+from .views import RSUListAPIView,RSUDetailAPIView
 
 urlpatterns = [
-    path('rsu/', RSUListAPIView.as_view(), name='rsu'),
+    path('', RSUListAPIView.as_view(), name='rsu'),
+    path('<int:pk>/', RSUDetailAPIView.as_view(), name='rsu-detail'),
 ]
