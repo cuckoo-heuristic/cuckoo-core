@@ -24,9 +24,6 @@ urlpatterns = [
     path('task/', include('task.urls')),
     path('rsu/', include('rsu.urls')),
     path('vehicle/', include('vehicle.urls')),
-    path('api/task/', include('task.urls')),
-    path('api/rsu/', include('rsu.urls')),
-    path('api/vehicle/', include('vehicle.urls')),
-
+    path('route/', include('routing.urls')),
 
 ]
