@@ -39,13 +39,18 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
 
     'rest_framework',
+<<<<<<< HEAD
     'drf_spectacular',
+=======
+    'channels',
+>>>>>>> socket
     
     'rsu',
     'vehicle',
     'task',
     'routing',
-    'run'
+    'run',
+    'websocket'
 ]
 
 MIDDLEWARE = [
@@ -76,6 +81,7 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'cuckoo_core.wsgi.application'
+ASGI_APPLICATION = "cuckoo_core.asgi.application"
 
 
 # Database
@@ -129,7 +135,12 @@ STATIC_URL = 'static/'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
-
 REST_FRAMEWORK = {
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+}
+
+CHANNEL_LAYERS = {
+    "default": {
+        "BACKEND": "channels.layers.InMemoryChannelLayer"
+    }
 }
