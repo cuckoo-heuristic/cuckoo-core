@@ -12,7 +12,7 @@ class Vehicle(models.Model):
 
     range = models.FloatField()
 
-    tower = models.ForeignKey(
+    rsu = models.ForeignKey(
         RSU,
         on_delete=models.SET_NULL,
         null=True,
