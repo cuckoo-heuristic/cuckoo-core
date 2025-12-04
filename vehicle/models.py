@@ -3,18 +3,12 @@ from rsu.models import RSU
 
 class Vehicle(models.Model):
     name = models.CharField(max_length=100)
-
-    origin_lat = models.FloatField()
-    origin_lon = models.FloatField()
-
-    destination_lat = models.FloatField()
-    destination_lon = models.FloatField()
-
-    range = models.FloatField()
-
-    rsu = models.ForeignKey(
-        RSU,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True
-    )
+    lat = models.FloatField()
+    lon = models.FloatField()
+    path = models.JSONField(default=list)
+    height = models.FloatField()
+    speed = models.FloatField()
+    cpu_capacity = models.IntegerField()
+    cache_capacity = models.IntegerField()
+    is_mission = models.BooleanField(default=True)
+   
