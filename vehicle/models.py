@@ -1,5 +1,4 @@
 from django.db import models
-from rsu.models import RSU
 
 class Vehicle(models.Model):
     name = models.CharField(max_length=100)

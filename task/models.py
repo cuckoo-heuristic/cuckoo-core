@@ -4,8 +4,8 @@ from django.utils import timezone
 from rsu.models import ServiceProvider
 
 class TaskType(models.Model):
-    name = models.CharField(max_length=100)
-    description = models.TextField()
+    name = models.CharField(max_length=20)
+    description = models.TextField(max_length=100)
     size = models.IntegerField()
 
 class ApplicationType(models.Model):
@@ -22,7 +22,7 @@ class Application(models.Model):
     is_progress = models.BooleanField(default=True)
 
 class Task(models.Model):
-    index = models.IntegerField()
+    index = models.TextField()
     application = models.ForeignKey(Application, on_delete=models.CASCADE, null=True, blank=True)
     task_type = models.ForeignKey(TaskType, on_delete=models.CASCADE, null=True, blank=True)
     workload_cycles = models.IntegerField()
