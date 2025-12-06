@@ -1,8 +1,9 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from .models import (RSU,RSUVehicle,ServiceProvider)
-from .serializer import (RSUSer,RSUVehicleSer,ServiceProviderSer)
+from .models import (RSU,RSUVehicle,ServiceProvider,Resource)
+from .serializer import (RSUSer,RSUVehicleSer,ServiceProviderSer,ResourceSer)
+from drf_spectacular.utils import extend_schema
 # /////////////////////////
 class BaseListAPI(APIView):
     model = None
@@ -55,28 +56,71 @@ class BaseDetailAPI(APIView):
         obj.delete()
         return Response({"message": "Deleted"}, status=204)
 # //////////////////////
+
 class RSUListAPI(BaseListAPI):
     model = RSU
     serializer = RSUSer
 
+    @extend_schema(request=RSUSer, responses=RSUSer)
+    def post(self, request):
+        return super().post(request)
+
 class RSUDetailAPI(BaseDetailAPI):
     model = RSU
     serializer = RSUSer
+
+    @extend_schema(request=RSUSer, responses=RSUSer)
+    def patch(self, request, pk):
+        return super().patch(request, pk)
+
 
 # //////////////////////
 class RVListAPI(BaseListAPI):
     model = RSUVehicle
     serializer = RSUVehicleSer
 
+    @extend_schema(request=RSUVehicleSer, responses=RSUVehicleSer)
+    def post(self, request):
+        return super().post(request)
+
 class RVDetailAPI(BaseDetailAPI):
     model = RSUVehicle
     serializer = RSUVehicleSer
+
+    @extend_schema(request=RSUVehicleSer, responses=RSUVehicleSer)
+    def patch(self, request, pk):
+        return super().patch(request, pk)
 
 # //////////////////////
 class SPListAPI(BaseListAPI):
     model = ServiceProvider
     serializer = ServiceProviderSer
 
+    @extend_schema(request=ServiceProviderSer, responses=ServiceProviderSer)
+    def post(self, request):
+        return super().post(request)
+
 class SPDetailAPI(BaseDetailAPI):
     model = ServiceProvider
     serializer = ServiceProviderSer
+
+    @extend_schema(request=ServiceProviderSer, responses=ServiceProviderSer)
+    def patch(self, request, pk):
+        return super().patch(request, pk)
+
+# //////////////////////
+class ResourceListAPI(BaseListAPI):
+    model = Resource
+    serializer = ResourceSer
+
+    @extend_schema(request=ResourceSer, responses=ResourceSer)
+    def post(self, request):
+        return super().post(request)
+
+class ResourceDetailAPI(BaseDetailAPI):
+    model = Resource
+    serializer = ResourceSer
+
+    @extend_schema(request=ResourceSer, responses=ResourceSer)
+    def patch(self, request, pk):
+        return super().patch(request, pk)

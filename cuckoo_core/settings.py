@@ -47,7 +47,6 @@ INSTALLED_APPS = [
     'task',
     'routing',
     'run',
-    'websocket'
 ]
 
 MIDDLEWARE = [

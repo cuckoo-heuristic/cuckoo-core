@@ -1,25 +1,17 @@
 import requests
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from vehicle.models import Vehicle
 
 class RouteAPIView(APIView):
     def post(self, request):
 
-        vehicle_id = request.data.get("vehicle_id")
+        origin_lat = request.data.get("origin_lat")
+        origin_lon = request.data.get("origin_lon")
+        dest_lat = request.data.get("dest_lat")
+        dest_lon = request.data.get("dest_lon")
 
-        if not vehicle_id:
-            return Response({"error": "id?"}, status=400)
-
-        try:
-            vehicle = Vehicle.objects.get(id=vehicle_id)
-        except Vehicle.DoesNotExist:
-            return Response({"error": "The vehicle was not found!"}, status=404)
-
-        origin_lat = vehicle.origin_lat
-        origin_lon = vehicle.origin_lon
-        dest_lat = vehicle.destination_lat
-        dest_lon = vehicle.destination_lon
+        if not all([origin_lat, origin_lon, dest_lat, dest_lon]):
+            return Response({"error": "enter lat and lon"}, status=400)
 
         url = 'https://api.neshan.org/v4/direction'
         headers = {
@@ -34,7 +26,7 @@ class RouteAPIView(APIView):
         data = response.json()
 
         if "routes" not in data:
-            return Response({"error": "مسیر پیدا نشد"}, status=400)
+            return Response({"error": "not found"}, status=400)
 
         formatted_routes = []
 

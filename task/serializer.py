@@ -17,9 +17,19 @@ class ApplicationTypeSer(serializers.ModelSerializer):
         fields = '__all__'
 
 class ApplicationSer(serializers.ModelSerializer):
+    deadline = serializers.ReadOnlyField() 
+
     class Meta:
         model = Application
-        fields = '__all__'   
+        fields = [
+            'id',
+            'vehicle_id',
+            'application_type_id',
+            'start_at',
+            'end_at',
+            'is_progress',
+            'deadline',
+        ]
 
 class TaskExecutionSer(serializers.ModelSerializer):
     class Meta:
