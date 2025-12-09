@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Task, TaskType, Application, ApplicationType, TaskExecution, TaskDependency, cache
+from .models import Task, TaskType, Application, ApplicationType, TaskExecution, TaskDependency
 
 class TaskSer(serializers.ModelSerializer):
     class Meta:
@@ -41,7 +41,3 @@ class TaskDependencySer(serializers.ModelSerializer):
         model = TaskDependency
         fields = '__all__'
 
-class CacheSer(serializers.ModelSerializer):
-    class Meta:
-        model = cache
-        fields = '__all__'

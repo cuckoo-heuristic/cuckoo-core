@@ -1,7 +1,6 @@
 from django.db import models
 from vehicle.models import Vehicle
 from django.utils import timezone
-from rsu.models import ServiceProvider
 
 class TaskType(models.Model):
     name = models.TextField(max_length=20,unique=True)
@@ -32,7 +31,7 @@ class Task(models.Model):
 
 class TaskExecution(models.Model):
     application_id = models.ForeignKey(Application, on_delete=models.CASCADE, null=True, blank=True)
-    sp_id = models.ForeignKey(ServiceProvider, on_delete=models.CASCADE, null=True, blank=True)
+    provider = models.ForeignKey("rsu.ServiceProvider", on_delete=models.CASCADE)
     task_id = models.ForeignKey(Task, on_delete=models.CASCADE, null=True, blank=True)
     start_time = models.DateTimeField(default=timezone.now)
     end_time = models.DateTimeField(null=True, blank=True)
@@ -43,6 +42,4 @@ class TaskDependency(models.Model):
     parent_task_id = models.ForeignKey(Task, on_delete=models.CASCADE, related_name="parents", null=True, blank=True)
     child_task_id = models.ForeignKey(Task, on_delete=models.CASCADE, related_name="children", null=True, blank=True)
 
-class cache(models.Model):
-    sp_id = models.ForeignKey(ServiceProvider, on_delete=models.CASCADE, null=True, blank=True)
-    task_type_id = models.ForeignKey(TaskType, on_delete=models.CASCADE, null=True, blank=True)
+

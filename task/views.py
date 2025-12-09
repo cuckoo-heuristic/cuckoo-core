@@ -1,8 +1,8 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from .models import (Task, TaskType, Application, ApplicationType, TaskExecution, TaskDependency, cache)
-from .serializer import (TaskSer, TaskTypeSer, ApplicationSer,ApplicationTypeSer, TaskExecutionSer,TaskDependencySer,CacheSer)
+from .models import (Task, TaskType, Application, ApplicationType, TaskExecution, TaskDependency)
+from .serializer import (TaskSer, TaskTypeSer, ApplicationSer,ApplicationTypeSer, TaskExecutionSer,TaskDependencySer)
 from drf_spectacular.utils import extend_schema
 # /////////////////////////
 class BaseListAPI(APIView):
@@ -153,18 +153,3 @@ class TaskDepDetailAPI(BaseDetailAPI):
     def patch(self, request, pk):
         return super().patch(request, pk)
 # //////////////////////
-class CacheListAPI(BaseListAPI):
-    model = cache
-    serializer = CacheSer
-
-    @extend_schema(request=CacheSer, responses=CacheSer)
-    def post(self, request):
-        return super().post(request)
-
-class CacheDetailAPI(BaseDetailAPI):
-    model = cache
-    serializer = CacheSer
-
-    @extend_schema(request=TaskDependencySer, responses=TaskDependencySer)
-    def patch(self, request, pk):
-        return super().patch(request, pk)

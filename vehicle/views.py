@@ -72,3 +72,11 @@ class VehicleDetailAPIView(BaseDetailAPI):
     def patch(self, request, pk):
         return super().patch(request, pk)
 
+class VehicleMissionStatusAPI(APIView):
+    def get(self, request, pk):
+        try:
+            vehicle = Vehicle.objects.get(pk=pk)
+        except Vehicle.DoesNotExist:
+            return Response({"error": "Vehicle not found"}, status=404)
+
+        return Response({"is_mission": vehicle.is_mission})

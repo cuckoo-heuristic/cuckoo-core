@@ -1,7 +1,6 @@
 from django.urls import path
 from .views import (TaskListAPI, TaskDetailAPI, TaskTypeListAPI, TaskTypeDetailAPI, ApplicationListAPI, ApplicationDetailAPI,
-    ApplicationTypeListAPI, ApplicationTypeDetailAPI, TaskExeListAPI, TaskExeDetailAPI,TaskDepListAPI, TaskDepDetailAPI,
-    CacheListAPI, CacheDetailAPI)
+    ApplicationTypeListAPI, ApplicationTypeDetailAPI, TaskExeListAPI, TaskExeDetailAPI,TaskDepListAPI, TaskDepDetailAPI,)
 
 urlpatterns = [
     path('task/', TaskListAPI.as_view(), name='task'),
@@ -22,6 +21,4 @@ urlpatterns = [
     path('task-dependency/', TaskDepListAPI.as_view(), name='task-dependency'),
     path('task-dependency/<int:pk>/', TaskDepDetailAPI.as_view(), name='task-dependency-detail'),
 
-    path('cache/', CacheListAPI.as_view(), name='cache'),
-    path('cache/<int:pk>/', CacheDetailAPI.as_view(), name='cache-detail'),
 ]
