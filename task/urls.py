@@ -1,6 +1,6 @@
 from django.urls import path
 from .views import (TaskListAPI, TaskDetailAPI, TaskTypeListAPI, TaskTypeDetailAPI, ApplicationListAPI, ApplicationDetailAPI,
-    ApplicationTypeListAPI, ApplicationTypeDetailAPI, TaskExeListAPI, TaskExeDetailAPI,TaskDepListAPI, TaskDepDetailAPI,)
+    ApplicationTypeListAPI, ApplicationTypeDetailAPI, TaskExeListAPI, TaskExeDetailAPI,TaskDepListAPI, TaskDepDetailAPI,StateListAPI,StateDetailAPI,AppProgressAPI)
 
 urlpatterns = [
     path('task/', TaskListAPI.as_view(), name='task'),
@@ -12,6 +12,8 @@ urlpatterns = [
     path('application/', ApplicationListAPI.as_view(), name='application'),
     path('application/<int:pk>/', ApplicationDetailAPI.as_view(), name='application-detail'),
 
+    path('application/progress/<int:pk>/', AppProgressAPI.as_view(), name='application_progress'),
+
     path('application-type/', ApplicationTypeListAPI.as_view(), name='application-type'),
     path('application-type/<int:pk>/', ApplicationTypeDetailAPI.as_view(), name='application-type-detail'),
 
@@ -20,5 +22,8 @@ urlpatterns = [
 
     path('task-dependency/', TaskDepListAPI.as_view(), name='task-dependency'),
     path('task-dependency/<int:pk>/', TaskDepDetailAPI.as_view(), name='task-dependency-detail'),
+
+    path('state/', StateListAPI.as_view(), name='state'),
+    path('state/<int:pk>/', StateDetailAPI.as_view(), name='state-detail'),
 
 ]

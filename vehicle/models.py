@@ -9,5 +9,5 @@ class Vehicle(models.Model):
     speed = models.FloatField()
     cpu_capacity = models.BigIntegerField()
     cache_capacity = models.BigIntegerField()
-    is_mission = models.BooleanField(default=True)
+    is_mission = models.BooleanField(default=False)
    

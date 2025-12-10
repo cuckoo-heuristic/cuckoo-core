@@ -145,20 +145,17 @@ class CacheDetailAPI(BaseDetailAPI):
 # /////////////////////////
 class RSUActiveAPI(APIView):
     def get(self, request, pk):
-        try:
-            rsu = RSU.objects.get(pk=pk)
-        except RSU.DoesNotExist:
-            return Response({"error": "RSU not found"}, status=404)
-        
-        is_active = RSUVehicle.objects.filter(rsu_id=rsu,is_current=True).exists()
-        return Response({"is_active": is_active})
-    
-# /////////////////////////
-class RSUConnectionStatusAPI(APIView):
-    def get(self, request, pk):
-        try:
-            rv = RSUVehicle.objects.get(pk=pk)
-        except RSUVehicle.DoesNotExist:
-            return Response({"error": "Not found"}, status=404)
+        active = RSUVehicle.objects.filter(
+            rsu_id=pk,
+            vehicle_id__isnull=False,
+            end_time__isnull=True
+        ).exists()
+        return Response({"rsu_id": pk, "is_active": active})
 
-        return Response({"is_current": rv.is_current})
+class RSUVIsCurrentAPI(APIView):
+    def get(self, request, pk):
+        r = RSUVehicle.objects.filter(id=pk).first()
+        if not r:
+            return Response({"error": "not found"}, status=404)
+        return Response({"id": pk, "is_current": r.end_time is None})
+

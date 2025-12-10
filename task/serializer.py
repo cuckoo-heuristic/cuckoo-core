@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Task, TaskType, Application, ApplicationType, TaskExecution, TaskDependency
+from .models import Task, TaskType, Application, ApplicationType, TaskExecution, TaskDependency,State
 
 class TaskSer(serializers.ModelSerializer):
     class Meta:
@@ -18,18 +18,16 @@ class ApplicationTypeSer(serializers.ModelSerializer):
 
 class ApplicationSer(serializers.ModelSerializer):
     deadline = serializers.ReadOnlyField() 
-
+    is_progress = serializers.BooleanField(read_only=True)
     class Meta:
         model = Application
-        fields = [
-            'id',
-            'vehicle_id',
-            'application_type_id',
-            'start_at',
-            'end_at',
-            'is_progress',
-            'deadline',
-        ]
+        fields = '__all__'
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["is_progress"] = instance.end_at is None
+        return data
+
 
 class TaskExecutionSer(serializers.ModelSerializer):
     class Meta:
@@ -41,3 +39,7 @@ class TaskDependencySer(serializers.ModelSerializer):
         model = TaskDependency
         fields = '__all__'
 
+class StateSer(serializers.ModelSerializer):
+    class Meta:
+        model = State
+        fields = '__all__'

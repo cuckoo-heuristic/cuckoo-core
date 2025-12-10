@@ -1,8 +1,8 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from .models import (Task, TaskType, Application, ApplicationType, TaskExecution, TaskDependency)
-from .serializer import (TaskSer, TaskTypeSer, ApplicationSer,ApplicationTypeSer, TaskExecutionSer,TaskDependencySer)
+from .models import (Task, TaskType, Application, ApplicationType, TaskExecution, TaskDependency,State)
+from .serializer import (TaskSer, TaskTypeSer, ApplicationSer,ApplicationTypeSer, TaskExecutionSer,TaskDependencySer,StateSer)
 from drf_spectacular.utils import extend_schema
 # /////////////////////////
 class BaseListAPI(APIView):
@@ -153,3 +153,27 @@ class TaskDepDetailAPI(BaseDetailAPI):
     def patch(self, request, pk):
         return super().patch(request, pk)
 # //////////////////////
+class StateListAPI(BaseListAPI):
+    model = State
+    serializer = StateSer
+
+    @extend_schema(request=StateSer, responses=StateSer)
+    def post(self, request):
+        return super().post(request)
+
+
+class StateDetailAPI(BaseDetailAPI):
+    model = State
+    serializer = StateSer
+
+    @extend_schema(request=StateSer, responses=StateSer)
+    def patch(self, request, pk):
+        return super().patch(request, pk)
+    
+class AppProgressAPI(APIView):
+    def get(self, request, pk):
+        app = Application.objects.filter(id=pk).first()
+        if not app:
+            return Response({"error": "not found"}, 404)
+
+        return Response({"id": pk, "is_progress": app.end_at is None})

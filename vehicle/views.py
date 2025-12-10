@@ -4,6 +4,7 @@ from rest_framework import status
 from .models import Vehicle
 from .serializer import VehicleSer
 from drf_spectacular.utils import extend_schema
+from task.models import State
 
 class BaseListAPI(APIView):
     model = None
@@ -72,11 +73,12 @@ class VehicleDetailAPIView(BaseDetailAPI):
     def patch(self, request, pk):
         return super().patch(request, pk)
 
-class VehicleMissionStatusAPI(APIView):
+class VehicleMissionAPI(APIView):
     def get(self, request, pk):
-        try:
-            vehicle = Vehicle.objects.get(pk=pk)
-        except Vehicle.DoesNotExist:
-            return Response({"error": "Vehicle not found"}, status=404)
 
-        return Response({"is_mission": vehicle.is_mission})
+        mission = State.objects.filter(
+            from_vehicle_id=pk,
+            task_execution_id__end_time__isnull=True
+        ).exists()
+
+        return Response({"vehicle_id": pk, "is_mission": mission})

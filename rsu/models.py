@@ -18,14 +18,17 @@ class RSUVehicle(models.Model):
     start_time = models.DateTimeField(default=timezone.now)
     end_time = models.DateTimeField(null=True, blank=True)
     connect_time = models.FloatField(null=True, blank=True)
-    is_current = models.BooleanField(default=True)
+    is_current = models.BooleanField(default=False)
 
     def save(self, *args, **kwargs):
-         if self.start_time and self.end_time:
-             delta = self.end_time - self.start_time
-             self.connect_time = delta.total_seconds()
-
-         super().save(*args, **kwargs)
+        if self.start_time and self.end_time:
+            delta = self.end_time - self.start_time
+            self.connect_time = delta.total_seconds()
+        else:
+            self.connect_time = None
+        # self.is_current = (self.end_time is None)
+        super().save(*args, **kwargs)
+    
 
 class ServiceProvider(models.Model):
     TYPE_CHOICES = (
@@ -38,8 +41,6 @@ class ServiceProvider(models.Model):
 
 class Resource(models.Model):
     sp_id = models.ForeignKey(ServiceProvider, on_delete=models.CASCADE)
-    # cpu_capacity = models.BigIntegerField()
-    # cache_capacity = models.IntegerField(default=0)
     cpu_used = models.BigIntegerField()
     cache_used = models.BigIntegerField()
     @property

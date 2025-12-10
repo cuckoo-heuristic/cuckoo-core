@@ -1,9 +1,17 @@
+from drf_spectacular.utils import extend_schema
 import requests
 from rest_framework.views import APIView
 from rest_framework.response import Response
 import polyline
+from .serializer import RouteInputSerializer
+
 
 class RouteAPIView(APIView):
+
+    @extend_schema(
+        request=RouteInputSerializer,
+        responses=None
+    )
     def post(self, request):
 
         origin_lat = request.data.get("origin_lat")
