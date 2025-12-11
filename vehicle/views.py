@@ -2,29 +2,83 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from .models import Vehicle
-from .serializer import VehicleSerializer
+from .serializer import VehicleSer
+from drf_spectacular.utils import extend_schema
+from task.models import State
 
-class vehicleListAPIView(APIView):
-
+class BaseListAPI(APIView):
+    model = None
+    serializer = None
     def get(self, request):
-        vehicles = Vehicle.objects.all()
-        serializer = VehicleSerializer(vehicles, many=True)
-        return Response(serializer.data)
+        items = self.model.objects.all()
+        ser = self.serializer(items, many=True)
+        return Response(ser.data)
 
     def post(self, request):
-        serializer = VehicleSerializer(data=request.data)
-        if serializer.is_valid():
-            serializer.save()
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-    
-class vehicleDetailAPIView(APIView):
+        ser = self.serializer(data=request.data)
+        if ser.is_valid():
+            ser.save()
+            return Response(ser.data, status=status.HTTP_201_CREATED)
+        return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class BaseDetailAPI(APIView):
+    model = None
+    serializer = None
+
+    def get_object(self, pk):
+        try:
+            return self.model.objects.get(pk=pk)
+        except self.model.DoesNotExist:
+            return None
 
     def get(self, request, pk):
-        try:
-            Vehicle = Vehicle.objects.get(pk=pk)
-        except Vehicle.DoesNotExist:
-            return Response({"error": "Vehicle not found"}, status=status.HTTP_404_NOT_FOUND)
+        obj = self.get_object(pk)
+        if not obj:
+            return Response({"error": "Not Found"}, status=404)
+        ser = self.serializer(obj)
+        return Response(ser.data)
 
-        serializer = VehicleSerializer(Vehicle)
-        return Response(serializer.data)
+    def patch(self, request, pk):
+        obj = self.get_object(pk)
+        if not obj:
+            return Response({"error": "Not Found"}, status=404)
+
+        ser = self.serializer(obj, data=request.data, partial=True)
+        if ser.is_valid():
+            ser.save()
+            return Response(ser.data)
+        return Response(ser.errors, status=400)
+
+    def delete(self, request, pk):
+        obj = self.get_object(pk)
+        if not obj:
+            return Response({"error": "Not Found"}, status=404)
+
+        obj.delete()
+        return Response({"message": "Deleted"}, status=204)
+    
+class VehicleListAPIView(BaseListAPI):
+    model = Vehicle
+    serializer = VehicleSer
+
+    @extend_schema(request=VehicleSer, responses=VehicleSer)
+    def post(self, request):
+        return super().post(request)
+
+class VehicleDetailAPIView(BaseDetailAPI):
+    model = Vehicle
+    serializer = VehicleSer
+
+    @extend_schema(request=VehicleSer, responses=VehicleSer)
+    def patch(self, request, pk):
+        return super().patch(request, pk)
+
+class VehicleMissionAPI(APIView):
+    def get(self, request, pk):
+
+        mission = State.objects.filter(
+            from_vehicle_id=pk,
+            task_execution_id__end_time__isnull=True
+        ).exists()
+
+        return Response({"vehicle_id": pk, "is_mission": mission})

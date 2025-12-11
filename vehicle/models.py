@@ -1,20 +1,13 @@
 from django.db import models
-from rsu.models import RSU
 
 class Vehicle(models.Model):
-    name = models.CharField(max_length=100)
-
-    origin_lat = models.FloatField()
-    origin_lon = models.FloatField()
-
-    destination_lat = models.FloatField()
-    destination_lon = models.FloatField()
-
-    range = models.FloatField()
-
-    rsu = models.ForeignKey(
-        RSU,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True
-    )
+    plate = models.CharField(max_length=100,unique=True)
+    path = models.JSONField(default=list)
+    x_coord = models.FloatField()
+    y_coord = models.FloatField()
+    height = models.FloatField()
+    speed = models.FloatField()
+    cpu_capacity = models.BigIntegerField()
+    cache_capacity = models.BigIntegerField()
+    is_mission = models.BooleanField(default=False)
+   
