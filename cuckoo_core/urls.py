@@ -32,5 +32,6 @@ urlpatterns = [
     path('rsu/', include('rsu.urls')),
     path('vehicle/', include('vehicle.urls')),
     path('route/', include('routing.urls')),
+    path('run/', include('run.urls')),
 
 ]
