@@ -1,3 +1,6 @@
+# NOTE:
+# Baseline policies for simulation validation only.
+# These are not benchmark algorithms.
 from typing import List
 from .base import PolicyBase, Task, VehicleState, RSUState, Decision
 
