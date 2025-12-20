@@ -1,7 +1,7 @@
 from django.db import models
 
 class Vehicle(models.Model):
-    plate = models.CharField(max_length=100,unique=True)
+    plate = models.CharField(max_length=100, unique=True)
     path = models.JSONField(default=list)
     x_coord = models.FloatField()
     y_coord = models.FloatField()
@@ -9,4 +9,4 @@ class Vehicle(models.Model):
     cpu_capacity = models.BigIntegerField()
     cache_capacity = models.BigIntegerField()
     is_mission = models.BooleanField(default=False)
-   
+    initial_snapshot = models.JSONField(null=True, blank=True)  # ✅ برای reset

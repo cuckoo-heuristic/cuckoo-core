@@ -11,13 +11,18 @@ class RSU(models.Model):
     cache_capacity = models.BigIntegerField()
     is_active = models.BooleanField(default=False)
 
+    initial_snapshot = models.JSONField(null=True, blank=True)
+
+
 class RSUVehicle(models.Model):
-    rsu_id = models.ForeignKey(RSU, on_delete=models.CASCADE, null=True, blank=True) 
-    vehicle_id = models.ForeignKey(Vehicle, on_delete=models.CASCADE, null=True, blank=True) 
+    rsu_id = models.ForeignKey(RSU, on_delete=models.CASCADE, null=True, blank=True)
+    vehicle_id = models.ForeignKey(Vehicle, on_delete=models.CASCADE, null=True, blank=True)
     start_time = models.DateTimeField(default=timezone.now)
     end_time = models.DateTimeField(null=True, blank=True)
     connect_time = models.FloatField(null=True, blank=True)
     is_current = models.BooleanField(default=False)
+
+    initial_snapshot = models.JSONField(null=True, blank=True)
 
     def save(self, *args, **kwargs):
         if self.start_time and self.end_time:
@@ -25,9 +30,8 @@ class RSUVehicle(models.Model):
             self.connect_time = delta.total_seconds()
         else:
             self.connect_time = None
-        # self.is_current = (self.end_time is None)
         super().save(*args, **kwargs)
-    
+
 
 class ServiceProvider(models.Model):
     TYPE_CHOICES = (
@@ -35,13 +39,19 @@ class ServiceProvider(models.Model):
         ("vehicle", "Vehicle"),
     )
     rsu_id = models.ForeignKey(RSU, on_delete=models.CASCADE, null=True, blank=True)
-    vehicle_id = models.ForeignKey(Vehicle, on_delete=models.CASCADE, null=True, blank=True) 
+    vehicle_id = models.ForeignKey(Vehicle, on_delete=models.CASCADE, null=True, blank=True)
     type = models.CharField(max_length=20, choices=TYPE_CHOICES)
+
+    initial_snapshot = models.JSONField(null=True, blank=True)
+
 
 class Resource(models.Model):
     sp_id = models.ForeignKey(ServiceProvider, on_delete=models.CASCADE)
     cpu_used = models.BigIntegerField()
     cache_used = models.BigIntegerField()
+
+    initial_snapshot = models.JSONField(null=True, blank=True)
+
     @property
     def cpu_capacity(self):
         if self.sp_id.rsu_id:
@@ -53,7 +63,10 @@ class Resource(models.Model):
         if self.sp_id.rsu_id:
             return self.sp_id.rsu_id.cache_capacity
         return self.sp_id.vehicle_id.cache_capacity
-    
+
+
 class cache(models.Model):
     sp_id = models.ForeignKey(ServiceProvider, on_delete=models.CASCADE, null=True, blank=True)
     task_type_id = models.ForeignKey("task.TaskType", on_delete=models.CASCADE)
+
+    initial_snapshot = models.JSONField(null=True, blank=True)

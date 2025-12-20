@@ -1,40 +1,79 @@
+from django.forms.models import model_to_dict
+from django.utils.timezone import is_aware
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from .models import (RSU,RSUVehicle,ServiceProvider,Resource,cache)
-from .serializer import (RSUSer,RSUVehicleSer,ServiceProviderSer,ResourceSer,CacheSer)
-from drf_spectacular.utils import extend_schema
-# /////////////////////////
+from drf_spectacular.utils import extend_schema, inline_serializer
+from rest_framework import serializers
+from django.db import models
+
+from .models import RSU, RSUVehicle, ServiceProvider, Resource, cache
+from .serializer import RSUSer, RSUVehicleSer, ServiceProviderSer, ResourceSer, CacheSer
+
+
+# ✅ یک serializer مشترک برای reset (دیگه تکراری نمیشه)
+class ResetResponseSer(serializers.Serializer):
+    detail = serializers.CharField()
+
+
+def _json_safe(value):
+    # datetime -> iso string
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return value
+
+
+def make_snapshot(obj):
+    data = model_to_dict(obj)
+    data.pop("id", None)
+    data.pop("initial_snapshot", None)
+
+    # ✅ همه values رو json-safe کن (datetime ها اینجا درست میشن)
+    for k, v in list(data.items()):
+        if isinstance(v, list):
+            data[k] = [_json_safe(x) for x in v]
+        else:
+            data[k] = _json_safe(v)
+
+    return data
+
+
 class BaseListAPI(APIView):
     model = None
-    serializer = None
+    serializer_class = None  # ✅ اینو نگه میداریم تا spectacular هم بفهمه
+
     def get(self, request):
         items = self.model.objects.all()
-        ser = self.serializer(items, many=True)
+        ser = self.serializer_class(items, many=True)
         return Response(ser.data)
 
     def post(self, request):
-        ser = self.serializer(data=request.data)
-        if ser.is_valid():
-            ser.save()
-            return Response(ser.data, status=status.HTTP_201_CREATED)
-        return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
+        ser = self.serializer_class(data=request.data)
+        if not ser.is_valid():
+            return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        obj = ser.save()
+
+        # ✅ snapshot فقط یکبار ذخیره میشه
+        if hasattr(obj, "initial_snapshot") and not obj.initial_snapshot:
+            obj.initial_snapshot = make_snapshot(obj)
+            obj.save(update_fields=["initial_snapshot"])
+
+        return Response(self.serializer_class(obj).data, status=status.HTTP_201_CREATED)
+
 
 class BaseDetailAPI(APIView):
     model = None
-    serializer = None
+    serializer_class = None
 
     def get_object(self, pk):
-        try:
-            return self.model.objects.get(pk=pk)
-        except self.model.DoesNotExist:
-            return None
+        return self.model.objects.filter(pk=pk).first()
 
     def get(self, request, pk):
         obj = self.get_object(pk)
         if not obj:
             return Response({"error": "Not Found"}, status=404)
-        ser = self.serializer(obj)
+        ser = self.serializer_class(obj)
         return Response(ser.data)
 
     def patch(self, request, pk):
@@ -42,7 +81,7 @@ class BaseDetailAPI(APIView):
         if not obj:
             return Response({"error": "Not Found"}, status=404)
 
-        ser = self.serializer(obj, data=request.data, partial=True)
+        ser = self.serializer_class(obj, data=request.data, partial=True)
         if ser.is_valid():
             ser.save()
             return Response(ser.data)
@@ -55,95 +94,201 @@ class BaseDetailAPI(APIView):
 
         obj.delete()
         return Response({"message": "Deleted"}, status=204)
-# //////////////////////
 
+
+class BaseResetOneAPI(APIView):
+    model = None
+    http_method_names = ["post", "head", "options"]
+
+    @extend_schema(request=None, responses=ResetResponseSer)
+    def post(self, request, pk):
+        obj = self.model.objects.filter(pk=pk).first()
+        if not obj:
+            return Response({"error": "Not Found"}, status=404)
+
+        snap = getattr(obj, "initial_snapshot", None)
+        if not snap:
+            return Response({"error": "No initial snapshot saved for this object."}, status=400)
+
+        for field, value in snap.items():
+            model_field = obj._meta.get_field(field)
+
+            # ✅ اگر ForeignKey بود، به جای rsu_id مقدار rsu_id_id را ست کن
+            if isinstance(model_field, models.ForeignKey):
+                setattr(obj, model_field.attname, value)  # attname مثلا "rsu_id_id"
+            else:
+                setattr(obj, field, value)
+
+        obj.save()
+        return Response({"detail": "Reset to initial POST snapshot done."}, status=200)
+
+
+# ---------------- RSU ----------------
 class RSUListAPI(BaseListAPI):
     model = RSU
-    serializer = RSUSer
+    serializer_class = RSUSer
+
+    @extend_schema(responses=RSUSer)
+    def get(self, request):
+        return super().get(request)
 
     @extend_schema(request=RSUSer, responses=RSUSer)
     def post(self, request):
         return super().post(request)
+
 
 class RSUDetailAPI(BaseDetailAPI):
     model = RSU
-    serializer = RSUSer
+    serializer_class = RSUSer
+
+    @extend_schema(responses=RSUSer)
+    def get(self, request, pk):
+        return super().get(request, pk)
 
     @extend_schema(request=RSUSer, responses=RSUSer)
     def patch(self, request, pk):
         return super().patch(request, pk)
 
 
-# //////////////////////
-class RVListAPI(BaseListAPI):
+class RSUResetAPI(BaseResetOneAPI):
+    model = RSU
+
+
+# ---------------- RSUVehicle ----------------
+class RSUVehicleListAPI(BaseListAPI):
     model = RSUVehicle
-    serializer = RSUVehicleSer
+    serializer_class = RSUVehicleSer
+
+    @extend_schema(responses=RSUVehicleSer)
+    def get(self, request):
+        return super().get(request)
 
     @extend_schema(request=RSUVehicleSer, responses=RSUVehicleSer)
     def post(self, request):
         return super().post(request)
 
-class RVDetailAPI(BaseDetailAPI):
+
+class RSUVehicleDetailAPI(BaseDetailAPI):
     model = RSUVehicle
-    serializer = RSUVehicleSer
+    serializer_class = RSUVehicleSer
+
+    @extend_schema(responses=RSUVehicleSer)
+    def get(self, request, pk):
+        return super().get(request, pk)
 
     @extend_schema(request=RSUVehicleSer, responses=RSUVehicleSer)
     def patch(self, request, pk):
         return super().patch(request, pk)
 
-# //////////////////////
-class SPListAPI(BaseListAPI):
+
+class RSUVehicleResetAPI(BaseResetOneAPI):
+    model = RSUVehicle
+
+
+# ---------------- ServiceProvider ----------------
+class ServiceProviderListAPI(BaseListAPI):
     model = ServiceProvider
-    serializer = ServiceProviderSer
+    serializer_class = ServiceProviderSer
+
+    @extend_schema(responses=ServiceProviderSer)
+    def get(self, request):
+        return super().get(request)
 
     @extend_schema(request=ServiceProviderSer, responses=ServiceProviderSer)
     def post(self, request):
         return super().post(request)
 
-class SPDetailAPI(BaseDetailAPI):
+
+class ServiceProviderDetailAPI(BaseDetailAPI):
     model = ServiceProvider
-    serializer = ServiceProviderSer
+    serializer_class = ServiceProviderSer
+
+    @extend_schema(responses=ServiceProviderSer)
+    def get(self, request, pk):
+        return super().get(request, pk)
 
     @extend_schema(request=ServiceProviderSer, responses=ServiceProviderSer)
     def patch(self, request, pk):
         return super().patch(request, pk)
 
-# //////////////////////
+
+class ServiceProviderResetAPI(BaseResetOneAPI):
+    model = ServiceProvider
+
+
+# ---------------- Resource ----------------
 class ResourceListAPI(BaseListAPI):
     model = Resource
-    serializer = ResourceSer
+    serializer_class = ResourceSer
+
+    @extend_schema(responses=ResourceSer)
+    def get(self, request):
+        return super().get(request)
 
     @extend_schema(request=ResourceSer, responses=ResourceSer)
     def post(self, request):
         return super().post(request)
+
 
 class ResourceDetailAPI(BaseDetailAPI):
     model = Resource
-    serializer = ResourceSer
+    serializer_class = ResourceSer
+
+    @extend_schema(responses=ResourceSer)
+    def get(self, request, pk):
+        return super().get(request, pk)
 
     @extend_schema(request=ResourceSer, responses=ResourceSer)
     def patch(self, request, pk):
         return super().patch(request, pk)
-    
-# /////////////////////////
+
+
+class ResourceResetAPI(BaseResetOneAPI):
+    model = Resource
+
+
+# ---------------- Cache ----------------
 class CacheListAPI(BaseListAPI):
     model = cache
-    serializer = CacheSer
+    serializer_class = CacheSer
+
+    @extend_schema(responses=CacheSer)
+    def get(self, request):
+        return super().get(request)
 
     @extend_schema(request=CacheSer, responses=CacheSer)
     def post(self, request):
         return super().post(request)
 
+
 class CacheDetailAPI(BaseDetailAPI):
     model = cache
-    serializer = CacheSer
+    serializer_class = CacheSer
+
+    @extend_schema(responses=CacheSer)
+    def get(self, request, pk):
+        return super().get(request, pk)
 
     @extend_schema(request=CacheSer, responses=CacheSer)
     def patch(self, request, pk):
-        return super().patch(request, pk) 
-       
-# /////////////////////////
+        return super().patch(request, pk)
+
+
+class CacheResetAPI(BaseResetOneAPI):
+    model = cache
+
+
+# ---------------- Extra APIs ----------------
 class RSUActiveAPI(APIView):
+    @extend_schema(
+        responses=inline_serializer(
+            name="RSUActiveResponse",
+            fields={
+                "rsu_id": serializers.IntegerField(),
+                "is_active": serializers.BooleanField(),
+            },
+        )
+    )
     def get(self, request, pk):
         active = RSUVehicle.objects.filter(
             rsu_id=pk,
@@ -152,10 +297,19 @@ class RSUActiveAPI(APIView):
         ).exists()
         return Response({"rsu_id": pk, "is_active": active})
 
+
 class RSUVIsCurrentAPI(APIView):
+    @extend_schema(
+        responses=inline_serializer(
+            name="RSUVIsCurrentResponse",
+            fields={
+                "id": serializers.IntegerField(),
+                "is_current": serializers.BooleanField(),
+            },
+        )
+    )
     def get(self, request, pk):
         r = RSUVehicle.objects.filter(id=pk).first()
         if not r:
             return Response({"error": "not found"}, status=404)
         return Response({"id": pk, "is_current": r.end_time is None})
-
