@@ -47,6 +47,7 @@ INSTALLED_APPS = [
     'task',
     'routing',
     'run',
+    'parameter',
 ]
 
 MIDDLEWARE = [

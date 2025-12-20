@@ -7,7 +7,6 @@ class RSU(models.Model):
     name = models.CharField(max_length=100, unique=True)
     x_coord = models.FloatField()
     y_coord = models.FloatField()
-    height = models.FloatField()
     cpu_capacity = models.BigIntegerField()
     cache_capacity = models.BigIntegerField()
     is_active = models.BooleanField(default=False)

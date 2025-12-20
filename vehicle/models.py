@@ -5,7 +5,6 @@ class Vehicle(models.Model):
     path = models.JSONField(default=list)
     x_coord = models.FloatField()
     y_coord = models.FloatField()
-    height = models.FloatField()
     speed = models.FloatField()
     cpu_capacity = models.BigIntegerField()
     cache_capacity = models.BigIntegerField()
