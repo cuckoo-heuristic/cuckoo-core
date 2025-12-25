@@ -1,11 +1,15 @@
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from run.simulation import run_simulation
+from parameter.services import load_params_obj
+
 import threading
 
 @api_view(["POST"])
 def start_simulation(request):
-    total_time = int(request.data.get("time", 30))
-    t = threading.Thread(target=run_simulation, args=(total_time,), daemon=True)
+    params = load_params_obj()
+
+    t = threading.Thread(target=run_simulation, daemon=True)
     t.start()
-    return Response({"status": "started", "time": total_time})
+
+    return Response({"status": "started", "time": params.simulate_time})
