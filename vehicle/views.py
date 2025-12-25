@@ -86,6 +86,39 @@ class BaseResetOneAPI(APIView):
     model = None
     http_method_names = ["post", "head", "options"]
 
+    def post(self, request, pk):   # ✅ الان داخل کلاسه
+        obj = self.model.objects.filter(pk=pk).first()
+        if not obj:
+            return Response({"error": "Not Found"}, status=404)
+
+        snap = getattr(obj, "initial_snapshot", None)
+        if not snap:
+            return Response(
+                {"error": "No initial snapshot saved for this object."},
+                status=400
+            )
+
+        for field, value in snap.items():
+            model_field = obj._meta.get_field(field)
+
+            # ForeignKey
+            if isinstance(model_field, models.ForeignKey):
+                setattr(obj, model_field.attname, value)
+                continue
+
+            # DateTimeField
+            if isinstance(model_field, models.DateTimeField) and isinstance(value, str):
+                setattr(obj, field, parse_datetime(value))
+                continue
+
+            setattr(obj, field, value)
+
+        obj.save()
+        return Response(
+            {"detail": "Reset to initial POST snapshot done."},
+            status=200
+        )
+
 def post(self, request, pk):
     obj = self.model.objects.filter(pk=pk).first()
     if not obj:
