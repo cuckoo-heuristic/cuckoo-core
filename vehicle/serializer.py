@@ -21,8 +21,8 @@ class VehicleSer(serializers.ModelSerializer):
 
     class Meta:
         model = Vehicle
-        exclude = ["initial_snapshot"]  # ✅
-        read_only_fields = ["is_mission"]
+        exclude = ["initial_snapshot"]
+        read_only_fields = ["is_mission", "length", "speed","x_coord","y_coord"]
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
