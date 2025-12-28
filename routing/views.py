@@ -39,10 +39,11 @@ class RouteAPIView(APIView):
 
         encoded_polyline = data["routes"][0]["overview_polyline"]["points"]
         decoded_path = polyline.decode(encoded_polyline)
-        formatted_path = [{"lat": lat, "lon": lon} for lat, lon in decoded_path]
+        vehicle_path = [[lon, lat] for lat, lon in decoded_path]
 
         return Response({
-            "path": formatted_path,
+            "path": vehicle_path,
             "distance": data["routes"][0]["legs"][0]["distance"]["text"],
             "duration": data["routes"][0]["legs"][0]["duration"]["text"]
         })
+

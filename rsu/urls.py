@@ -1,23 +1,33 @@
 from django.urls import path
-from .views import RSUListAPI,RSUDetailAPI,SPListAPI,SPDetailAPI,RVListAPI,RVDetailAPI,ResourceListAPI,ResourceDetailAPI,CacheListAPI,CacheDetailAPI,RSUActiveAPI,RSUVIsCurrentAPI
+from .views import (
+    RSUListAPI, RSUDetailAPI, RSUResetAPI,
+    RSUVehicleListAPI, RSUVehicleDetailAPI, RSUVehicleResetAPI,
+    ServiceProviderListAPI, ServiceProviderDetailAPI, ServiceProviderResetAPI,
+    ResourceListAPI, ResourceDetailAPI, ResourceResetAPI,
+    CacheListAPI, CacheDetailAPI, CacheResetAPI,
+    RSUActiveAPI, RSUVIsCurrentAPI,
+)
+
 urlpatterns = [
-    path('rsu/', RSUListAPI.as_view(), name='rsu'),
-    path('rsu/<int:pk>/', RSUDetailAPI.as_view(), name='rsu-detail'),
+    path("rsu/", RSUListAPI.as_view()),
+    path("rsu/<int:pk>/", RSUDetailAPI.as_view()),
+    path("rsu/<int:pk>/reset/", RSUResetAPI.as_view()),
+    path("rsu/<int:pk>/active/", RSUActiveAPI.as_view()),
 
-    path('rsu/active/<int:pk>/', RSUActiveAPI.as_view(), name='rsu'),
+    path("rsu-vehicle/", RSUVehicleListAPI.as_view()),
+    path("rsu-vehicle/<int:pk>/", RSUVehicleDetailAPI.as_view()),
+    path("rsu-vehicle/<int:pk>/reset/", RSUVehicleResetAPI.as_view()),
+    path("rsu-vehicle/<int:pk>/is-current/", RSUVIsCurrentAPI.as_view()),
 
-    path('servicepro/', SPListAPI.as_view(), name='service_provider'),
-    path('servicepro/<int:pk>/', SPDetailAPI.as_view(), name='service_provider-detail'),
-    
-    path('rsuvehicle/', RVListAPI.as_view(), name='rsu_vehicle'),
-    path('rsuvehicle/<int:pk>/', RVDetailAPI.as_view(), name='rsu_vehicle-detail'),
+    path("service-provider/", ServiceProviderListAPI.as_view()),
+    path("service-provider/<int:pk>/", ServiceProviderDetailAPI.as_view()),
+    path("service-provider/<int:pk>/reset/", ServiceProviderResetAPI.as_view()),
 
-    path('rsuvehicle/current/<int:pk>/', RSUVIsCurrentAPI.as_view(), name='rsu_vehicle'),
+    path("resource/", ResourceListAPI.as_view()),
+    path("resource/<int:pk>/", ResourceDetailAPI.as_view()),
+    path("resource/<int:pk>/reset/", ResourceResetAPI.as_view()),
 
-    path('resource/', ResourceListAPI.as_view(), name='resource'),
-    path('resource/<int:pk>/', ResourceDetailAPI.as_view(), name='resource-detail'),
-    
-    path('cache/', CacheListAPI.as_view(), name='cache'),
-    path('cache/<int:pk>/', CacheDetailAPI.as_view(), name='cache-detail'),
-
+    path("cache/", CacheListAPI.as_view()),
+    path("cache/<int:pk>/", CacheDetailAPI.as_view()),
+    path("cache/<int:pk>/reset/", CacheResetAPI.as_view()),
 ]
