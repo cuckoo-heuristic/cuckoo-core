@@ -40,13 +40,14 @@ INSTALLED_APPS = [
 
     'rest_framework',
     'drf_spectacular',
-    'channels',
+    # 'channels',
     
     'rsu',
     'vehicle',
     'task',
     'routing',
     'run',
+    'parameter',
 ]
 
 MIDDLEWARE = [

@@ -1,27 +1,32 @@
 from rest_framework import serializers
-from .models import Task, TaskType, Application, ApplicationType, TaskExecution, TaskDependency,State
+from .models import Task, TaskType, Application, ApplicationType, TaskExecution, TaskDependency, State
+
 
 class TaskSer(serializers.ModelSerializer):
     class Meta:
         model = Task
-        fields = '__all__'
+        exclude = ["initial_snapshot"]
+
 
 class TaskTypeSer(serializers.ModelSerializer):
     class Meta:
         model = TaskType
-        fields = '__all__'
+        exclude = ["initial_snapshot"]
+
 
 class ApplicationTypeSer(serializers.ModelSerializer):
     class Meta:
         model = ApplicationType
-        fields = '__all__'
+        exclude = ["initial_snapshot"]
+
 
 class ApplicationSer(serializers.ModelSerializer):
-    deadline = serializers.ReadOnlyField() 
+    deadline = serializers.IntegerField(read_only=True)  # ✅ نوع مشخص شد
     is_progress = serializers.BooleanField(read_only=True)
+
     class Meta:
         model = Application
-        fields = '__all__'
+        exclude = ["initial_snapshot"]
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -32,14 +37,16 @@ class ApplicationSer(serializers.ModelSerializer):
 class TaskExecutionSer(serializers.ModelSerializer):
     class Meta:
         model = TaskExecution
-        fields = '__all__'
+        exclude = ["initial_snapshot"]
+
 
 class TaskDependencySer(serializers.ModelSerializer):
     class Meta:
         model = TaskDependency
-        fields = '__all__'
+        exclude = ["initial_snapshot"]
+
 
 class StateSer(serializers.ModelSerializer):
     class Meta:
         model = State
-        fields = '__all__'
+        exclude = ["initial_snapshot"]
