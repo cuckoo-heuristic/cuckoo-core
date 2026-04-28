@@ -12,12 +12,6 @@ class ParameterPatchSerializer(serializers.ModelSerializer):
         model = Parameter
         fields = ["value"]
 
-    # def validate(self, attrs):
-    #     instance: Parameter = self.instance
-    #     if instance and not instance.is_editable:
-    #         raise serializers.ValidationError("This parameter is not editable.")
-    #     return attrs
-
     def validate_value(self, v):
         instance: Parameter = self.instance
         if not instance:
