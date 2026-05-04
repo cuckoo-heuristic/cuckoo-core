@@ -1,17 +1,20 @@
 from __future__ import annotations
 
-import math
+import random
 import threading
 from datetime import timedelta
 from typing import Optional, Tuple, List
 
 from django.db import close_old_connections, transaction
+from django.db.models import Count
 from django.utils import timezone
 
 from monarch_pylib.model import transmission
 
 from parameter.services import load_params_obj
 from object.models import RSU, RSUVehicle, Vehicle, ServiceProvider
+from dag.models import ApplicationType
+from application.models import Application
 
 
 class SimulationConfig:
@@ -24,6 +27,24 @@ class SimulationConfig:
         self.motion_tick_seconds = 1
 
 
+def _sim_datetime(cfg: SimulationConfig, sim_seconds: float):
+    base = cfg.base_time or timezone.now()
+    return base + timedelta(seconds=max(0.0, float(sim_seconds)))
+
+
+def _pick_application_type_id(min_tasks: int = 3) -> int | None:
+    qs = (
+        ApplicationType.objects
+        .annotate(task_count=Count("task"))
+        .filter(task_count__gte=int(min_tasks))
+        .values_list("id", flat=True)
+    )
+    ids = list(qs)
+    if not ids:
+        return None
+    return int(random.choice(ids))
+
+
 def _euclid2(a: Tuple[float, float], b: Tuple[float, float]) -> float:
     return float(transmission.distance_2d(float(a[0]), float(a[1]), float(b[0]), float(b[1])))
 
@@ -34,29 +55,23 @@ def _nearest_rsu(rsus, pos_xy: Tuple[float, float]) -> Optional[RSU]:
     for r in rsus:
         if r.x_coord is None or r.y_coord is None:
             continue
-
         d = _euclid2((float(r.x_coord), float(r.y_coord)), pos_xy)
-
         if best is None or (best_d is not None and d < best_d):
             best = r
             best_d = d
-
     return best
 
 
 def _sync_rsu_vehicle(vehicle_id: int, new_rsu_id: Optional[int], now_dt):
-
     open_qs = RSUVehicle.objects.filter(
         vehicle_id_id=vehicle_id,
         end_time__isnull=True
     )
 
     if new_rsu_id is not None:
-        open_qs_other = open_qs.exclude(rsu_id_id=new_rsu_id)
+        open_qs.exclude(rsu_id_id=new_rsu_id).update(end_time=now_dt, is_current=False)
     else:
-        open_qs_other = open_qs
-
-    open_qs_other.update(end_time=now_dt, is_current=False)
+        open_qs.update(end_time=now_dt, is_current=False)
 
     if new_rsu_id is None:
         return
@@ -71,62 +86,48 @@ def _sync_rsu_vehicle(vehicle_id: int, new_rsu_id: Optional[int], now_dt):
         },
     )
 
-    if not created:
-        if not obj.is_current:
-            obj.is_current = True
-            obj.save(update_fields=["is_current"])
+    if not created and not obj.is_current:
+        obj.is_current = True
+        obj.save(update_fields=["is_current"])
 
 
-def discover_available_sps(vehicle: Vehicle, rsus: List[RSU], params) -> List[ServiceProvider]:
+def discover_available_sps(vehicle: Vehicle) -> List[int]:
 
-    available_sps = []
+    available = []
 
-    vx = float(vehicle.x_coord)
-    vy = float(vehicle.y_coord)
+    rv = RSUVehicle.objects.filter(
+        vehicle_id=vehicle.id,
+        is_current=True
+    ).select_related("rsu_id").first()
 
-    # RSU range
-    rsu_range = float(getattr(params, "rsu_range", 300))
-    v2v_range = float(getattr(params, "v2v_range", 100))
+    if not rv:
+        return available
 
-    # ---------- RSU providers ----------
-    for rsu in rsus:
+    rsu = rv.rsu_id
 
-        if rsu.x_coord is None or rsu.y_coord is None:
-            continue
+    sp_rsu = ServiceProvider.objects.filter(
+        rsu_id=rsu,
+        type="rsu"
+    ).first()
 
-        d = _euclid2((vx, vy), (rsu.x_coord, rsu.y_coord))
+    if sp_rsu:
+        available.append(sp_rsu.id)
 
-        if d <= rsu_range:
+    vehicle_ids = RSUVehicle.objects.filter(
+        rsu_id=rsu,
+        is_current=True
+    ).exclude(
+        vehicle_id=vehicle.id
+    ).values_list("vehicle_id_id", flat=True)
 
-            sp = ServiceProvider.objects.filter(
-                rsu_id=rsu,
-                type="rsu"
-            ).first()
+    sp_vehicles = ServiceProvider.objects.filter(
+        vehicle_id_id__in=vehicle_ids,
+        type="vehicle"
+    ).values_list("id", flat=True)
 
-            if sp:
-                available_sps.append(sp)
+    available.extend(list(sp_vehicles))
 
-    # ---------- Vehicle providers ----------
-    vehicles = Vehicle.objects.exclude(id=vehicle.id)
-
-    for v in vehicles:
-
-        if v.x_coord is None or v.y_coord is None:
-            continue
-
-        d = _euclid2((vx, vy), (v.x_coord, v.y_coord))
-
-        if d <= v2v_range:
-
-            sp = ServiceProvider.objects.filter(
-                vehicle_id=v,
-                type="vehicle"
-            ).first()
-
-            if sp:
-                available_sps.append(sp)
-
-    return available_sps
+    return available
 
 
 class VehicleWorker(threading.Thread):
@@ -137,7 +138,10 @@ class VehicleWorker(threading.Thread):
         self.vehicle_id = int(vehicle_id)
         self.cfg = cfg
         self._stop_flag = threading.Event()
+
         self.params = load_params_obj()
+        self.min_tasks = int(getattr(self.params, "min_tasks_per_app_type", 3) or 3)
+        self.app_interval = int(getattr(self.cfg, "tick_seconds", 0) or 0)
 
     def stop(self):
         self._stop_flag.set()
@@ -147,22 +151,15 @@ class VehicleWorker(threading.Thread):
         close_old_connections()
 
         rsus = list(RSU.objects.all())
-
         t = 0
 
-        motion_tick = 1
-
-        try:
-            motion_tick = max(1, int(getattr(self.cfg, "motion_tick_seconds", 1) or 1))
-        except Exception:
-            motion_tick = 1
+        motion_tick = max(1, int(getattr(self.cfg, "motion_tick_seconds", 1) or 1))
 
         while (t <= self.cfg.total_time) and (not self._stop_flag.is_set()):
 
             close_old_connections()
 
             v = Vehicle.objects.filter(id=self.vehicle_id).first()
-
             if v is None:
                 break
 
@@ -180,7 +177,6 @@ class VehicleWorker(threading.Thread):
                 )
 
                 nearest = _nearest_rsu(rsus, (float(x), float(y)))
-
                 now_dt = self.cfg.base_time + timedelta(seconds=int(t))
 
                 with transaction.atomic():
@@ -190,8 +186,38 @@ class VehicleWorker(threading.Thread):
                         now_dt
                     )
 
-  
-                available_sps = discover_available_sps(v, rsus, self.params)
+                available_sps = discover_available_sps(v)
+
+            if self.app_interval > 0 and (t % self.app_interval == 0) and (t < self.cfg.total_time):
+
+                app_type_id = _pick_application_type_id(min_tasks=self.min_tasks)
+
+                if app_type_id is not None:
+
+                    now_dt = _sim_datetime(self.cfg, float(t))
+
+                    with transaction.atomic():
+
+                        exists = Application.objects.filter(
+                            vehicle_id_id=self.vehicle_id,
+                            is_progress=True,
+                        ).exists()
+
+                        if not exists:
+
+                            app = Application.objects.create(
+                                vehicle_id_id=self.vehicle_id,
+                                application_type_id_id=int(app_type_id),
+                                start_at=now_dt,
+                                end_at=None,
+                                is_progress=True,
+                            )
+
+                            app.context = {
+                                "application_id": app.id,
+                                "available_sps": available_sps,
+                            }
+                            app.save(update_fields=["context"])
 
             if self._stop_flag.wait(int(motion_tick)):
                 break

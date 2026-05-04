@@ -1,13 +1,10 @@
 from typing import Dict, Any
-from django.db import transaction
-
-from dag.models import Task
-from cache.models import cache as Cache
 from monarch_pylib.model import policy
+
 
 def cache_value(ctx, sp_id, task_type_id):
     return policy.cache_service_value_score(
-        cpu_cycles_list=ctx["cpu_cycles"],
+        cpu_cycles_list=list(ctx["cpu_cycles"].values()),
         v_kj_list=ctx["cache_value_v_kj"].get((sp_id, task_type_id), []),
         mu_kj=ctx["cache_value_mu"].get((sp_id, task_type_id), 0.0),
         denom_cpu_cycles_list=ctx["cache_value_denom_cpu_cycles"].get(sp_id, []),
@@ -44,94 +41,28 @@ def cache_knapsack_dp(values, weights, capacity, items):
     return list(reversed(selected))
 
 
-def update_cache(ctx: Dict[str, Any], sp_id: int, task_id: int):
-    task = Task.objects.get(id=task_id)
-    ttype = task.task_type_id_id
-
+def update_cache(ctx, sp_id, task_id):
+    ttype = ctx["task_type_ids"].get(task_id)
     current_cached = ctx["cache"].get(sp_id, set())
-    if ttype in current_cached:
-        return {
-            "sp_id": sp_id,
-            "updated": False,
-            "added": [],
-            "removed": [],
-            "items": list(current_cached),
-        }
 
-    value = cache_value(ctx, sp_id, ttype)
-    ctx.setdefault("eta_values", {})
-    ctx["eta_values"][(sp_id, ttype)] = value
+    if ttype in current_cached:
+        return {"updated": False}
 
     task_types = list(set(ctx["task_type_ids"].values()) - {None})
     capacity = ctx["sp_cache_capacity"][sp_id]
 
-    values = {t: ctx["eta_values"].get((sp_id, t), 0.0) for t in task_types}
-    weights = {t: ctx["task_type_size_bits"][t] for t in task_types}
+    values: Dict[Any, float] = {}
+    weights: Dict[Any, int] = {}
+
+    for t in task_types:
+        values[t] = cache_value(ctx, sp_id, t)
+        weights[t] = ctx["task_type_size_bits"][t]
 
     new_items = cache_knapsack_dp(values, weights, capacity, task_types)
-    new_items_set = set(new_items)
 
-    removed = [x for x in current_cached if x not in new_items_set]
-    added = [x for x in new_items if x not in current_cached]
-
-    ctx["cache"][sp_id] = new_items_set
+    ctx["cache"][sp_id] = set(new_items)
 
     return {
-        "sp_id": sp_id,
         "updated": True,
-        "added": added,
-        "removed": removed,
-        "items": new_items,
+        "items": new_items
     }
-
-
-# def update_cache(ctx: Dict[str, Any], sp_id: int, task_id: int):
-
-#     task = Task.objects.get(id=task_id)
-#     ttype = task.task_type_id_id
-
-#     current_cached = ctx["cache"].get(sp_id, set())
-#     if ttype in current_cached:
-#         return {
-#             "sp_id": sp_id,
-#             "updated": False,
-#             "added": [],
-#             "removed": [],
-#             "items": list(current_cached),
-#         }
-
-#     # compute η_kj
-#     value = cache_value(ctx, sp_id, ttype)
-#     ctx.setdefault("eta_values", {})
-#     ctx["eta_values"][(sp_id, ttype)] = value
-
-#     task_types = list(set(ctx["task_type_ids"].values()) - {None})
-#     capacity = ctx["sp_cache_capacity"][sp_id]
-
-#     values = {t: ctx["eta_values"].get((sp_id, t), 0.0) for t in task_types}
-#     weights = {t: ctx["task_type_size_bits"][t] for t in task_types}
-
-#     new_items = cache_knapsack_dp(values, weights, capacity, task_types)
-
-#     new_items_set = set(new_items)
-
-#     removed = [x for x in current_cached if x not in new_items_set]
-#     added = [x for x in new_items if x not in current_cached]
-
-#     with transaction.atomic():
-#         Cache.objects.filter(sp_id_id=sp_id).delete()
-#         for t in new_items:
-#             Cache.objects.create(
-#                 sp_id_id=sp_id,
-#                 task_type_id_id=t,
-#             )
-
-#     ctx["cache"][sp_id] = new_items_set
-
-#     return {
-#         "sp_id": sp_id,
-#         "updated": True,
-#         "added": added,
-#         "removed": removed,
-#         "items": new_items,
-#     }

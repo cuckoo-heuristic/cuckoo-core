@@ -1,8 +1,10 @@
 import threading
 from datetime import timedelta
+
 from django.db import close_old_connections, transaction
 from django.db.models import Q
 from django.utils import timezone
+
 from parameter.services import load_params_obj
 
 from object.models import RSU, RSUVehicle, Vehicle
@@ -14,7 +16,6 @@ from application.models import Application
 
 from run.worker.vehicle import VehicleWorker, SimulationConfig
 from run.worker.rsu import RSUWorker
-from run.worker.task import TaskGeneratorWorker
 from system.build_context import MiniSystemContextBuilder as build_context
 
 
@@ -22,7 +23,6 @@ _registry_lock = threading.Lock()
 
 _vehicle_workers = []
 _rsu_workers = []
-_task_gen = None
 _status_worker = None
 _context_worker = None
 _clock_worker = None
@@ -86,7 +86,7 @@ def _build_cfg(params) -> SimulationConfig:
 
     cfg = SimulationConfig(
         total_time=total_time,
-        tick_seconds=scheduling_tick,
+        tick_seconds=scheduling_tick,   # این همان app_interval در VehicleWorker است
         cell_radius_rsu=cell_radius_rsu,
         base_time=base_time,
     )
@@ -370,7 +370,7 @@ def reset_simulation():
 
 
 def run_simulation(a1: int = 1, a2: int = 1, a3: int = 1):
-    global _running, _vehicle_workers, _rsu_workers, _task_gen, _status_worker, _context_worker, _clock_worker, _cfg
+    global _running, _vehicle_workers, _rsu_workers, _status_worker, _context_worker, _clock_worker, _cfg
 
     with _registry_lock:
         if _running:
@@ -388,7 +388,6 @@ def run_simulation(a1: int = 1, a2: int = 1, a3: int = 1):
     _vehicle_workers = [VehicleWorker(vehicle_id=v.id, cfg=cfg) for v in Vehicle.objects.all()]
     _rsu_workers = [RSUWorker(rsu_id=r.id, cfg=cfg) for r in RSU.objects.all()]
 
-    _task_gen = TaskGeneratorWorker(cfg=cfg)
     _status_worker = StatusWorker(cfg=cfg)
     _context_worker = ContextWorker(cfg=cfg)
 
@@ -397,7 +396,6 @@ def run_simulation(a1: int = 1, a2: int = 1, a3: int = 1):
     for w in _vehicle_workers + _rsu_workers:
         w.start()
 
-    _task_gen.start()
     _status_worker.start()
     _context_worker.start()
 
@@ -410,15 +408,12 @@ def stop_simulation():
             return
 
         workers = list(_vehicle_workers + _rsu_workers)
-        task_gen = _task_gen
         status_w = _status_worker
         ctx_w = _context_worker
         clock_w = _clock_worker
         cfg = _cfg
         sim_time_s = float(_sim_time_s)
 
-    if task_gen is not None:
-        task_gen.stop()
     if status_w is not None:
         status_w.stop()
     if ctx_w is not None:
@@ -431,8 +426,6 @@ def stop_simulation():
 
     cur = threading.current_thread()
 
-    if task_gen is not None and task_gen is not cur:
-        task_gen.join()
     if status_w is not None and status_w is not cur:
         status_w.join()
     if ctx_w is not None and ctx_w is not cur:
@@ -478,7 +471,6 @@ def simulation_status():
         running = _running
         vehicle_workers = len(_vehicle_workers)
         rsu_workers = len(_rsu_workers)
-        has_task_gen = _task_gen is not None
         has_context = _context_worker is not None
         has_status = _status_worker is not None
         cfg = _cfg
@@ -499,7 +491,7 @@ def simulation_status():
         "workers": {
             "vehicle": vehicle_workers,
             "rsu": rsu_workers,
-            "task_generator": has_task_gen,
+            "task_generator": False,  # دیگر worker جداگانه‌ای برای task/app نداریم
             "context": has_context,
             "status": has_status,
         },
