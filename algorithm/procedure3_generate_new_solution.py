@@ -8,7 +8,7 @@ from algorithm.update_service_cache import update_cache
 params = load_params_obj()
 params_lib = load_params_for_lib()
 
-levy_lambda = params_lib["levy_lambda"]
+levy_lambda = params.levy_lambda
 
 
 def nest_to_dict(nest: List[Tuple[int, int, int]]) -> Dict:
@@ -18,8 +18,6 @@ def nest_to_dict(nest: List[Tuple[int, int, int]]) -> Dict:
 def dict_to_nest(X: Dict, task_list) -> List[Tuple[int, int, int]]:
     return [(i, X[i]["provider"], X[i]["rank"]) for i in task_list]
 
-
-# ✅ CHANGE 1: provider + rank
 def hamming_distance(Xs: Dict, Xb: Dict | None, task_list) -> int:
     if Xb is None:
         return len(task_list)
@@ -183,9 +181,6 @@ def procedure3_generate_new_solution(
             )
 
     rebuild_binary(ctx, Xnew, task_list, sp_list)
-
-    # # ✅ CHANGE 3: reset cache before update
-    # ctx["cache"].clear()
 
     for i in task_list:
         update_cache(ctx, Xnew[i]["provider"], i)

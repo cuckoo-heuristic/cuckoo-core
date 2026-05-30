@@ -2,11 +2,11 @@ from __future__ import annotations
 import random
 from typing import List
 from parameter.services import load_params_for_lib, load_params_obj
-from monarch_pylib.model import offloading_efficiency, transmission, communication, scheduling
-
+from monarch_pylib.model import offloading_efficiency, transmission, communication, scheduling,policy
+from monarch_pylib.model.transmission import channel_gain_v2i, v2i_uplink_rate
+from .low_complexity import run as optimize_tx_power
 params = load_params_obj()
 params_lib = load_params_for_lib()
-
 
 def _safe_float(x, default=0.0):
     try:
@@ -183,31 +183,66 @@ def e_off(ctx):
         compute_energy_by_provider_j=energy_matrix,
         z_task_provider=_z_task_provider(ctx)
     )
+def ch_gain(ctx, sp_id: int) -> float:
+    distance = float(ctx["distance"][sp_id])
+    tau_nm = float(getattr(params, "sigma_v2i", 8.0))
+    g_rsu_db = float(getattr(params, "G_rsu", 8.0))
+    g_vehicle_db = float(getattr(params, "G_vehicle", 3.0))
+    g_rsu = 10 ** (g_rsu_db / 10.0)
+    g_vehicle = 10 ** (g_vehicle_db / 10.0)
 
+    rho = g_rsu * g_vehicle
+    varpi_nm = float(getattr(params, "h_rsu", 5.0)) * float(getattr(params, "h_vehicle", 1.5))
+    gamma = float(getattr(params, "Y_v2i", 3.76))
+
+    return float(
+        channel_gain_v2i(
+            tau_nm=tau_nm,
+            rho=rho,
+            varpi_nm=varpi_nm,
+            distance_nm=distance,
+            pathloss_exponent_gamma=gamma
+        )
+    )
+
+def rate(ctx, sp_id: int) -> float:
+    vn_m = float(ctx["connected_vehicles_count"].get(sp_id, 1.0)) if "connected_vehicles_count" in ctx else 1.0
+    b_hz = float(getattr(params_lib, "B_hz", 20.0 * 1e6))
+    delta2_w = float(getattr(params_lib, "delta2_w", 1e-13))
+    h = ch_gain(ctx, sp_id)
+    p_opt = optimize_tx_power(ctx)
+    return float(
+        v2i_uplink_rate(
+            B_hz=b_hz,
+            V_m=vn_m,
+            tx_power_pn=p_opt,
+            channel_gain_gnm=h,
+            noise_power_delta2=delta2_w
+        )
+    )
 
 def t_rec_i_prim(ctx, src_sp: int, dst_sp: int, src_task: int, dst_task: int):
-    ft_src = t_finish(ctx, src_sp, src_task)
-    ft_dst = t_finish(ctx, dst_sp, dst_task)
 
+    ft_src = float(t_finish(ctx, src_sp, src_task))
     same = src_sp == dst_sp
-    idle = float(ctx["idle_time"])
+    idle = float(ctx.get("idle_time", 0.0))
 
     if same:
-        tr = 0.0
+        transfer_time = 0.0
     else:
-        tr = transmission.task_output_transmission_time(
-            data_size_bits=float(ctx["output_size"][src_task]),
-            src_sp_id=src_sp,
-            dst_sp_id=dst_sp
-        )
+        data_size = float(ctx["output_size"][src_task])
+        r = rate(ctx, dst_sp)
+
+        transfer_time = 0.0 if r <= 0 else data_size / r
 
     return scheduling.dependency_output_receive_time(
         finish_time_src_s=ft_src,
-        finish_time_same_provider_s=ft_dst,
+        finish_time_same_provider_s=ft_src,
         idle_time_s=idle,
-        transfer_time_s=tr,
+        transfer_time_s=transfer_time,
         same_provider=same
     )
+
 
 
 def t_rec(ctx, sp_id: int, task_id: int):
@@ -245,13 +280,13 @@ def compute_Q(ctx, sp_id: int, i: int):
     a = _safe_float(params.alpha_n)
     b = _safe_float(params.beta_n)
 
-    return offloading_efficiency.application_offloading_efficiency(
+    return policy.single_task_efficiency(
         alpha_n=a,
         beta_n=b,
         t_ref_s=t_ref_s(ctx),
-        t_off_s=t_finish(ctx, sp_id, i),
-        e_loc_j=e_com(ctx, sp_id, i),
-        e_task_off_j=e_com(ctx, sp_id, i)
+        task_finish_time_s=t_finish(ctx, sp_id, i),
+        e_loc_j=e_loc_j(ctx),
+        e_task_off_j=e_com(ctx, sp_id, i) #////////
     )
 
 

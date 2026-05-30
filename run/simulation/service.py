@@ -7,7 +7,7 @@ from django.utils import timezone
 
 from parameter.services import load_params_obj
 
-from object.models import RSU, RSUVehicle, Vehicle
+from object.models import RSU, RSUVehicle, Vehicle, ServiceProvider
 from cache.models import cache as CacheModel
 from resource.models import Resource
 from dag.models import Task
@@ -44,6 +44,19 @@ _snapshot = {
         "last_error": None,
     },
 }
+
+
+def ensure_service_providers():
+    for rsu in RSU.objects.all():
+        ServiceProvider.objects.get_or_create(
+            rsu_id=rsu,
+            defaults={"name": f"rsu-{rsu.id}", "type": "rsu"}
+        )
+    for v in Vehicle.objects.all():
+        ServiceProvider.objects.get_or_create(
+            vehicle_id=v,
+            defaults={"name": f"vehicle-{v.id}", "type": "vehicle"}
+        )
 
 
 def _safe_int(x, name: str) -> int:
@@ -86,7 +99,7 @@ def _build_cfg(params) -> SimulationConfig:
 
     cfg = SimulationConfig(
         total_time=total_time,
-        tick_seconds=scheduling_tick,   # این همان app_interval در VehicleWorker است
+        tick_seconds=scheduling_tick,
         cell_radius_rsu=cell_radius_rsu,
         base_time=base_time,
     )
@@ -97,9 +110,8 @@ def _build_cfg(params) -> SimulationConfig:
     return cfg
 
 
-def _close_open_applications() -> None:
-    now = timezone.now()
-    Application.objects.filter(is_progress=True).update(is_progress=False, end_at=now)
+def _close_open_applications(close_at) -> None:
+    Application.objects.filter(is_progress=True).update(is_progress=False, end_at=close_at)
 
 
 def _sim_now_dt(base_time, sim_time_s: float):
@@ -157,18 +169,16 @@ def _summarize_ctx(ctx: dict, vehicle_id: int, sim_time_s: float) -> dict:
 
         if st is None:
             continue
+
         if et is None:
-            running_ids.append(int(tid))
+            if st <= now_dt:
+                running_ids.append(int(tid))
             continue
 
-        try:
-            if st <= now_dt < et:
-                running_ids.append(int(tid))
-                continue
-            if et <= now_dt:
-                done_ids.append(int(tid))
-        except Exception:
-            continue
+        if st <= now_dt < et:
+            running_ids.append(int(tid))
+        elif et <= now_dt:
+            done_ids.append(int(tid))
 
     done_set = set(done_ids)
     ready_set = set(ready_ids)
@@ -200,14 +210,12 @@ def _summarize_ctx(ctx: dict, vehicle_id: int, sim_time_s: float) -> dict:
     else:
         app_id = getattr(app, "id", None)
 
-    has_application = app_id is not None
-
     return {
         "sim_time_s": float(sim_time_s),
         "vehicle_id": int(vehicle_id),
         "rsu_id": actor.get("rsu_id"),
         "neighbors": len(actor.get("neighbor_vehicle_ids") or []),
-        "has_application": bool(has_application),
+        "has_application": app_id is not None,
         "application_id": app_id,
         "ready_tasks": len(ready_ids),
         "ready_tasks_count": len(ready_ids),
@@ -231,25 +239,16 @@ class ClockWorker(threading.Thread):
 
     def run(self):
         close_old_connections()
-
         clock_tick = int(getattr(self.cfg, "clock_tick_seconds", 1) or 1)
         total_time = int(getattr(self.cfg, "total_time", 0) or 0)
-        if clock_tick <= 0:
-            raise ValueError(f"Invalid cfg.clock_tick_seconds={clock_tick}")
-        if total_time <= 0:
-            raise ValueError(f"Invalid cfg.total_time={total_time}")
-
         t = 0.0
         _set_sim_time_s(0.0)
         _set_stop_requested(False)
-
         while (not self._stop_flag.is_set()) and (t < float(total_time)):
             if self._stop_flag.wait(clock_tick):
                 break
-
             t = min(float(total_time), t + float(clock_tick))
             _set_sim_time_s(t)
-
         if not self._stop_flag.is_set():
             _set_sim_time_s(float(total_time))
             _set_stop_requested(True)
@@ -267,9 +266,6 @@ class StatusWorker(threading.Thread):
     def run(self):
         close_old_connections()
         clock_tick = int(getattr(self.cfg, "clock_tick_seconds", 1) or 1)
-        if clock_tick <= 0:
-            raise ValueError(f"Invalid cfg.clock_tick_seconds={clock_tick}")
-
         while not self._stop_flag.is_set():
             close_old_connections()
             with _registry_lock:
@@ -290,51 +286,28 @@ class ContextWorker(threading.Thread):
     def run(self):
         close_old_connections()
         clock_tick = int(getattr(self.cfg, "clock_tick_seconds", 1) or 1)
-        if clock_tick <= 0:
-            raise ValueError(f"Invalid cfg.clock_tick_seconds={clock_tick}")
-
         total_time = int(getattr(self.cfg, "total_time", 0) or 0)
-        if total_time <= 0:
-            raise ValueError(f"Invalid cfg.total_time={total_time}")
-
         while not self._stop_flag.is_set():
             close_old_connections()
-
             t = _get_sim_time_s()
             if t > float(total_time):
                 t = float(total_time)
-
-            ok = 0
-            fail = 0
-            sample = None
-            last_error = None
-            vehicle_summaries = []
-
+            ok, fail, sample, last_error, vehicle_summaries = 0, 0, None, None, []
             vehicle_ids = list(Vehicle.objects.values_list("id", flat=True))
             for vid in vehicle_ids:
                 if self._stop_flag.is_set():
                     break
                 try:
-                    base = {
-                        "actor": {"vehicle_id": int(vid)},
-                        "sim_time_s": float(t),
-                        "base_time": self.cfg.base_time,
-                    }
+                    base = {"actor": {"vehicle_id": int(vid)}, "sim_time_s": float(t), "base_time": self.cfg.base_time}
                     ctx = build_context(base, write_db=False)
                     ok += 1
-
                     cur_sample = _summarize_ctx(ctx=ctx, vehicle_id=int(vid), sim_time_s=float(t))
                     vehicle_summaries.append(cur_sample)
-
-                    if sample is None:
+                    if sample is None or ((not sample.get("has_application")) and cur_sample.get("has_application")):
                         sample = cur_sample
-                    else:
-                        if (not sample.get("has_application")) and cur_sample.get("has_application"):
-                            sample = cur_sample
                 except Exception as e:
                     fail += 1
                     last_error = str(e)
-
             with _registry_lock:
                 _snapshot["context"] = {
                     "ok": ok,
@@ -343,17 +316,15 @@ class ContextWorker(threading.Thread):
                     "vehicles": vehicle_summaries,
                     "sim_time_s": float(t),
                     "base_time": self.cfg.base_time,
-                    "base_time_type": type(self.cfg.base_time).__name__ if self.cfg.base_time is not None else None,
+                    "base_time_type": type(self.cfg.base_time).__name__ if self.cfg.base_time else None,
                     "last_error": last_error,
                 }
-
             if _get_stop_requested() and float(t) >= float(total_time):
                 try:
                     stop_simulation()
                 except Exception:
                     pass
                 break
-
             if self._stop_flag.wait(clock_tick):
                 break
 
@@ -371,81 +342,63 @@ def reset_simulation():
 
 def run_simulation(a1: int = 1, a2: int = 1, a3: int = 1):
     global _running, _vehicle_workers, _rsu_workers, _status_worker, _context_worker, _clock_worker, _cfg
-
     with _registry_lock:
         if _running:
             return
         _running = True
         _stop_requested = False
-
     params = load_params_obj()
     cfg = _build_cfg(params)
     _cfg = cfg
     _set_sim_time_s(0.0)
     _set_stop_requested(False)
-
+    ensure_service_providers()
     _clock_worker = ClockWorker(cfg=cfg)
     _vehicle_workers = [VehicleWorker(vehicle_id=v.id, cfg=cfg) for v in Vehicle.objects.all()]
     _rsu_workers = [RSUWorker(rsu_id=r.id, cfg=cfg) for r in RSU.objects.all()]
-
     _status_worker = StatusWorker(cfg=cfg)
     _context_worker = ContextWorker(cfg=cfg)
-
     _clock_worker.start()
-
     for w in _vehicle_workers + _rsu_workers:
         w.start()
-
     _status_worker.start()
     _context_worker.start()
 
 
 def stop_simulation():
     global _running
-
     with _registry_lock:
         if not _running:
             return
-
         workers = list(_vehicle_workers + _rsu_workers)
         status_w = _status_worker
         ctx_w = _context_worker
         clock_w = _clock_worker
         cfg = _cfg
-        sim_time_s = float(_sim_time_s)
-
-    if status_w is not None:
+    if status_w:
         status_w.stop()
-    if ctx_w is not None:
+    if ctx_w:
         ctx_w.stop()
-    if clock_w is not None:
+    if clock_w:
         clock_w.stop()
-
     for w in workers:
         w.stop()
-
     cur = threading.current_thread()
-
-    if status_w is not None and status_w is not cur:
+    if status_w and status_w is not cur:
         status_w.join()
-    if ctx_w is not None and ctx_w is not cur:
+    if ctx_w and ctx_w is not cur:
         ctx_w.join()
-    if clock_w is not None and clock_w is not cur:
+    if clock_w and clock_w is not cur:
         clock_w.join()
-
     for w in workers:
         if w is not cur:
             w.join()
-
     with _registry_lock:
         _running = False
 
-    if cfg is not None:
+    if cfg:
         total_time = int(getattr(cfg, "total_time", 0) or 0)
-        if total_time > 0:
-            sim_time_s = float(total_time)
-
-        horizon_dt = _sim_now_dt(getattr(cfg, "base_time", None), float(sim_time_s))
+        horizon_dt = _sim_now_dt(getattr(cfg, "base_time", None), float(total_time) if total_time > 0 else float(_sim_time_s))
         try:
             with transaction.atomic():
                 qs = TaskExecution.objects.filter(start_time__lte=horizon_dt).filter(
@@ -454,80 +407,39 @@ def stop_simulation():
                 for te in qs.select_related("application_id", "task_id", "sp_id"):
                     te.end_time = horizon_dt
                     try:
-                        if te.start_time is not None and te.end_time is not None:
+                        if te.start_time and te.end_time:
                             te.exec_time = float((te.end_time - te.start_time).total_seconds())
                     except Exception:
                         pass
                     te.save(update_fields=["end_time", "exec_time"])
+                _close_open_applications(horizon_dt)
         except Exception:
             pass
-
-    _close_open_applications()
+    else:
+        _close_open_applications(timezone.now())
 
 
 def simulation_status():
     with _registry_lock:
         snap = dict(_snapshot)
         running = _running
-        vehicle_workers = len(_vehicle_workers)
-        rsu_workers = len(_rsu_workers)
-        has_context = _context_worker is not None
-        has_status = _status_worker is not None
+        v_workers = len(_vehicle_workers)
+        r_workers = len(_rsu_workers)
+        h_ctx = _context_worker is not None
+        h_stat = _status_worker is not None
         cfg = _cfg
-
     context = snap.get("context", {}) or {}
-    sample = context.get("sample") or {}
-
-    cfg_info = None
-    if cfg is not None:
-        cfg_info = {
-            "total_time": int(getattr(cfg, "total_time", 0) or 0),
-            "tick_seconds": int(getattr(cfg, "tick_seconds", 0) or 0),
-            "cell_radius_rsu": float(getattr(cfg, "cell_radius_rsu", 0.0) or 0.0),
-        }
-
     return {
         "running": running,
-        "workers": {
-            "vehicle": vehicle_workers,
-            "rsu": rsu_workers,
-            "task_generator": False,  # دیگر worker جداگانه‌ای برای task/app نداریم
-            "context": has_context,
-            "status": has_status,
-        },
+        "workers": {"vehicle": v_workers, "rsu": r_workers, "context": h_ctx, "status": h_stat},
         "counts": {
             "vehicles": Vehicle.objects.count(),
             "rsus": RSU.objects.count(),
-            "rsu_vehicle_total": RSUVehicle.objects.count(),
-            "rsu_vehicle_open": RSUVehicle.objects.filter(end_time__isnull=True).count(),
             "applications": Application.objects.count(),
-            "applications_in_progress": Application.objects.filter(is_progress=True).count(),
-            "tasks": Task.objects.count(),
             "taskexecutions": TaskExecution.objects.count(),
             "cache_items": CacheModel.objects.count(),
         },
-        "context": {
-            "ok": context.get("ok", 0),
-            "fail": context.get("fail", 0),
-            "sample": sample,
-            "vehicles": context.get("vehicles") or [],
-            "sim_time_s": context.get("sim_time_s"),
-            "base_time": context.get("base_time"),
-            "base_time_type": context.get("base_time_type"),
-            "last_error": context.get("last_error"),
-        },
-        "cfg": cfg_info,
-        "sanity": {
-            "ctx_running": context.get("ok", 0) > 0,
-            "ctx_no_error": context.get("fail", 0) == 0,
-            "has_application": bool(sample.get("has_application")),
-            "has_ready_tasks": (sample.get("ready_tasks", 0) > 0)
-            if "ready_tasks" in sample
-            else (sample.get("ready_tasks_count", 0) > 0),
-            "ready_task_ids_sample": sample.get("ready_task_ids") or [],
-            "done_task_ids_sample": sample.get("done_task_ids") or [],
-            "blocked_task_ids_sample": sample.get("blocked_task_ids") or [],
-            "db_debug_sample": (sample.get("db_debug") or {}),
-        },
+        "context": context,
+        "cfg": {"total_time": int(getattr(cfg, "total_time", 0) or 0)} if cfg else None,
         "snapshot_ts": snap.get("ts"),
     }

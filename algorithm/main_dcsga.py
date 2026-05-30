@@ -1,30 +1,63 @@
 import random
 from typing import List, Tuple
 from parameter.services import load_params_for_lib, load_params_obj
-from greedy_nests import procedure1_greedy_initialization, compute_Q1
-from procedure3_generate_new_solution import procedure3_generate_new_solution
-from update_service_cache import update_cache
-from low_complexity import run as optimize_tx_power
+from .greedy_nests import procedure1_greedy_initialization, compute_Q1
+from .procedure3_generate_new_solution import procedure3_generate_new_solution
+from .update_service_cache import update_cache
+from .low_complexity import run as optimize_tx_power
 from monarch_pylib.model import task_ranking
 from monarch_pylib.model import offloading_efficiency, transmission, communication, scheduling
 from monarch_pylib.model.transmission import channel_gain_v2i, v2i_uplink_rate
+
 params = load_params_obj()
 params_lib = load_params_for_lib()
 
-def hh(ctx, sp_id: int) -> float:
+# ////////
+def ch_gain(ctx, sp_id: int) -> float:
     distance = float(ctx["distance"][sp_id])
-    tau_nm = float(getattr(params_lib, "sigma_v2i", 8.0))
-    rho = float(getattr(params_lib, "G_rsu", 8.0)) * float(getattr(params_lib, "G_vehicle", 3.0))
-    varpi_nm = float(getattr(params_lib, "h_rsu", 5.0)) * float(getattr(params_lib, "h_vehicle", 1.5))
-    gamma = float(getattr(params_lib, "Y_v2i", 3.76))
-    return float(channel_gain_v2i(tau_nm=tau_nm, rho=rho, varpi_nm=varpi_nm, distance_nm=distance, pathloss_exponent_gamma=gamma))
+    tau_nm = float(getattr(params, "sigma_v2i", 8.0))
+    g_rsu_db = float(getattr(params, "G_rsu", 8.0))
+    g_vehicle_db = float(getattr(params, "G_vehicle", 3.0))
+    g_rsu = 10 ** (g_rsu_db / 10.0)
+    g_vehicle = 10 ** (g_vehicle_db / 10.0)
 
+    rho = g_rsu * g_vehicle
+    varpi_nm = float(getattr(params, "h_rsu", 5.0)) * float(getattr(params, "h_vehicle", 1.5))
+    gamma = float(getattr(params, "Y_v2i", 3.76))
+
+    return float(
+        channel_gain_v2i(
+            tau_nm=tau_nm,
+            rho=rho,
+            varpi_nm=varpi_nm,
+            distance_nm=distance,
+            pathloss_exponent_gamma=gamma
+        )
+    )
+
+# //////////
 def rate(ctx, sp_id: int) -> float:
-    vn_m = float(ctx["v_m"].get(sp_id, 1.0)) if "v_m" in ctx else 1.0
+    vn_m = float(ctx["connected_vehicles_count"].get(sp_id, 1.0)) if "connected_vehicles_count" in ctx else 1.0
     b_hz = float(getattr(params_lib, "B_hz", 20.0 * 1e6))
-    delta2_w=float(getattr(params_lib, "delta2_w", 20.0 * 1e6))
-    h = hh(ctx, sp_id)
-    return float(v2i_uplink_rate(B_hz=b_hz, V_m=vn_m, tx_power_pn=float(ctx.get("p_n_w", 0.0)), channel_gain_gnm=h, noise_power_delta2=delta2_w))
+    delta2_w = float(getattr(params_lib, "delta2_w", 1e-13))
+    h = ch_gain(ctx, sp_id)
+
+    sp_type = ctx.get("sp_types", {}).get(sp_id, None)
+    if sp_type == "rsu":
+        pmax = float(getattr(params_lib, "pmax_rsu_w", 0.0))
+    else:
+        pmax = float(getattr(params_lib, "pmax_vehicle_w", 0.0))
+
+    p_opt = optimize_tx_power(ctx, pmax=pmax)
+    return float(
+        v2i_uplink_rate(
+            B_hz=b_hz,
+            V_m=vn_m,
+            tx_power_pn=p_opt,
+            channel_gain_gnm=h,
+            noise_power_delta2=delta2_w
+        )
+    )
 
 def compute_local_ranks(ctx):
     children = ctx["children"]
@@ -33,26 +66,33 @@ def compute_local_ranks(ctx):
     rates = ctx["rates"]
     all_tasks = ctx["tasks"]["all"]
     ranks = {}
+    r = max(rates.values()) if rates else 1e-6
+
     for tid in reversed(all_tasks):
         exec_time = communication.local_task_compute_time(
             cpu_cycles=cpu_cycles[tid],
             local_cpu_freq_hz=ctx["local_cpu_freq_hz"]
         )
+
         succs = children[tid]
+
         if not succs:
             ranks[tid] = exec_time
             continue
+
         comm_times = []
         succ_ranks = []
+
         for s in succs:
             size = sizes_bits[tid]
-            r = rates[tid] if rates[tid] > 0 else 1e-6
+
             comm_times.append(
                 transmission.intermediate_data_tx_time(
                     data_bits=size,
                     link_rate_bps=r
                 )
             )
+
             succ_ranks.append(ranks[s])
 
         ranks[tid] = task_ranking.heft_task_local_rank(
@@ -60,12 +100,15 @@ def compute_local_ranks(ctx):
             succ_comm_times_s=comm_times,
             succ_ranks_s=succ_ranks,
         )
+
     return ranks
+
 
 def compute_global_ranks(ctx, local_ranks):
     max_deadline = ctx["deadline_max_s"]
     app_deadline = ctx["deadline_s"]
     global_ranks = {}
+
     for tid, r in local_ranks.items():
         global_ranks[tid] = task_ranking.heft_task_global_rank(
             local_rank_s=r,
@@ -81,6 +124,7 @@ def get_task_order(global_ranks):
         tid for tid, _ in sorted(global_ranks.items(), key=lambda x: x[1], reverse=True)
     ]
 
+
 def evaluate_solution_quality(ctx, nest, task_order):
     ctx["cache"] = {}
     total_q = 0
@@ -93,11 +137,13 @@ def evaluate_solution_quality(ctx, nest, task_order):
 
     return total_q
 
+
 def dcsga_compute_ranks_and_order(ctx):
     local_ranks = compute_local_ranks(ctx)
     global_ranks = compute_global_ranks(ctx, local_ranks)
     task_order = get_task_order(global_ranks)
     return task_order
+
 
 def dcsga_run(ctx):
     params = load_params_obj()
@@ -105,7 +151,9 @@ def dcsga_run(ctx):
     S = int(params.S)
     Pa0 = float(params.p_discard_init)
 
-    p_opt = optimize_tx_power(ctx)
+    ctx["rates"] = {}
+    for sp_id in ctx["distance"]:
+        ctx["rates"][sp_id] = rate(ctx, sp_id)
 
     task_order = dcsga_compute_ranks_and_order(ctx)
 

@@ -27,6 +27,7 @@ INSTALLED_APPS = [
     'object',
     'resource',
     'state',
+    'run',
 ]
 
 MIDDLEWARE = [

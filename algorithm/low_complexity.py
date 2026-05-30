@@ -13,24 +13,25 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
     except Exception:
         return float(default)
 
+def db_to_linear(db: float) -> float:
+    return 10 ** (float(db) / 10.0)
+
 def hh(ctx, sp_id: int) -> float:
     distance = float(ctx["distance"][sp_id])
-    tau_nm = float(getattr(params_lib, "sigma_v2i", 8.0))
-    rho = float(getattr(params_lib, "G_rsu", 8.0)) * float(getattr(params_lib, "G_vehicle", 3.0))
-    varpi_nm = float(getattr(params_lib, "h_rsu", 5.0)) * float(getattr(params_lib, "h_vehicle", 1.5))
-    gamma = float(getattr(params_lib, "Y_v2i", 3.76))
-    return float(channel_gain_v2i(tau_nm=tau_nm, rho=rho, varpi_nm=varpi_nm, distance_nm=distance, pathloss_exponent_gamma=gamma))
+    tau_nm = float(getattr(params, "sigma_v2i", 8.0))
+    g_rsu_db = float(getattr(params, "G_rsu", 8.0))
+    g_vehicle_db = float(getattr(params, "G_vehicle", 3.0))
+    rho = db_to_linear(g_rsu_db) * db_to_linear(g_vehicle_db)
+    varpi_nm = float(getattr(params, "h_rsu", 5.0)) * float(getattr(params, "h_vehicle", 1.5))
+    gamma = float(getattr(params, "Y_v2i", 3.76))
 
-def rate(ctx, sp_id: int) -> float:
-    vn_m = float(ctx["v_m"].get(sp_id, 1.0)) if "v_m" in ctx else 1.0
-    b_hz = float(getattr(params_lib, "B_hz", 20.0 * 1e6))
-    if hasattr(params_lib, "delta2_w"):
-        delta2_w = float(params_lib.delta2_w)
-    else:
-        delta2_dbm = float(getattr(params_lib, "delta2", -114))
-        delta2_w = 10 ** ((delta2_dbm - 30.0) / 10.0)
-    h = hh(ctx, sp_id)
-    return float(v2i_uplink_rate(B_hz=b_hz, V_m=vn_m, tx_power_pn=float(ctx.get("p_n_w", 0.0)), channel_gain_gnm=h, noise_power_delta2=delta2_w))
+    return float(channel_gain_v2i(
+        tau_nm=tau_nm,
+        rho=rho,
+        varpi_nm=varpi_nm,
+        distance_nm=distance,
+        pathloss_exponent_gamma=gamma
+    ))
 
 def compute_local_time(ctx) -> float:
     cpu_cycles_list = list(ctx["cpu_cycles"].values())
