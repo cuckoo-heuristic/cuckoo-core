@@ -1,13 +1,14 @@
 from collections import defaultdict
-from django.core.cache import cache
-from django.db.models import Max
-from application.models import Application, ApplicationType
-from dag.models import Task, TaskDependency
+from math import isfinite
+from django.core.cache import cache as django_cache
+from application.models import Application
+from dag.models import Task, TaskDependency, TaskType
 from object.models import ServiceProvider, Vehicle, RSUVehicle
-from cache.models import cache as Cache
+from cache.models import cache as CacheModel
 from resource.models import Resource
-from parameter.services import load_params_for_lib
+from parameter.services import load_params_for_lib, load_params_obj
 from monarch_pylib.model.transmission import distance_3d
+
 
 class MiniSystemContextBuilder:
     def __init__(self, application_id: int):
@@ -25,105 +26,550 @@ class MiniSystemContextBuilder:
         return self.ctx
 
     def _build_application(self):
-        app = Application.objects.select_related("application_type_id", "vehicle_id").get(id=self.application_id)
-        self.ctx["application"] = {"id": app.id, "application_type_id": app.application_type_id.id}
-        
-        ddl = float(app.application_type_id.deadline)
-        
-        max_ddl_aggregate = ApplicationType.objects.aggregate(max_deadline=Max('deadline'))
-        max_ddl_val = max_ddl_aggregate.get('max_deadline')
-        max_ddl = float(max_ddl_val) if max_ddl_val else ddl
-        
-        self.ctx["t_ddl_s"] = ddl
-        self.ctx["deadline_s"] = ddl
-        self.ctx["deadline_max_s"] = max_ddl
-        self.ctx["vehicle_id"] = app.vehicle_id.id if app.vehicle_id else None
+        app = Application.objects.select_related(
+            "application_type_id",
+            "vehicle_id",
+        ).get(id=self.application_id)
+
+        app_type = app.application_type_id
+        vehicle = app.vehicle_id
+
+        if app_type is None:
+            raise ValueError(f"Application {app.id} has no application type")
+        if vehicle is None:
+            raise ValueError(f"Application {app.id} has no vehicle")
+
+        deadline_s = float(app_type.deadline) / 1000.0
+        if deadline_s <= 0.0:
+            raise ValueError(f"Application {app.id} has an invalid deadline")
+
+        alpha_n = 0.01 / deadline_s + 0.6
+        beta_n = 1.0 - alpha_n
+
+        if not 0.0 <= alpha_n <= 1.0 or not 0.0 <= beta_n <= 1.0:
+            raise ValueError(
+                f"Application {app.id} deadline produces invalid paper weights"
+            )
+
+        self.ctx["application"] = {
+            "id": int(app.id),
+            "application_type_id": int(app_type.id),
+            "vehicle_id": int(vehicle.id),
+        }
+        self.ctx["application_initial_snapshot"] = app.initial_snapshot or {}
+        self.ctx["application_type_initial_snapshot"] = app_type.initial_snapshot or {}
+        self.ctx["application_start_at"] = app.start_at
+        self.ctx["t_ddl_s"] = deadline_s
+        self.ctx["deadline_s"] = deadline_s
+        self.ctx["deadline_max_s"] = deadline_s
+        self.ctx["alpha_n"] = float(alpha_n)
+        self.ctx["beta_n"] = float(beta_n)
+        self.ctx["vehicle_id"] = int(vehicle.id)
 
     def _build_task_info(self):
         app_type_id = self.ctx["application"]["application_type_id"]
-        tasks = list(Task.objects.filter(application_type_id=app_type_id).select_related("task_type_id").order_by("id"))
-        tids = [t.id for t in tasks]
-        self.ctx["task_ids"] = tids
-        self.ctx["cpu_cycles"] = {t.id: float(t.workload_cycles) for t in tasks}
-        self.ctx["task_type_ids"] = {t.id: (t.task_type_id.id if t.task_type_id else None) for t in tasks}
-        self.ctx["task_type_size_bits"] = {t.id: (int(t.task_type_id.size) * 8 if t.task_type_id else 0) for t in tasks}
 
-        deps = defaultdict(list)
+        tasks = list(
+            Task.objects.filter(application_type_id_id=app_type_id)
+            .select_related("task_type_id")
+            .order_by("id")
+        )
+
+        if not tasks:
+            raise ValueError(f"Application type {app_type_id} has no tasks")
+
+        task_ids = [int(task.id) for task in tasks]
+        task_id_set = set(task_ids)
+        cpu_cycles = {}
+        task_type_ids = {}
+        task_indexes = {}
+        task_output_size_bits = {}
+        task_type_size_bits = {}
+        service_size_bits = {}
+        service_size_bytes = {}
+
+        for task in tasks:
+            task_id = int(task.id)
+            task_type = task.task_type_id
+
+            if task_type is None:
+                raise ValueError(f"Task {task_id} has no task type")
+
+            cycles = float(task.workload_cycles or 0.0)
+            if cycles <= 0.0:
+                raise ValueError(f"Task {task_id} has an invalid workload")
+
+            task_type_id = int(task_type.id)
+            service_bytes = int(task_type.size or 0)
+            if service_bytes <= 0:
+                raise ValueError(
+                    f"Task type {task_type_id} has an invalid service size"
+                )
+
+            task_snapshot = task.initial_snapshot or {}
+            task_type_snapshot = task_type.initial_snapshot or {}
+            output_bits = task_snapshot.get("output_size_bits")
+
+            if output_bits is None:
+                output_bits = task_type_snapshot.get("communication_data_bits")
+
+            output_bits = int(float(output_bits or 0.0))
+            if output_bits <= 0:
+                raise ValueError(
+                    f"Task {task_id} has no valid communication data size"
+                )
+
+            cpu_cycles[task_id] = cycles
+            task_type_ids[task_id] = task_type_id
+            task_indexes[task_id] = str(task.index or "")
+            task_output_size_bits[task_id] = output_bits
+            task_type_size_bits[task_type_id] = service_bytes * 8
+            service_size_bits[task_type_id] = service_bytes * 8
+            service_size_bytes[task_type_id] = service_bytes
+
+        dependencies = defaultdict(list)
         children = defaultdict(list)
-        for d in TaskDependency.objects.filter(parent_task_id_id__in=tids, child_task_id_id__in=tids):
-            deps[d.child_task_id_id].append(d.parent_task_id_id)
-            children[d.parent_task_id_id].append(d.child_task_id_id)
+        task_dependencies = []
+        edge_data_bits = defaultdict(dict)
+        seen_edges = set()
 
-        self.ctx["dependencies"] = dict(deps)
+        dep_qs = TaskDependency.objects.filter(
+            parent_task_id_id__in=task_ids,
+            child_task_id_id__in=task_ids,
+        ).order_by("id")
+
+        for dependency in dep_qs:
+            parent_id = int(dependency.parent_task_id_id)
+            child_id = int(dependency.child_task_id_id)
+
+            if parent_id not in task_id_set or child_id not in task_id_set:
+                raise ValueError(
+                    f"Dependency {dependency.id} references an invalid task"
+                )
+            if parent_id == child_id:
+                raise ValueError(
+                    f"Dependency {dependency.id} contains a self-loop"
+                )
+            if (parent_id, child_id) in seen_edges:
+                raise ValueError(
+                    f"Duplicate dependency {parent_id}->{child_id}"
+                )
+
+            seen_edges.add((parent_id, child_id))
+            dependency_snapshot = dependency.initial_snapshot or {}
+            data_bits = dependency_snapshot.get("communication_data_bits")
+
+            if data_bits is None:
+                data_bits = task_output_size_bits[parent_id]
+
+            data_bits = int(float(data_bits or 0.0))
+            if data_bits <= 0:
+                raise ValueError(
+                    f"Dependency {parent_id}->{child_id} has an invalid data size"
+                )
+
+            dependencies[child_id].append(parent_id)
+            children[parent_id].append(child_id)
+            edge_data_bits[parent_id][child_id] = data_bits
+            task_dependencies.append(
+                {
+                    "id": int(dependency.id),
+                    "parent_task_id": parent_id,
+                    "child_task_id": child_id,
+                    "communication_data_bits": data_bits,
+                }
+            )
+
+        for task_id in task_ids:
+            dependencies[task_id] = sorted(dependencies.get(task_id, []))
+            children[task_id] = sorted(children.get(task_id, []))
+            edge_data_bits[task_id] = dict(edge_data_bits.get(task_id, {}))
+
+        indegree = {
+            task_id: len(dependencies[task_id])
+            for task_id in task_ids
+        }
+        ready = sorted(
+            task_id
+            for task_id in task_ids
+            if indegree[task_id] == 0
+        )
+        entry_tasks = list(ready)
+        topological_order = []
+
+        while ready:
+            task_id = ready.pop(0)
+            topological_order.append(task_id)
+
+            for child_id in children[task_id]:
+                indegree[child_id] -= 1
+                if indegree[child_id] == 0:
+                    ready.append(child_id)
+                    ready.sort()
+
+        if len(topological_order) != len(task_ids):
+            raise ValueError(
+                f"Application type {app_type_id} task graph is not a DAG"
+            )
+        if len(entry_tasks) != 1:
+            raise ValueError(
+                f"Application type {app_type_id} must have exactly one entry task"
+            )
+
+        entry_task_id = int(entry_tasks[0])
+
+        self.ctx["task_ids"] = task_ids
+        self.ctx["cpu_cycles"] = cpu_cycles
+        self.ctx["task_type_ids"] = task_type_ids
+        self.ctx["task_indexes"] = task_indexes
+        self.ctx["task_type_size_bits"] = task_type_size_bits
+        self.ctx["task_output_size_bits"] = task_output_size_bits
+        self.ctx["service_size_bits"] = service_size_bits
+        self.ctx["service_size_bytes"] = service_size_bytes
+        self.ctx["dependencies"] = dict(dependencies)
         self.ctx["children"] = dict(children)
-        self.ctx["tasks"] = {"all": tids, "ready": [t for t in tids if not deps[t]]}
-
-    def _build_providers(self):
-        vehicle_id = self.ctx["vehicle_id"]
-        providers = cache.get(f"vehicle_available_sps_{vehicle_id}", [])
-        self.ctx["providers"] = list(providers)
-        self.ctx["sp_cpu_freq"] = {}
-        self.ctx["sp_cache_capacity"] = {}
-        self.ctx["sp_types"] = {}
-        self.ctx["sp_position"] = {}
-
-        for sp in ServiceProvider.objects.filter(id__in=providers):
-            res = Resource.objects.filter(sp_id=sp.id).first()
-            self.ctx["sp_cpu_freq"][sp.id] = float(res.cpu_capacity if res else 1e9)
-            self.ctx["sp_cache_capacity"][sp.id] = int(res.cache_capacity if res else 0)
-            self.ctx["sp_types"][sp.id] = sp.type
-            if sp.type == "rsu":
-                self.ctx["sp_position"][sp.id] = (sp.rsu_id.x_coord, sp.rsu_id.y_coord)
-            else:
-                self.ctx["sp_position"][sp.id] = (sp.vehicle_id.x_coord, sp.vehicle_id.y_coord)
-
-    def _build_network_state(self):
-        params_lib = load_params_for_lib()
-        app_vehicle = Vehicle.objects.filter(id=self.ctx["vehicle_id"]).first() if self.ctx.get("vehicle_id") else None
-
-        if app_vehicle:
-            vx, vy = app_vehicle.x_coord, app_vehicle.y_coord
-            v_speed = app_vehicle.speed
-            local_cpu = float(app_vehicle.cpu_capacity)
-            vh = params_lib.h_vehicle_m
-        else:
-            vx, vy, v_speed, local_cpu = 0.0, 0.0, 0.0, float(params_lib.fmax_vehicle_hz)
-            vh = params_lib.h_vehicle_m
-
-        distances = {}
-        for sp in self.ctx["providers"]:
-            sx, sy = self.ctx["sp_position"][sp]
-            sh = params_lib.h_rsu_m if self.ctx["sp_types"][sp] == "rsu" else params_lib.h_vehicle_m
-            distances[sp] = distance_3d(vx, vy, vh, sx, sy, sh)
-
-        connected_counts = {}
-        for sp in self.ctx["providers"]:
-            if self.ctx["sp_types"][sp] == "rsu":
-                rsu_obj = ServiceProvider.objects.filter(id=sp).first()
-                count = RSUVehicle.objects.filter(rsu_id=rsu_obj.rsu_id).count() if rsu_obj and rsu_obj.rsu_id else 1
-                connected_counts[sp] = float(count)
-            else:
-                connected_counts[sp] = 1.0
-
-        self.ctx["distance"] = distances
-        self.ctx["v_m"] = {sp: float(v_speed) for sp in self.ctx["providers"]}
-        self.ctx["connected_vehicles_count"] = connected_counts
-        self.ctx["local_cpu_freq_hz"] = float(local_cpu)
-
-    def _build_cache_state(self):
-        self.ctx["cache"] = {
-            sp: set(Cache.objects.filter(sp_id_id=sp).values_list("task_type_id_id", flat=True))
-            for sp in self.ctx["providers"]
+        self.ctx["task_dependencies"] = task_dependencies
+        self.ctx["edge_data_bits"] = dict(edge_data_bits)
+        self.ctx["topological_order"] = topological_order
+        self.ctx["entry_task_id"] = entry_task_id
+        self.ctx["optimized_task_ids"] = [
+            task_id
+            for task_id in topological_order
+            if task_id != entry_task_id
+        ]
+        self.ctx["tasks"] = {
+            "all": topological_order,
+            "ready": [entry_task_id],
         }
 
+    def _build_providers(self):
+        vehicle_id = self.ctx.get("vehicle_id")
+        provider_ids = []
+
+        cached_providers = django_cache.get(
+            f"vehicle_available_sps_{vehicle_id}",
+            [],
+        )
+
+        for item in cached_providers or []:
+            sp_id = getattr(item, "id", item)
+            if sp_id is not None:
+                provider_ids.append(int(sp_id))
+
+        local_sp = None
+        if vehicle_id is not None:
+            local_sp = ServiceProvider.objects.filter(
+                vehicle_id_id=vehicle_id,
+                type="vehicle",
+            ).first()
+
+        if local_sp is not None:
+            provider_ids.append(int(local_sp.id))
+
+        provider_ids = list(dict.fromkeys(provider_ids))
+
+        sp_qs = list(
+            ServiceProvider.objects.filter(id__in=provider_ids)
+            .select_related("rsu_id", "vehicle_id")
+            .order_by("id")
+        )
+
+        self.ctx["providers"] = {}
+        self.ctx["provider_ids"] = []
+        self.ctx["sp_cpu_freq"] = {}
+        self.ctx["sp_cache_capacity"] = {}
+        self.ctx["cache_capacity"] = {}
+        self.ctx["sp_types"] = {}
+        self.ctx["sp_modes"] = {}
+        self.ctx["sp_position"] = {}
+        self.ctx["sp_vehicle_ids"] = {}
+        self.ctx["sp_rsu_ids"] = {}
+        self.ctx["local_sp_id"] = int(local_sp.id) if local_sp else None
+
+        for sp in sp_qs:
+            sp_id = int(sp.id)
+            res = Resource.objects.filter(sp_id=sp).first()
+
+            if sp.type == "rsu":
+                cpu_capacity = sp.rsu_id.cpu_capacity if sp.rsu_id else None
+                cache_capacity = sp.rsu_id.cache_capacity if sp.rsu_id else None
+                x = sp.rsu_id.x_coord if sp.rsu_id else 0.0
+                y = sp.rsu_id.y_coord if sp.rsu_id else 0.0
+                rsu_id = sp.rsu_id_id
+                vehicle_ref_id = None
+                mode = "v2i"
+            else:
+                cpu_capacity = sp.vehicle_id.cpu_capacity if sp.vehicle_id else None
+                cache_capacity = sp.vehicle_id.cache_capacity if sp.vehicle_id else None
+                x = sp.vehicle_id.x_coord if sp.vehicle_id else 0.0
+                y = sp.vehicle_id.y_coord if sp.vehicle_id else 0.0
+                rsu_id = None
+                vehicle_ref_id = sp.vehicle_id_id
+                mode = "local" if sp_id == self.ctx["local_sp_id"] else "v2v"
+
+            if res is not None:
+                cpu_capacity = res.cpu_capacity
+                cache_capacity = res.cache_capacity
+
+            cpu_capacity = float(cpu_capacity if cpu_capacity is not None else 0.0)
+            cache_capacity = int(cache_capacity if cache_capacity is not None else 0)
+
+            self.ctx["provider_ids"].append(sp_id)
+            self.ctx["providers"][sp_id] = {
+                "id": sp_id,
+                "type": sp.type,
+                "mode": mode,
+                "vehicle_id": int(vehicle_ref_id) if vehicle_ref_id else None,
+                "rsu_id": int(rsu_id) if rsu_id else None,
+            }
+            self.ctx["sp_cpu_freq"][sp_id] = cpu_capacity
+            self.ctx["sp_cache_capacity"][sp_id] = cache_capacity
+            self.ctx["cache_capacity"][sp_id] = cache_capacity
+            self.ctx["sp_types"][sp_id] = sp.type
+            self.ctx["sp_modes"][sp_id] = mode
+            self.ctx["sp_position"][sp_id] = (float(x), float(y))
+            self.ctx["sp_vehicle_ids"][sp_id] = int(vehicle_ref_id) if vehicle_ref_id else None
+            self.ctx["sp_rsu_ids"][sp_id] = int(rsu_id) if rsu_id else None
+
+    def _build_network_state(self):
+        params = load_params_obj()
+        params_lib = load_params_for_lib()
+
+        vehicle_id = self.ctx.get("vehicle_id")
+        app_vehicle = (
+            Vehicle.objects.filter(id=vehicle_id).first()
+            if vehicle_id is not None
+            else None
+        )
+
+        if app_vehicle is not None:
+            vx = float(app_vehicle.x_coord)
+            vy = float(app_vehicle.y_coord)
+            local_cpu = float(app_vehicle.cpu_capacity)
+        else:
+            vx = 0.0
+            vy = 0.0
+            local_cpu = float(params_lib.fmax_vehicle_hz)
+
+        vh = float(params.h_vehicle)
+        rh = float(params.h_rsu)
+
+        distances = {}
+
+        for sp_id in self.ctx["providers"].keys():
+            sx, sy = self.ctx["sp_position"][sp_id]
+            sh = rh if self.ctx["sp_types"][sp_id] == "rsu" else vh
+
+            distances[sp_id] = float(
+                distance_3d(
+                    vx,
+                    vy,
+                    vh,
+                    float(sx),
+                    float(sy),
+                    sh,
+                )
+            )
+
+        connected_counts = {}
+
+        # Every V2V link of application n reuses one V2I subchannel of
+        # the RSU currently accessed by the mission vehicle. Therefore,
+        # all vehicle SPs in the same alliance V_n use that RSU's V_m.
+        access_rsu_id = (
+            RSUVehicle.objects
+            .filter(
+                vehicle_id_id=vehicle_id,
+                is_current=True,
+            )
+            .values_list("rsu_id_id", flat=True)
+            .first()
+        )
+        alliance_vehicle_count = 1.0
+
+        if access_rsu_id is not None:
+            alliance_vehicle_count = float(
+                max(
+                    RSUVehicle.objects.filter(
+                        rsu_id_id=access_rsu_id,
+                        is_current=True,
+                    ).count(),
+                    1,
+                )
+            )
+
+        for sp_id in self.ctx["providers"].keys():
+            if self.ctx["sp_types"][sp_id] == "rsu":
+                rsu_id = self.ctx["sp_rsu_ids"].get(sp_id)
+                if rsu_id is not None:
+                    count = RSUVehicle.objects.filter(
+                        rsu_id_id=rsu_id,
+                        is_current=True,
+                    ).count()
+                    connected_counts[sp_id] = float(max(count, 1))
+                else:
+                    connected_counts[sp_id] = 1.0
+            else:
+                connected_counts[sp_id] = alliance_vehicle_count
+
+        self.ctx["distance"] = distances
+        self.ctx["v_m"] = connected_counts
+        self.ctx["connected_vehicles_count"] = connected_counts
+        self.ctx["local_cpu_freq_hz"] = local_cpu
+
+    def _build_cache_state(self):
+        cache_state = {}
+
+        for sp_id in self.ctx["providers"].keys():
+            cached_types = CacheModel.objects.filter(
+                sp_id_id=sp_id,
+            ).values_list("task_type_id_id", flat=True)
+
+            cache_state[sp_id] = set(int(x) for x in cached_types if x is not None)
+
+        self.ctx["cache"] = cache_state
+
     def _build_assignment_state(self):
-        self.ctx["z"] = {"binary": {}, "compact": {t: {"provider": None, "rank": None} for t in self.ctx["task_ids"]}}
+        self.ctx["z"] = {
+            "binary": {},
+            "compact": {
+                tid: {
+                    "provider": None,
+                    "rank": None,
+                }
+                for tid in self.ctx["task_ids"]
+            },
+        }
 
     def _build_auxiliary_fields(self):
         self.ctx["idle_time"] = 0.0
-        self.ctx["output_size"] = {t: self.ctx["task_type_size_bits"][t] for t in self.ctx["task_ids"]}
-        task_types = set(self.ctx["task_type_ids"].values()) - {None}
-        self.ctx["compile_workloads"] = {
-            k: sum(self.ctx["cpu_cycles"][t] for t in self.ctx["task_ids"] if self.ctx["task_type_ids"][t] == k)
-            for k in task_types
+        self.ctx["output_size"] = {
+            tid: int(self.ctx["task_output_size_bits"].get(tid, 0))
+            for tid in self.ctx["task_ids"]
         }
+
+        task_type_ids = set(self.ctx["task_type_ids"].values()) - {None}
+        task_types = {
+            int(t.id): t
+            for t in TaskType.objects.filter(id__in=task_type_ids)
+        }
+
+        compile_workloads = {}
+
+        app_type_snapshot = self.ctx.get("application_type_initial_snapshot") or {}
+        service_compile_map = app_type_snapshot.get("compile_workloads") or app_type_snapshot.get("service_compile_workloads") or {}
+
+        for task_type_id in task_type_ids:
+            task_type_id = int(task_type_id)
+            task_type = task_types.get(task_type_id)
+            value = None
+
+            if task_type is not None and isinstance(task_type.initial_snapshot, dict):
+                for key in (
+                    "compile_workload_cycles",
+                    "compile_cycles",
+                    "w_k_cycles",
+                    "W_k",
+                    "Wk",
+                ):
+                    if key in task_type.initial_snapshot:
+                        value = task_type.initial_snapshot[key]
+                        break
+
+            if value is None:
+                value = service_compile_map.get(str(task_type_id), service_compile_map.get(task_type_id))
+
+            compile_workloads[task_type_id] = float(value) if value is not None else 0.0
+
+        self.ctx["compile_workloads"] = compile_workloads
+
+        cpu_cycles_by_task = self.ctx["cpu_cycles"]
+        task_type_by_task = self.ctx["task_type_ids"]
+
+        cache_value_v_kj = {}
+        cache_value_mu = {}
+        cache_value_denom_cpu_cycles = {}
+        cache_value_denom_v_kj = {}
+
+        all_task_ids = list(self.ctx["task_ids"])
+        all_cpu_cycles = [float(cpu_cycles_by_task[tid]) for tid in all_task_ids]
+
+        cached_counts = {}
+        for task_type_id in task_type_ids:
+            task_type_id = int(task_type_id)
+            cached_counts[task_type_id] = CacheModel.objects.filter(
+                task_type_id_id=task_type_id
+            ).count()
+
+        for sp_id in self.ctx["providers"].keys():
+            cache_value_denom_cpu_cycles[sp_id] = all_cpu_cycles
+
+            for task_type_id in task_type_ids:
+                task_type_id = int(task_type_id)
+                flags = [
+                    1.0 if task_type_by_task.get(tid) == task_type_id else 0.0
+                    for tid in all_task_ids
+                ]
+
+                cache_value_v_kj[(sp_id, task_type_id)] = flags
+                cache_value_mu[(sp_id, task_type_id)] = float(cached_counts.get(task_type_id, 0))
+                cache_value_denom_v_kj[(sp_id, task_type_id)] = flags
+
+        self.ctx["cache_value_v_kj"] = cache_value_v_kj
+        self.ctx["cache_value_mu"] = cache_value_mu
+        self.ctx["cache_value_denom_cpu_cycles"] = cache_value_denom_cpu_cycles
+        self.ctx["cache_value_denom_v_kj"] = cache_value_denom_v_kj
+
+        local_sp_id = self.ctx.get("local_sp_id")
+        if local_sp_id is None or local_sp_id not in self.ctx["sp_cpu_freq"]:
+            raise ValueError("Local service provider has no CPU capacity")
+
+        fmax_by_provider = {
+            int(sp_id): float(value)
+            for sp_id, value in self.ctx["sp_cpu_freq"].items()
+        }
+        local_fmax = float(fmax_by_provider[int(local_sp_id)])
+        if not isfinite(local_fmax) or local_fmax <= 0.0:
+            raise ValueError("Local maximum CPU frequency must be positive")
+
+        total_cycles = sum(float(value) for value in self.ctx["cpu_cycles"].values())
+        kappa = float(load_params_obj().k)
+        t_local = total_cycles / local_fmax
+        e_local = kappa * (local_fmax ** 2) * total_cycles
+        t_ref = min(t_local, float(self.ctx["deadline_s"]))
+
+        alpha_n = float(self.ctx["alpha_n"])
+        beta_n = float(self.ctx["beta_n"])
+
+        if t_ref <= 0.0 or e_local <= 0.0 or kappa <= 0.0:
+            raise ValueError("Invalid local reference for CPU allocation")
+
+        if beta_n <= 0.0:
+            f_star = local_fmax
+        else:
+            f_star = (
+                alpha_n * e_local
+                / (2.0 * beta_n * kappa * t_ref)
+            ) ** (1.0 / 3.0)
+
+        allocated_by_provider = {}
+        for sp_id, fmax in fmax_by_provider.items():
+            if not isfinite(fmax) or fmax <= 0.0:
+                raise ValueError(f"Provider {sp_id} has an invalid CPU capacity")
+            if self.ctx["sp_types"].get(sp_id) == "rsu":
+                allocated_by_provider[sp_id] = float(fmax)
+            else:
+                allocated_by_provider[sp_id] = float(min(f_star, fmax))
+
+        self.ctx["sp_cpu_fmax_hz"] = fmax_by_provider
+        self.ctx["sp_cpu_allocated_hz"] = allocated_by_provider
+        self.ctx["paper_reference"] = {
+            "t_local_s": float(t_local),
+            "t_ref_s": float(t_ref),
+            "e_local_j": float(e_local),
+        }
+        self.ctx["paper_weights"] = {
+            "alpha_n": alpha_n,
+            "beta_n": beta_n,
+        }
+        self.ctx["article_exact_cpu_allocation"] = True

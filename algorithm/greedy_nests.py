@@ -1,306 +1,527 @@
 from __future__ import annotations
+
+import copy
 import random
-from typing import List
+from typing import Any, List, Tuple
+
 from parameter.services import load_params_for_lib, load_params_obj
-from monarch_pylib.model import offloading_efficiency, transmission, communication, scheduling,policy
-from monarch_pylib.model.transmission import channel_gain_v2i, v2i_uplink_rate
-from .low_complexity import run as optimize_tx_power
+from monarch_pylib.model import communication, offloading_efficiency, policy, scheduling, transmission
+from monarch_pylib.model.transmission import v2i_uplink_rate
+
+from .low_complexity import run as optimize_tx_power, channel_gain
+
 params = load_params_obj()
 params_lib = load_params_for_lib()
 
-def _safe_float(x, default=0.0):
-    try:
-        return float(x)
-    except:
-        return float(default)
+
+def _weights(ctx):
+    alpha_n = float(ctx.get("alpha_n", params.alpha_n))
+    beta_n = float(ctx.get("beta_n", 1.0 - alpha_n))
+    return alpha_n, beta_n
 
 
-def _cpu_cycles_list(ctx):
-    return list(ctx["cpu_cycles"].values())
+def _all_providers(ctx) -> List[int]:
+    if isinstance(ctx.get("providers"), dict):
+        providers = list(ctx["providers"].keys())
+    else:
+        providers = list(ctx.get("sp_cpu_freq", {}).keys())
+
+    return [int(sp) for sp in providers]
 
 
-def _providers(ctx):
-    return list(ctx["sp_cpu_freq"].keys())
+def _providers(ctx) -> List[int]:
+    providers = _all_providers(ctx)
+
+    if ctx.get("v2i_only", False):
+        return [int(sp) for sp in providers if ctx.get("sp_types", {}).get(sp) == "rsu"]
+
+    return providers
 
 
-def _tasks(ctx):
+def _tasks(ctx) -> List[int]:
     return list(ctx["cpu_cycles"].keys())
 
 
-def _z_task_provider(ctx):
-    providers = _providers(ctx)
-    tasks = _tasks(ctx)
-    z_binary = ctx["z"]["binary"]
-
-    mat = [[0.0 for _ in providers] for _ in tasks]
-
-    for p_i, p in enumerate(providers):
-        for ranks in z_binary.get(p, {}).values():
-            for t_i, t in enumerate(tasks):
-                if ranks.get(t, 0) == 1:
-                    mat[t_i][p_i] = 1.0
-
-    return mat
+def _local_sp_id(ctx):
+    return ctx.get("local_sp_id")
 
 
-def _z_rank_for_provider(ctx, sp_id):
-    tasks = _tasks(ctx)
-    z_binary = ctx["z"]["binary"]
-
-    row = [0.0 for _ in tasks]
-
-    for ranks in z_binary.get(sp_id, {}).values():
-        for i, t in enumerate(tasks):
-            if ranks.get(t, 0) == 1:
-                row[i] = 1.0
-
-    return row
+def _mode(ctx, sp_id: int) -> str:
+    return ctx.get("sp_modes", {}).get(sp_id, "v2i" if ctx["sp_types"].get(sp_id) == "rsu" else "v2v")
 
 
-def t_loc_s(ctx):
-    fmax = _safe_float(params_lib.fmax_vehicle_hz)
+def _task_types(ctx) -> List[int]:
+    return sorted(set(ctx["task_type_ids"].values()) - {None})
 
-    return offloading_efficiency.all_local_execution_time(
-        cpu_cycles_list=_cpu_cycles_list(ctx),
-        f_max_local_hz=fmax
+
+def _vectors(ctx, sp_id: int, task_id: int):
+    k_type = ctx["task_type_ids"].get(task_id)
+    types = _task_types(ctx)
+
+    if ctx.get("use_caching", True):
+        cached = ctx.get("cache", {}).get(sp_id, set())
+    else:
+        cached = set()
+
+    v_k = [1.0 if t == k_type else 0.0 for t in types]
+    u_k = [1.0 if t in cached else 0.0 for t in types]
+    w_k = [float(ctx.get("compile_workloads", {}).get(t, 0.0)) for t in types]
+
+    return v_k, u_k, w_k
+
+
+def _cpu_frequency(ctx, sp_id: int) -> float:
+    sp_id = int(sp_id)
+    allocated = ctx.get("sp_cpu_allocated_hz", {})
+    if sp_id in allocated:
+        value = float(allocated[sp_id])
+    else:
+        value = float(ctx.get("sp_cpu_freq", {}).get(sp_id, 0.0))
+    if value <= 0.0:
+        raise ValueError(f"Provider {sp_id} has no positive CPU frequency")
+    return value
+
+
+def t_loc_s(ctx) -> float:
+    cached = ctx.get("_t_loc_s_cache")
+    if cached is not None:
+        return float(cached)
+    value = offloading_efficiency.all_local_execution_time(
+        cpu_cycles_list=list(ctx["cpu_cycles"].values()),
+        f_max_local_hz=float(ctx.get("local_cpu_freq_hz", params_lib.fmax_vehicle_hz)),
     )
+    ctx["_t_loc_s_cache"] = float(value)
+    return float(value)
 
 
-def t_ref_s(ctx):
-    return offloading_efficiency.reference_time(
-        t_loc_s=t_loc_s(ctx),
-        t_ddl_s=float(ctx["t_ddl_s"])
+def e_loc_j(ctx) -> float:
+    cached = ctx.get("_e_loc_j_cache")
+    if cached is not None:
+        return float(cached)
+    value = offloading_efficiency.all_local_execution_energy(
+        kappa=float(params.k),
+        cpu_cycles_list=list(ctx["cpu_cycles"].values()),
+        f_max_local_hz=float(ctx.get("local_cpu_freq_hz", params_lib.fmax_vehicle_hz)),
     )
+    ctx["_e_loc_j_cache"] = float(value)
+    return float(value)
 
 
-def t_comp(ctx, sp_id: int, task_id: int):
-    C = float(ctx["cpu_cycles"][task_id])
-    k_type = ctx["task_type_ids"][task_id]
-    f_sp = float(ctx["sp_cpu_freq"][sp_id])
+def t_ref_s(ctx) -> float:
+    cached = ctx.get("_t_ref_s_cache")
+    if cached is not None:
+        return float(cached)
+    value = offloading_efficiency.reference_time(t_loc_s=t_loc_s(ctx), t_ddl_s=float(ctx["t_ddl_s"]))
+    ctx["_t_ref_s_cache"] = float(value)
+    return float(value)
 
-    task_types_sorted = sorted(ctx["compile_workloads"].keys())
 
-    v_k = [1.0 if k_type == t else 0.0 for t in task_types_sorted]
-    w_k = [float(ctx["compile_workloads"][t]) for t in task_types_sorted]
+def t_comp(ctx, sp_id: int, task_id: int) -> float:
+    c = float(ctx["cpu_cycles"][task_id])
+    f = _cpu_frequency(ctx, sp_id)
+    mode = _mode(ctx, sp_id)
 
-    cached = ctx["cache"].get(sp_id, set())
-    u_k = [1.0 if t in cached else 0.0 for t in task_types_sorted]
+    if mode == "local":
+        return communication.local_task_compute_time(cpu_cycles=c, local_cpu_freq_hz=f)
 
-    sp_type = ctx["sp_types"][sp_id]
+    v_k, u_k, w_k = _vectors(ctx, sp_id, task_id)
 
-    local_vehicle_ids = [sid for sid, t in ctx["sp_types"].items() if t == "vehicle"]
-    local_vehicle_id = min(local_vehicle_ids) if local_vehicle_ids else None
+    if mode == "v2i":
+        return communication.mec_task_compute_time(v_k=v_k, u_k_mec=u_k, w_k_cycles=w_k, mec_cpu_freq_hz=f, cpu_cycles=c)
 
-    if sp_id == local_vehicle_id:
-        return communication.local_task_compute_time(
-            cpu_cycles=C,
-            local_cpu_freq_hz=f_sp
-        )
+    compile_time = communication.v2v_service_compile_time(v_k=v_k, u_k_peer=u_k, w_k_cycles=w_k, peer_cpu_freq_hz=f)
+    process_time = communication.v2v_task_processing_time(cpu_cycles=c, peer_cpu_freq_hz=f)
 
-    if sp_type == "rsu":
-        return communication.mec_task_compute_time(
-            v_k=v_k,
-            u_k_mec=u_k,
-            w_k_cycles=w_k,
-            mec_cpu_freq_hz=f_sp,
-            cpu_cycles=C
-        )
+    return communication.v2v_task_total_compute_time(compile_time_s=compile_time, processing_time_s=process_time)
 
-    compile_time = communication.v2v_service_compile_time(
+
+def e_comp(ctx, sp_id: int, task_id: int) -> float:
+    c = float(ctx["cpu_cycles"][task_id])
+    f = _cpu_frequency(ctx, sp_id)
+    mode = _mode(ctx, sp_id)
+
+    if mode == "local":
+        return communication.local_task_compute_energy(kappa=float(params.k), local_cpu_freq_hz=f, cpu_cycles=c)
+
+    if mode == "v2i":
+        return 0.0
+
+    v_k, u_k, w_k = _vectors(ctx, sp_id, task_id)
+
+    return communication.v2v_task_compute_energy(
+        kappa=float(params.k),
         v_k=v_k,
         u_k_peer=u_k,
         w_k_cycles=w_k,
-        peer_cpu_freq_hz=f_sp
-    )
-
-    process_time = communication.v2v_task_processing_time(
-        cpu_cycles=C,
-        peer_cpu_freq_hz=f_sp
-    )
-
-    return communication.v2v_task_total_compute_time(
-        compile_time_s=compile_time,
-        processing_time_s=process_time
+        peer_cpu_freq_hz=f,
+        cpu_cycles=c,
     )
 
 
-def t_finish(ctx, sp_id: int, task_id: int):
-    return float(t_start(ctx, sp_id, task_id)) + float(t_comp(ctx, sp_id, task_id))
+def _link_bandwidth_divisor(ctx, src_sp_id: int, dst_sp_id: int) -> float:
+    src_type = ctx.get("sp_types", {}).get(src_sp_id)
+    dst_type = ctx.get("sp_types", {}).get(dst_sp_id)
+
+    if dst_type == "rsu":
+        return float(max(float(ctx.get("connected_vehicles_count", {}).get(dst_sp_id, 1.0)), 1.0))
+
+    if src_type == "rsu":
+        return float(max(float(ctx.get("connected_vehicles_count", {}).get(src_sp_id, 1.0)), 1.0))
+
+    if src_type == "vehicle" and dst_type == "vehicle":
+        return float(max(float(ctx.get("connected_vehicles_count", {}).get(src_sp_id, 1.0)), 1.0))
+
+    return 1.0
 
 
-def t_off(ctx):
-    providers = _providers(ctx)
-    tasks = _tasks(ctx)
+def link_rate(ctx, src_sp_id: int, dst_sp_id: int) -> float:
+    src_sp_id = int(src_sp_id)
+    dst_sp_id = int(dst_sp_id)
 
-    finish_matrix = [[t_finish(ctx, sp, t) for sp in providers] for t in tasks]
+    if src_sp_id == dst_sp_id:
+        return 0.0
 
-    return offloading_efficiency.offloaded_completion_time(
-        task_finish_times_by_provider_s=finish_matrix,
-        z_task_provider=_z_task_provider(ctx)
-    )
+    src_type = ctx.get("sp_types", {}).get(src_sp_id)
+    dst_type = ctx.get("sp_types", {}).get(dst_sp_id)
 
+    if src_type == "rsu" and dst_type == "rsu":
+        return 0.0
 
-def e_loc_j(ctx):
-    kappa = _safe_float(params.k)
-    fmax = _safe_float(params_lib.fmax_vehicle_hz)
+    rate_cache = ctx.setdefault("_link_rate_cache", {})
+    cache_key = (src_sp_id, dst_sp_id)
+    if cache_key in rate_cache:
+        return float(rate_cache[cache_key])
 
-    return offloading_efficiency.all_local_execution_energy(
-        kappa=kappa,
-        cpu_cycles_list=_cpu_cycles_list(ctx),
-        f_max_local_hz=fmax
-    )
+    p_opt = optimize_tx_power(ctx, sp_id=src_sp_id, dst_sp_id=dst_sp_id)
+    gain = channel_gain(ctx, src_sp_id, dst_sp_id)
 
-
-def e_com(ctx, sp_id: int, task_id: int):
-    cyc = float(ctx["cpu_cycles"][task_id])
-    ttype = ctx["task_type_ids"][task_id]
-
-    k = _safe_float(params.k)
-    f = float(ctx["sp_cpu_freq"].get(sp_id))
-
-    local_vehicle_ids = [sid for sid, t in ctx["sp_types"].items() if t == "vehicle"]
-    local_vehicle_id = min(local_vehicle_ids) if local_vehicle_ids else None
-
-    if sp_id == local_vehicle_id:
-        return k * (f ** 2) * cyc
-
-    wk = float(ctx["compile_workloads"].get(ttype, 0.0))
-    cached = 1 if ttype in ctx["cache"].get(sp_id, set()) else 0
-
-    e_compile = (1 - cached) * k * (f ** 2) * wk
-    e_process = k * (f ** 2) * cyc
-
-    return e_compile + e_process
-
-
-def e_off(ctx):
-    providers = _providers(ctx)
-    tasks = _tasks(ctx)
-
-    energy_matrix = [[e_com(ctx, sp, t) for sp in providers] for t in tasks]
-
-    return offloading_efficiency.offloaded_total_energy(
-        compute_energy_by_provider_j=energy_matrix,
-        z_task_provider=_z_task_provider(ctx)
-    )
-def ch_gain(ctx, sp_id: int) -> float:
-    distance = float(ctx["distance"][sp_id])
-    tau_nm = float(getattr(params, "sigma_v2i", 8.0))
-    g_rsu_db = float(getattr(params, "G_rsu", 8.0))
-    g_vehicle_db = float(getattr(params, "G_vehicle", 3.0))
-    g_rsu = 10 ** (g_rsu_db / 10.0)
-    g_vehicle = 10 ** (g_vehicle_db / 10.0)
-
-    rho = g_rsu * g_vehicle
-    varpi_nm = float(getattr(params, "h_rsu", 5.0)) * float(getattr(params, "h_vehicle", 1.5))
-    gamma = float(getattr(params, "Y_v2i", 3.76))
-
-    return float(
-        channel_gain_v2i(
-            tau_nm=tau_nm,
-            rho=rho,
-            varpi_nm=varpi_nm,
-            distance_nm=distance,
-            pathloss_exponent_gamma=gamma
+    value = float(
+        v2i_uplink_rate(
+            B_hz=float(params_lib.B_hz),
+            V_m=_link_bandwidth_divisor(
+                ctx,
+                src_sp_id,
+                dst_sp_id,
+            ),
+            tx_power_pn=p_opt,
+            channel_gain_gnm=gain,
+            noise_power_delta2=float(params_lib.delta2_w),
         )
     )
+    rate_cache[cache_key] = value
+    return value
+
 
 def rate(ctx, sp_id: int) -> float:
-    vn_m = float(ctx["connected_vehicles_count"].get(sp_id, 1.0)) if "connected_vehicles_count" in ctx else 1.0
-    b_hz = float(getattr(params_lib, "B_hz", 20.0 * 1e6))
-    delta2_w = float(getattr(params_lib, "delta2_w", 1e-13))
-    h = ch_gain(ctx, sp_id)
-    p_opt = optimize_tx_power(ctx)
-    return float(
-        v2i_uplink_rate(
-            B_hz=b_hz,
-            V_m=vn_m,
-            tx_power_pn=p_opt,
-            channel_gain_gnm=h,
-            noise_power_delta2=delta2_w
-        )
-    )
+    local_sp_id = _local_sp_id(ctx)
 
-def t_rec_i_prim(ctx, src_sp: int, dst_sp: int, src_task: int, dst_task: int):
+    if local_sp_id is None:
+        raise ValueError("Local service provider is not available")
 
-    ft_src = float(t_finish(ctx, src_sp, src_task))
-    same = src_sp == dst_sp
-    idle = float(ctx.get("idle_time", 0.0))
+    return link_rate(ctx, int(local_sp_id), int(sp_id))
 
-    if same:
-        transfer_time = 0.0
+
+def _tx_time_energy(ctx, src_sp_id: int, dst_sp_id: int, data_bits: float) -> Tuple[float, float]:
+    src_sp_id = int(src_sp_id)
+    dst_sp_id = int(dst_sp_id)
+    data_bits = float(data_bits)
+
+    if src_sp_id == dst_sp_id or data_bits <= 0.0:
+        return 0.0, 0.0
+
+    if ctx.get("sp_types", {}).get(src_sp_id) == "rsu" and ctx.get("sp_types", {}).get(dst_sp_id) == "rsu":
+        return 0.0, 0.0
+
+    tx_cache = ctx.setdefault("_tx_time_energy_cache", {})
+    cache_key = (src_sp_id, dst_sp_id, data_bits)
+    if cache_key in tx_cache:
+        item = tx_cache[cache_key]
+        return float(item[0]), float(item[1])
+
+    r = link_rate(ctx, src_sp_id, dst_sp_id)
+
+    if r <= 0.0:
+        raise ValueError(f"Link {src_sp_id}->{dst_sp_id} has no positive transmission rate")
+
+    tx_time = transmission.intermediate_data_tx_time(data_bits=data_bits, link_rate_bps=r)
+    p_opt = optimize_tx_power(ctx, sp_id=src_sp_id, dst_sp_id=dst_sp_id)
+    if ctx.get("sp_types", {}).get(src_sp_id) == "vehicle":
+        tx_energy = transmission.intermediate_data_tx_energy(tx_power_w=p_opt, tx_time_s=tx_time)
     else:
-        data_size = float(ctx["output_size"][src_task])
-        r = rate(ctx, dst_sp)
+        tx_energy = 0.0
 
-        transfer_time = 0.0 if r <= 0 else data_size / r
-
-    return scheduling.dependency_output_receive_time(
-        finish_time_src_s=ft_src,
-        finish_time_same_provider_s=ft_src,
-        idle_time_s=idle,
-        transfer_time_s=transfer_time,
-        same_provider=same
-    )
+    value = (float(tx_time), float(tx_energy))
+    tx_cache[cache_key] = value
+    return value
 
 
+def _service_program_energy(ctx, sp_id: int, task_id: int) -> float:
+    mode = _mode(ctx, sp_id)
 
-def t_rec(ctx, sp_id: int, task_id: int):
+    if mode == "local":
+        return 0.0
+
+    task_type = ctx["task_type_ids"].get(task_id)
+
+    if task_type is None:
+        return 0.0
+
+    if ctx.get("use_caching", True) and task_type in ctx.get("cache", {}).get(sp_id, set()):
+        return 0.0
+
+    size_bits = float(ctx.get("service_size_bits", {}).get(task_type, 0.0))
+    if size_bits <= 0.0:
+        return 0.0
+
+    service_energy_cache = ctx.setdefault("_service_program_energy_cache", {})
+    cache_key = (int(sp_id), int(task_type), size_bits)
+    if cache_key in service_energy_cache:
+        return float(service_energy_cache[cache_key])
+
+    vehicle_sources = [
+        int(source_id)
+        for source_id in _all_providers(ctx)
+        if int(source_id) != int(sp_id)
+        and ctx.get("sp_types", {}).get(int(source_id)) == "vehicle"
+    ]
+
+    if not vehicle_sources:
+        raise ValueError(f"No vehicle source is available for service type {task_type}")
+
+    energies = []
+    for source_id in vehicle_sources:
+        _, energy = _tx_time_energy(ctx, source_id, int(sp_id), size_bits)
+        energies.append(float(energy))
+
+    value = min(energies)
+    service_energy_cache[cache_key] = float(value)
+    return float(value)
+
+
+def _candidate_dependency_ready_and_energy(ctx, state, sp_id: int, task_id: int):
     preds = ctx["dependencies"].get(task_id, [])
 
     if not preds:
-        return 0.0
+        return 0.0, 0.0, dict(state.get("link_finish", {})), []
 
-    dep_times = [t_rec_i_prim(ctx, sp_id, sp_id, p, task_id) for p in preds]
+    recv_times = []
+    tx_energy_total = 0.0
+    edge_data_bits = ctx.get("edge_data_bits", {})
+    fallback_output = ctx.get("task_output_size_bits", ctx.get("output_size", {}))
+    link_finish = dict(state.get("link_finish", {}))
+    transfers = []
 
-    return scheduling.all_dependencies_receive_time(
-        dep_receive_times_s=dep_times
+    ordered_preds = sorted((int(pred) for pred in preds), key=lambda pred: float(state["task_finish"].get(pred, 0.0)))
+
+    for pred in ordered_preds:
+        src_sp = state["task_provider"].get(pred)
+
+        if src_sp is None:
+            raise ValueError(f"Predecessor task {pred} must be scheduled before task {task_id}")
+
+        src_sp = int(src_sp)
+        finish_src = float(state["task_finish"][pred])
+
+        if src_sp == int(sp_id):
+            recv_times.append(finish_src)
+            continue
+
+        data_bits = edge_data_bits.get(pred, {}).get(task_id)
+
+        if data_bits is None:
+            data_bits = fallback_output.get(pred, 0.0)
+
+        tx_time, tx_energy = _tx_time_energy(ctx, src_sp, int(sp_id), float(data_bits))
+        link_key = (src_sp, int(sp_id))
+        idle_time = float(link_finish.get(link_key, ctx.get("idle_time", 0.0)))
+        transfer_start = max(finish_src, idle_time)
+        arrival_time = transfer_start + tx_time
+        link_finish[link_key] = arrival_time
+
+        recv_times.append(arrival_time)
+        tx_energy_total += tx_energy
+        transfers.append(
+            {
+                "predecessor_task_id": pred,
+                "source_provider_id": src_sp,
+                "destination_provider_id": int(sp_id),
+                "data_bits": float(data_bits),
+                "transfer_start_s": float(transfer_start),
+                "transfer_time_s": float(tx_time),
+                "arrival_time_s": float(arrival_time),
+                "transfer_energy_j": float(tx_energy),
+            }
+        )
+
+    return (scheduling.all_dependencies_receive_time(recv_times), tx_energy_total, link_finish, transfers)
+
+
+def _candidate_eval(ctx, state, sp_id: int, task_id: int):
+    deps_ready, dep_energy, link_finish, transfers = _candidate_dependency_ready_and_energy(ctx, state, sp_id, task_id)
+
+    start = scheduling.task_start_timestamp(
+        deps_ready_time_s=deps_ready,
+        prev_rank_finish_time_s=float(
+            state["provider_finish"].get(sp_id, 0.0)
+        ),
     )
 
+    finish = scheduling.task_finish_timestamp(start_time_s=start, compute_time_s=t_comp(ctx, sp_id, task_id))
 
-def t_finish_rank(ctx, sp_id: int):
-    tasks = _tasks(ctx)
+    energy = e_comp(ctx, sp_id, task_id) + dep_energy + _service_program_energy(ctx, sp_id, task_id)
 
-    finish_list = [t_finish(ctx, sp_id, t) for t in tasks]
+    alpha_n, beta_n = _weights(ctx)
 
-    return scheduling.provider_rank_finish_time(
-        task_finish_times_s=finish_list,
-        z_task_to_rank=_z_rank_for_provider(ctx, sp_id)
+    q = policy.single_task_efficiency(
+        alpha_n=alpha_n,
+        beta_n=beta_n,
+        t_ref_s=t_ref_s(ctx),
+        task_finish_time_s=finish,
+        e_loc_j=e_loc_j(ctx),
+        e_task_off_j=energy,
     )
 
-
-def t_start(ctx, sp_id: int, task_id: int):
-    return scheduling.task_start_timestamp(
-        deps_ready_time_s=t_rec(ctx, sp_id, task_id),
-        prev_rank_finish_time_s=t_finish_rank(ctx, sp_id)
-    )
+    return q, start, finish, energy, link_finish, transfers
 
 
 def compute_Q(ctx, sp_id: int, i: int):
-    a = _safe_float(params.alpha_n)
-    b = _safe_float(params.beta_n)
+    state = ctx.get("_schedule_state")
 
-    return policy.single_task_efficiency(
-        alpha_n=a,
-        beta_n=b,
-        t_ref_s=t_ref_s(ctx),
-        task_finish_time_s=t_finish(ctx, sp_id, i),
-        e_loc_j=e_loc_j(ctx),
-        e_task_off_j=e_com(ctx, sp_id, i) #////////
-    )
+    if state is None:
+        state = _empty_state(ctx)
+
+    q, _, _, _, _, _ = _candidate_eval(ctx, state, sp_id, i)
+
+    return q
 
 
-def compute_Q1(ctx, sp_id: int):
-    a = _safe_float(params.alpha_n)
-    b = _safe_float(params.beta_n)
+def _empty_state(ctx):
+    initial_provider_finish = ctx.get("provider_initial_finish", {})
+
+    return {
+        "provider_finish": {
+            sp: max(0.0, float(initial_provider_finish.get(sp, 0.0)))
+            for sp in _all_providers(ctx)
+        },
+        "link_finish": {},
+        "task_start": {},
+        "task_finish": {},
+        "task_provider": {},
+        "task_energy": {},
+        "task_transfers": {},
+    }
+
+
+def _apply_assignment(ctx, state, task_id: int, sp_id: int, rank: int):
+    _, start, finish, energy, link_finish, transfers = _candidate_eval(ctx, state, sp_id, task_id)
+
+    state["provider_finish"][sp_id] = finish
+    shared_link_finish = state.setdefault("link_finish", {})
+    shared_link_finish.clear()
+    shared_link_finish.update(link_finish)
+    state.setdefault("task_start", {})[task_id] = start
+    state["task_finish"][task_id] = finish
+    state["task_provider"][task_id] = sp_id
+    state["task_energy"][task_id] = energy
+    state.setdefault("task_transfers", {})[task_id] = transfers
+
+    _update_z(ctx, task_id, sp_id, rank)
+
+
+def _entry_task_id(ctx) -> int:
+    entry_task_id = ctx.get("entry_task_id")
+
+    if entry_task_id is None:
+        ready = [int(task_id) for task_id in ctx.get("tasks", {}).get("ready", [])]
+
+        if len(ready) != 1:
+            raise ValueError("Exactly one entry task is required")
+
+        entry_task_id = ready[0]
+
+    entry_task_id = int(entry_task_id)
+
+    if entry_task_id not in ctx.get("cpu_cycles", {}):
+        raise ValueError(f"Entry task {entry_task_id} is not present in the context")
+
+    return entry_task_id
+
+
+def _apply_entry_task(ctx, state, rank_counter):
+    entry_task_id = _entry_task_id(ctx)
+    local_sp_id = ctx.get("local_sp_id")
+
+    if local_sp_id is None:
+        raise ValueError("Local service provider is required for the entry task")
+
+    local_sp_id = int(local_sp_id)
+
+    if local_sp_id not in rank_counter:
+        raise ValueError(f"Local service provider {local_sp_id} is not available")
+
+    assigned_provider = state.get("task_provider", {}).get(entry_task_id)
+
+    if assigned_provider is not None:
+        if int(assigned_provider) != local_sp_id:
+            raise ValueError("Entry task must be assigned to the local service provider")
+
+        return entry_task_id, local_sp_id
+
+    rank_counter[local_sp_id] += 1
+
+    _apply_assignment(ctx, state, entry_task_id, local_sp_id, rank_counter[local_sp_id])
+
+    return entry_task_id, local_sp_id
+
+
+def t_finish(ctx, sp_id: int, task_id: int):
+    state = ctx.get("_schedule_state")
+
+    if state and state["task_provider"].get(task_id) == sp_id:
+        return float(state["task_finish"].get(task_id, 0.0))
+
+    _, _, finish, _, _, _ = _candidate_eval(ctx, state or _empty_state(ctx), sp_id, task_id)
+
+    return finish
+
+
+def t_start(ctx, sp_id: int, task_id: int):
+    state = ctx.get("_schedule_state")
+
+    if state and state["task_provider"].get(task_id) == sp_id:
+        return float(state["task_start"].get(task_id, 0.0))
+
+    _, start, _, _, _, _ = _candidate_eval(ctx, state or _empty_state(ctx), sp_id, task_id)
+
+    return start
+
+
+def t_off(ctx):
+    state = ctx.get("_schedule_state")
+    if state and state["task_finish"]:
+        return max(state["task_finish"].values())
+    return 0.0
+
+
+def e_off(ctx):
+    state = ctx.get("_schedule_state")
+
+    if state and state["task_energy"]:
+        return sum(state["task_energy"].values())
+
+    return 0.0
+
+
+def compute_Q1(ctx, sp_id: int | None = None):
+    alpha_n, beta_n = _weights(ctx)
 
     return offloading_efficiency.application_offloading_efficiency(
-        alpha_n=a,
-        beta_n=b,
+        alpha_n=alpha_n,
+        beta_n=beta_n,
         t_ref_s=t_ref_s(ctx),
         t_off_s=t_off(ctx),
         e_loc_j=e_loc_j(ctx),
-        e_task_off_j=e_off(ctx)
+        e_off_j=e_off(ctx),
     )
 
 
@@ -308,59 +529,73 @@ def _update_z(ctx, task_id, provider_id, rank):
     z_binary = ctx["z"]["binary"]
     z_compact = ctx["z"]["compact"]
 
+    for p in list(z_binary.keys()):
+        for rk in list(z_binary[p].keys()):
+            if task_id in z_binary[p][rk]:
+                del z_binary[p][rk][task_id]
+            if not z_binary[p][rk]:
+                del z_binary[p][rk]
+        if not z_binary[p]:
+            del z_binary[p]
+
     z_compact[task_id]["provider"] = provider_id
     z_compact[task_id]["rank"] = rank
 
-    if provider_id not in z_binary:
-        z_binary[provider_id] = {}
-
-    if rank not in z_binary[provider_id]:
-        z_binary[provider_id][rank] = {}
-
+    z_binary.setdefault(provider_id, {})
+    z_binary[provider_id].setdefault(rank, {})
     z_binary[provider_id][rank][task_id] = 1
+
+
+def _reset_assignment(ctx):
+    ctx["z"] = {"binary": {}, "compact": {tid: {"provider": None, "rank": None} for tid in ctx["task_ids"]}}
 
 
 def procedure1_greedy_initialization(S: int, task_order: List[int], ctx):
     from algorithm.update_service_cache import update_cache
 
-    sp_list = list(ctx["providers"].keys())
+    sp_list = _providers(ctx)
     I = len(task_order)
 
     solutions = []
 
     for s in range(1, S + 1):
-        mutaInd = random.randint(0, I - 1)
+        work_ctx = copy.deepcopy(ctx)
+        _reset_assignment(work_ctx)
+        work_ctx["_schedule_state"] = _empty_state(work_ctx)
 
+        mutaInd = random.randint(0, I - 1) if I > 0 else 0
         nest = []
         r = {sp: 0 for sp in sp_list}
+        local_sp_id = _local_sp_id(work_ctx)
+        if local_sp_id is not None:
+            r.setdefault(int(local_sp_id), 0)
+
+        _apply_entry_task(work_ctx, work_ctx["_schedule_state"], r)
 
         for idx, task_id in enumerate(task_order):
-
-            qm = {sp: compute_Q(ctx, sp, task_id) for sp in sp_list}
+            q_map = {sp: compute_Q(work_ctx, sp, task_id) for sp in sp_list}
 
             if s == 1:
-                x_star = max(qm, key=qm.get)
-
-            elif idx == mutaInd:
-                xb = max(qm, key=qm.get)
-                xw = min(qm, key=qm.get)
-                qm[xb] = qm[xw]
-                x_star = max(qm, key=qm.get)
-
+                x_star = max(q_map, key=q_map.get)
+            elif idx == mutaInd and len(q_map) > 1:
+                best = max(q_map, key=q_map.get)
+                alternatives = [sp for sp in q_map if sp != best]
+                x_star = max(alternatives, key=q_map.get)
             else:
-                x_star = max(qm, key=qm.get)
+                x_star = max(q_map, key=q_map.get)
 
             r[x_star] += 1
 
-            _update_z(ctx, task_id, x_star, r[x_star])
-            update_cache(ctx, x_star, task_id)
+            _apply_assignment(work_ctx, work_ctx["_schedule_state"], task_id, x_star, r[x_star])
+
+            if work_ctx.get("use_caching", True):
+                update_cache(work_ctx, x_star, task_id, remaining_task_ids=task_order[idx + 1:])
 
             nest.append((task_id, x_star, r[x_star]))
 
-        solutions.append(nest)
+        quality = compute_Q1(work_ctx)
+        solutions.append((nest, quality))
 
-    return sorted(
-        solutions,
-        key=lambda s: sum(compute_Q1(ctx, sp) for (_, sp, _) in s),
-        reverse=True
-    )
+    solutions.sort(key=lambda item: item[1], reverse=True)
+
+    return [nest for nest, _ in solutions]

@@ -61,6 +61,10 @@ class SimParams:
     fmax_rsu: float
     simulate_time: int
     taking_task_time: int
+    vehicle_speed_min_kmh: float
+    vehicle_speed_max_kmh: float
+    application_rate_per_second: float
+    simulation_seed: int
 
     @property
     def beta_n(self) -> float:
@@ -104,6 +108,10 @@ def load_params_obj() -> SimParams:
         fmax_rsu=_to_float(_require(raw, "fmax_rsu")),
         simulate_time=_to_int(_require(raw, "simulate_time")),
         taking_task_time=_to_int(_require(raw, "taking_task_time")),
+        vehicle_speed_min_kmh=_to_float(raw.get("vehicle_speed_min_kmh", 60.0)),
+        vehicle_speed_max_kmh=_to_float(raw.get("vehicle_speed_max_kmh", 80.0)),
+        application_rate_per_second=_to_float(raw.get("application_rate_per_second", 10.0)),
+        simulation_seed=_to_int(raw.get("simulation_seed", 1)),
     )
 
 

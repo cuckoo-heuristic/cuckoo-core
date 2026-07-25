@@ -2,9 +2,12 @@ from rest_framework import serializers
 
 
 class StartSimulationSerializer(serializers.Serializer):
-    a1 = serializers.IntegerField(default=1)
-    a2 = serializers.IntegerField(default=1)
-    a3 = serializers.IntegerField(default=1)
+    tmax = serializers.IntegerField(
+        required=False,
+        min_value=1,
+        max_value=1000,
+        default=10,
+    )
 
 
 class SimulationConfigSerializer(serializers.Serializer):
@@ -51,3 +54,70 @@ class SimulationStatusSerializer(serializers.Serializer):
     context = SimulationContextSerializer()
     cfg = SimulationConfigSerializer(required=False, allow_null=True)
     snapshot_ts = serializers.CharField(required=False, allow_null=True)
+class BenchmarkRequestSerializer(serializers.Serializer):
+    application_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        allow_empty=False,
+    )
+
+    algorithms = serializers.ListField(
+        child=serializers.ChoiceField(
+            choices=[
+                "dcsga",
+                "dtosc",
+                "to_v2i",
+                "to_wo_c",
+                "to_wo_r",
+            ]
+        ),
+        required=False,
+        allow_empty=False,
+    )
+
+    seeds = serializers.ListField(
+        child=serializers.IntegerField(),
+        required=False,
+        allow_empty=False,
+        default=[1],
+    )
+
+    tmax = serializers.IntegerField(
+        required=False,
+        min_value=1,
+        max_value=1000,
+        default=10,
+    )
+
+class PaperExperimentRequestSerializer(serializers.Serializer):
+    figure = serializers.ChoiceField(
+        choices=[
+            "figure_6",
+            "figure_7",
+            "figure_8",
+            "figure_9",
+            "figure_10",
+            "all",
+            "*",
+        ]
+    )
+    repetitions = serializers.IntegerField(
+        required=False,
+        min_value=1,
+        max_value=100,
+    )
+    seed_start = serializers.IntegerField(
+        required=False,
+        default=1,
+    )
+    tmax = serializers.IntegerField(
+        required=False,
+        min_value=1,
+        max_value=1000,
+        default=15,
+    )
+    population_size = serializers.IntegerField(
+        required=False,
+        min_value=2,
+        max_value=500,
+        allow_null=True,
+    )
