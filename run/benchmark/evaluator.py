@@ -405,10 +405,12 @@ class JointScheduleState:
         *,
         use_caching: bool,
         v2i_only: bool,
+        record_schedule: bool = True,
     ):
         self.joint_ctx = joint_ctx
         self.use_caching = bool(use_caching)
         self.v2i_only = bool(v2i_only)
+        self.record_schedule = bool(record_schedule)
         shared_cache_keys = (
             "_link_fading",
             "_channel_gain_cache",
@@ -503,6 +505,7 @@ class JointScheduleState:
         cloned.joint_ctx = self.joint_ctx
         cloned.use_caching = self.use_caching
         cloned.v2i_only = self.v2i_only
+        cloned.record_schedule = self.record_schedule
         cloned.shared_cache = {
             int(sp_id): set(values)
             for sp_id, values in self.shared_cache.items()
@@ -611,6 +614,9 @@ class JointScheduleState:
         cache_before: Iterable[int] | None = None,
         cache_after: Iterable[int] | None = None,
     ) -> None:
+        if not self.record_schedule:
+            return
+
         ref = self.task_ref(joint_task_id)
         app_ctx = self.application_contexts[ref.application_id]
         state = self.app_states[ref.application_id]
@@ -793,6 +799,25 @@ class JointScheduleState:
             * _safe_ratio(e_local - task_energy, e_local)
         )
 
+    def total_efficiency(self) -> float:
+        """Return the exact joint objective without materializing report rows.
+
+        The application order and floating-point operations intentionally match
+        ``final_evaluation``.  This method is used only by the search fast path;
+        the winning nest is still evaluated once with full details before it is
+        returned to callers.
+        """
+
+        return float(
+            sum(
+                _application_efficiency(
+                    self.application_contexts[app_id],
+                    self.app_states[app_id],
+                )
+                for app_id in self.joint_ctx["application_ids"]
+            )
+        )
+
     def final_evaluation(self) -> JointEvaluation:
         application_results: List[JointApplicationResult] = []
 
@@ -915,3 +940,53 @@ def evaluate_joint_nest(
         )
 
     return state.final_evaluation()
+
+def evaluate_joint_nest_total(
+    joint_ctx: Dict[str, Any],
+    nest: Sequence[NestItem],
+    task_order: Sequence[int],
+    *,
+    use_caching: bool,
+    v2i_only: bool,
+) -> float:
+    """Evaluate only the exact total objective for an intermediate nest.
+
+    Scheduling, queues, transfers, cache updates, formulas, and task order are
+    identical to :func:`evaluate_joint_nest`.  The only omitted work is the
+    construction and deep-copying of reporting objects that the optimizer does
+    not inspect while ranking intermediate nests.
+    """
+
+    expected = [int(task_id) for task_id in joint_ctx["optimized_task_ids"]]
+    normalized_order = [int(task_id) for task_id in task_order]
+    provider_map = _nest_provider_map(nest)
+
+    expected_set = set(expected)
+    if set(provider_map) != expected_set:
+        missing = sorted(expected_set - set(provider_map))
+        extra = sorted(set(provider_map) - expected_set)
+        raise ValueError(f"Nest task mismatch; missing={missing}, extra={extra}")
+    if (
+        set(normalized_order) != expected_set
+        or len(normalized_order) != len(expected)
+    ):
+        raise ValueError(
+            "Task order must contain every non-entry task exactly once"
+        )
+
+    state = JointScheduleState(
+        joint_ctx,
+        use_caching=use_caching,
+        v2i_only=v2i_only,
+        record_schedule=False,
+    )
+    state.assign_entry_tasks()
+
+    for index, joint_task_id in enumerate(normalized_order):
+        state.assign_task(
+            joint_task_id,
+            provider_map[joint_task_id],
+            remaining_task_ids=normalized_order[index + 1 :],
+        )
+
+    return state.total_efficiency()

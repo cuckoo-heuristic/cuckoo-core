@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 from parameter.services import load_params_obj
@@ -12,12 +13,55 @@ from .evaluator import (
     JointScheduleState,
     NestItem,
     evaluate_joint_nest,
+    evaluate_joint_nest_total,
 )
 from .schemes import (
     SUPPORTED_JOINT_ALGORITHMS,
     JointScheme,
     get_joint_scheme,
 )
+
+
+@dataclass
+class _SearchStaticCache:
+    """Per-run immutable lookup cache for search-only structural data.
+
+    The cached values are derived exclusively from the already-built joint
+    scenario.  They do not depend on the random seed, the current nest, cache
+    contents, queues, or any mutable scheduling state.
+    """
+
+    ranked_task_ids: Tuple[int, ...]
+    unranked_task_ids: Tuple[int, ...]
+    initial_provider_ranks: Dict[int, int]
+    domains: Dict[Tuple[str, int], List[int]] = field(default_factory=dict)
+    modes: Dict[Tuple[int, int], str] = field(default_factory=dict)
+
+
+def _build_search_static_cache(
+    joint_ctx: Dict[str, Any],
+) -> _SearchStaticCache:
+    ranks = {
+        int(sp_id): 0
+        for sp_id in joint_ctx["provider_ids"]
+    }
+    for app_id in joint_ctx["application_ids"]:
+        local_sp_id = int(
+            joint_ctx["applications"][app_id]["local_sp_id"]
+        )
+        ranks[local_sp_id] = ranks.get(local_sp_id, 0) + 1
+
+    return _SearchStaticCache(
+        ranked_task_ids=tuple(
+            int(task_id)
+            for task_id in joint_ctx["ranked_task_ids"]
+        ),
+        unranked_task_ids=tuple(
+            int(task_id)
+            for task_id in joint_ctx["unranked_task_ids"]
+        ),
+        initial_provider_ranks=ranks,
+    )
 
 
 def _prepare_joint_context_seed(
@@ -39,26 +83,66 @@ def _prepare_joint_context_seed(
         app_ctx.pop("_t_ref_s_cache", None)
 
 
-def task_order_for_scheme(joint_ctx: Dict[str, Any], scheme: JointScheme) -> List[int]:
+def task_order_for_scheme(
+    joint_ctx: Dict[str, Any],
+    scheme: JointScheme,
+    search_cache: _SearchStaticCache | None = None,
+) -> List[int]:
+    if search_cache is not None:
+        source = (
+            search_cache.ranked_task_ids
+            if scheme.use_ranking
+            else search_cache.unranked_task_ids
+        )
+        return list(source)
+
     key = "ranked_task_ids" if scheme.use_ranking else "unranked_task_ids"
     return [int(task_id) for task_id in joint_ctx[key]]
 
 
-def _mode_for_task(joint_ctx: Dict[str, Any], joint_task_id: int, provider_id: int) -> str:
-    ref = joint_ctx["task_refs"][int(joint_task_id)]
+def _mode_for_task(
+    joint_ctx: Dict[str, Any],
+    joint_task_id: int,
+    provider_id: int,
+    search_cache: _SearchStaticCache | None = None,
+) -> str:
+    joint_task_id = int(joint_task_id)
+    provider_id = int(provider_id)
+    cache_key = (joint_task_id, provider_id)
+
+    if search_cache is not None:
+        cached = search_cache.modes.get(cache_key)
+        if cached is not None:
+            return cached
+
+    ref = joint_ctx["task_refs"][joint_task_id]
     app_ctx = joint_ctx["applications"][ref.application_id]
-    return str(app_ctx.get("sp_modes", {}).get(int(provider_id), "unknown"))
+    mode = str(app_ctx.get("sp_modes", {}).get(provider_id, "unknown"))
+
+    if search_cache is not None:
+        search_cache.modes[cache_key] = mode
+    return mode
 
 
 def _domain(
     joint_ctx: Dict[str, Any],
     joint_task_id: int,
     scheme: JointScheme,
+    search_cache: _SearchStaticCache | None = None,
 ) -> List[int]:
-    ref = joint_ctx["task_refs"][int(joint_task_id)]
+    joint_task_id = int(joint_task_id)
+    cache_key = (str(scheme.name), joint_task_id)
+
+    if search_cache is not None:
+        cached = search_cache.domains.get(cache_key)
+        if cached is not None:
+            return cached
+
+    ref = joint_ctx["task_refs"][joint_task_id]
     app_ctx = joint_ctx["applications"][ref.application_id]
     providers = [
-        int(sp_id) for sp_id in joint_ctx["task_domains"][int(joint_task_id)]
+        int(sp_id)
+        for sp_id in joint_ctx["task_domains"][joint_task_id]
     ]
 
     if scheme.provider_scope == "rsu_only":
@@ -77,11 +161,22 @@ def _domain(
         ]
 
     if not providers:
-        raise ValueError(f"Joint task {joint_task_id} has no feasible providers")
+        raise ValueError(
+            f"Joint task {joint_task_id} has no feasible providers"
+        )
+
+    if search_cache is not None:
+        search_cache.domains[cache_key] = providers
     return providers
 
 
-def _initial_provider_ranks(joint_ctx: Dict[str, Any]) -> Dict[int, int]:
+def _initial_provider_ranks(
+    joint_ctx: Dict[str, Any],
+    search_cache: _SearchStaticCache | None = None,
+) -> Dict[int, int]:
+    if search_cache is not None:
+        return dict(search_cache.initial_provider_ranks)
+
     ranks = {int(sp_id): 0 for sp_id in joint_ctx["provider_ids"]}
     for app_id in joint_ctx["application_ids"]:
         local_sp_id = int(joint_ctx["applications"][app_id]["local_sp_id"])
@@ -93,8 +188,12 @@ def _rebuild_nest(
     joint_ctx: Dict[str, Any],
     task_order: Sequence[int],
     provider_map: Dict[int, int],
+    search_cache: _SearchStaticCache | None = None,
 ) -> List[NestItem]:
-    ranks: Dict[int, int] = _initial_provider_ranks(joint_ctx)
+    ranks: Dict[int, int] = _initial_provider_ranks(
+        joint_ctx,
+        search_cache,
+    )
     nest: List[NestItem] = []
     for joint_task_id in task_order:
         provider_id = int(provider_map[int(joint_task_id)])
@@ -109,8 +208,16 @@ def greedy_initial_population(
     scheme: JointScheme,
     population_size: int,
     rng: random.Random,
+    search_cache: _SearchStaticCache | None = None,
 ) -> List[List[NestItem]]:
-    task_order = task_order_for_scheme(joint_ctx, scheme)
+    if search_cache is None:
+        search_cache = _build_search_static_cache(joint_ctx)
+
+    task_order = task_order_for_scheme(
+        joint_ctx,
+        scheme,
+        search_cache,
+    )
     if not task_order:
         raise ValueError("Joint scenario has no non-entry tasks")
 
@@ -121,6 +228,7 @@ def greedy_initial_population(
             joint_ctx,
             use_caching=scheme.use_caching,
             v2i_only=scheme.v2i_only,
+            record_schedule=False,
         )
         state.assign_entry_tasks()
         mutation_index = rng.randrange(len(task_order))
@@ -130,7 +238,12 @@ def greedy_initial_population(
             remaining = task_order[index + 1 :]
             candidate_rows: List[Tuple[float, int]] = []
 
-            for provider_id in _domain(joint_ctx, joint_task_id, scheme):
+            for provider_id in _domain(
+                joint_ctx,
+                joint_task_id,
+                scheme,
+                search_cache,
+            ):
                 candidate_rows.append(
                     (state.candidate_provider_score(joint_task_id, provider_id), provider_id)
                 )
@@ -150,17 +263,27 @@ def greedy_initial_population(
             )
             provider_map[joint_task_id] = selected_provider
 
-        evaluation = state.final_evaluation()
+        total_efficiency = state.total_efficiency()
         solutions.append(
-            (_rebuild_nest(joint_ctx, task_order, provider_map), evaluation.total_efficiency)
+            (
+                _rebuild_nest(
+                    joint_ctx,
+                    task_order,
+                    provider_map,
+                    search_cache,
+                ),
+                total_efficiency,
+            )
         )
 
     solutions.sort(key=lambda row: row[1], reverse=True)
     return [nest for nest, _quality in solutions]
 
 
-def _levy(beta: float, rng: random.Random) -> float:
-    sigma = (
+@lru_cache(maxsize=16)
+def _levy_sigma(beta: float) -> float:
+    beta = float(beta)
+    return (
         math.gamma(1.0 + beta)
         * math.sin(math.pi * beta / 2.0)
         / (
@@ -169,6 +292,10 @@ def _levy(beta: float, rng: random.Random) -> float:
             * (2.0 ** ((beta - 1.0) / 2.0))
         )
     ) ** (1.0 / beta)
+
+
+def _levy(beta: float, rng: random.Random) -> float:
+    sigma = _levy_sigma(float(beta))
     u = rng.gauss(0.0, sigma)
     v = rng.gauss(0.0, 1.0)
     return u / (abs(v) ** (1.0 / beta))
@@ -186,19 +313,35 @@ def _random_provider_same_mode(
     target_mode: str,
     scheme: JointScheme,
     rng: random.Random,
+    search_cache: _SearchStaticCache | None = None,
 ) -> int:
-    domain = _domain(joint_ctx, joint_task_id, scheme)
+    domain = _domain(
+        joint_ctx,
+        joint_task_id,
+        scheme,
+        search_cache,
+    )
     candidates = [
         provider_id
         for provider_id in domain
         if provider_id != current_provider
-        and _mode_for_task(joint_ctx, joint_task_id, provider_id) == target_mode
+        and _mode_for_task(
+            joint_ctx,
+            joint_task_id,
+            provider_id,
+            search_cache,
+        ) == target_mode
     ]
     if not candidates:
         candidates = [
             provider_id
             for provider_id in domain
-            if _mode_for_task(joint_ctx, joint_task_id, provider_id) == target_mode
+            if _mode_for_task(
+                joint_ctx,
+                joint_task_id,
+                provider_id,
+                search_cache,
+            ) == target_mode
         ]
     if not candidates:
         candidates = [provider_id for provider_id in domain if provider_id != current_provider]
@@ -215,6 +358,7 @@ def generate_new_solution(
     scheme: JointScheme,
     levy_lambda: float,
     rng: random.Random,
+    search_cache: _SearchStaticCache | None = None,
 ) -> List[NestItem]:
     task_order = [int(task_id) for task_id, _provider_id, _rank in source_nest]
     source = {
@@ -270,6 +414,7 @@ def generate_new_solution(
                     joint_ctx,
                     task_id,
                     best[task_id],
+                    search_cache,
                 )
                 new_map[task_id] = _random_provider_same_mode(
                     joint_ctx,
@@ -278,12 +423,22 @@ def generate_new_solution(
                     target_mode,
                     scheme,
                     rng,
+                    search_cache,
                 )
     else:
         if quotient:
             selected = rng.sample(task_order, min(quotient, len(task_order)))
             for task_id in selected:
-                new_map[task_id] = int(rng.choice(_domain(joint_ctx, task_id, scheme)))
+                new_map[task_id] = int(
+                    rng.choice(
+                        _domain(
+                            joint_ctx,
+                            task_id,
+                            scheme,
+                            search_cache,
+                        )
+                    )
+                )
                 transformed.add(task_id)
 
         if remainder:
@@ -294,6 +449,7 @@ def generate_new_solution(
                     joint_ctx,
                     task_id,
                     new_map[task_id],
+                    search_cache,
                 )
                 new_map[task_id] = _random_provider_same_mode(
                     joint_ctx,
@@ -302,9 +458,15 @@ def generate_new_solution(
                     current_mode,
                     scheme,
                     rng,
+                    search_cache,
                 )
 
-    return _rebuild_nest(joint_ctx, task_order, new_map)
+    return _rebuild_nest(
+        joint_ctx,
+        task_order,
+        new_map,
+        search_cache,
+    )
 
 
 def _evaluate_population(
@@ -313,9 +475,17 @@ def _evaluate_population(
     *,
     task_order: Sequence[int],
     scheme: JointScheme,
-    memo: Dict[Tuple[int, ...], JointEvaluation] | None = None,
-) -> List[Tuple[List[NestItem], JointEvaluation]]:
-    evaluated: List[Tuple[List[NestItem], JointEvaluation]] = []
+    memo: Dict[Tuple[int, ...], float] | None = None,
+) -> List[Tuple[List[NestItem], float]]:
+    """Rank intermediate nests using the exact objective-only evaluator.
+
+    The complete schedule/report is intentionally materialized only once for
+    the final winning nest in ``run_joint_dcsga``.  This changes neither the
+    objective value nor the population ordering; it only skips report-object
+    construction for nests that the optimizer uses solely as scalar fitness.
+    """
+
+    evaluated: List[Tuple[List[NestItem], float]] = []
     if memo is None:
         memo = {}
 
@@ -325,30 +495,27 @@ def _evaluate_population(
             for task_id, provider_id, _rank in nest
         }
         signature = tuple(provider_by_task[int(task_id)] for task_id in task_order)
-        evaluation = memo.get(signature)
-        if evaluation is None:
-            evaluation = evaluate_joint_nest(
+        total_efficiency = memo.get(signature)
+        if total_efficiency is None:
+            total_efficiency = evaluate_joint_nest_total(
                 joint_ctx,
                 nest,
                 task_order,
                 use_caching=scheme.use_caching,
                 v2i_only=scheme.v2i_only,
             )
-            memo[signature] = evaluation
-        evaluated.append((list(nest), evaluation))
+            memo[signature] = total_efficiency
+        evaluated.append((list(nest), float(total_efficiency)))
 
-    evaluated.sort(key=lambda row: row[1].total_efficiency, reverse=True)
+    evaluated.sort(key=lambda row: row[1], reverse=True)
     return evaluated
 
 
 def _history_row(
     iteration: int,
-    evaluated: List[Tuple[List[NestItem], JointEvaluation]],
+    evaluated: List[Tuple[List[NestItem], float]],
 ) -> Dict[str, Any]:
-    population = [
-        float(row[1].total_efficiency)
-        for row in evaluated
-    ]
+    population = [float(row[1]) for row in evaluated]
     return {
         "iteration": float(iteration),
         "best_total_efficiency": float(max(population)),
@@ -366,6 +533,7 @@ def run_joint_dcsga(
 ) -> Tuple[List[NestItem], JointEvaluation, List[Dict[str, Any]]]:
     _prepare_joint_context_seed(joint_ctx, seed)
     scheme = get_joint_scheme(algorithm)
+    search_cache = _build_search_static_cache(joint_ctx)
     if scheme.name == "dtosc":
         raise ValueError("DTOSC must be executed with run_joint_dtosc")
 
@@ -377,7 +545,11 @@ def run_joint_dcsga(
     rng = random.Random(int(seed))
     levy_lambda = float(params.levy_lambda)
     discard_probability = float(params.p_discard_init)
-    task_order = task_order_for_scheme(joint_ctx, scheme)
+    task_order = task_order_for_scheme(
+        joint_ctx,
+        scheme,
+        search_cache,
+    )
 
     population = greedy_initial_population(
         joint_ctx,
@@ -385,7 +557,7 @@ def run_joint_dcsga(
         population_size=S,
         rng=rng,
     )
-    evaluation_memo: Dict[Tuple[int, ...], JointEvaluation] = {}
+    evaluation_memo: Dict[Tuple[int, ...], float] = {}
     evaluated = _evaluate_population(
         joint_ctx,
         population,
@@ -394,7 +566,6 @@ def run_joint_dcsga(
         memo=evaluation_memo,
     )
     population = [row[0] for row in evaluated[:S]]
-    best_evaluation = evaluated[0][1]
     best_nest = population[0]
     history: List[Dict[str, Any]] = [
         _history_row(0, evaluated[:S])
@@ -412,6 +583,7 @@ def run_joint_dcsga(
                     scheme=scheme,
                     levy_lambda=levy_lambda,
                     rng=rng,
+                    search_cache=search_cache,
                 )
             )
 
@@ -424,6 +596,7 @@ def run_joint_dcsga(
                 scheme=scheme,
                 levy_lambda=levy_lambda,
                 rng=rng,
+                search_cache=search_cache,
             )
             for _ in range(S)
         ]
@@ -451,6 +624,7 @@ def run_joint_dcsga(
                     scheme=scheme,
                     levy_lambda=levy_lambda,
                     rng=rng,
+                    search_cache=search_cache,
                 )
                 for _ in range(S)
             ]
@@ -465,10 +639,20 @@ def run_joint_dcsga(
         evaluated = evaluated[:S]
         population = [row[0] for row in evaluated]
         best_nest = population[0]
-        best_evaluation = evaluated[0][1]
         history.append(_history_row(t, evaluated))
         t += 1
 
+    # Materialize the full, externally visible result exactly once for the
+    # final winner.  CSV/JSON/XLSX rows, cache state, schedule rows, delays,
+    # energies and completion metrics still come from the unchanged full
+    # evaluator.
+    best_evaluation = evaluate_joint_nest(
+        joint_ctx,
+        best_nest,
+        task_order,
+        use_caching=scheme.use_caching,
+        v2i_only=scheme.v2i_only,
+    )
     return best_nest, best_evaluation, history
 
 @dataclass
@@ -587,7 +771,12 @@ def run_joint_dtosc(
 
     _prepare_joint_context_seed(joint_ctx, seed)
     scheme = get_joint_scheme("dtosc")
-    ranked_task_order = task_order_for_scheme(joint_ctx, scheme)
+    search_cache = _build_search_static_cache(joint_ctx)
+    ranked_task_order = task_order_for_scheme(
+        joint_ctx,
+        scheme,
+        search_cache,
+    )
     application_order = _dtosc_application_order(joint_ctx, ranked_task_order)
     tasks_by_application: Dict[int, List[int]] = {
         app_id: [
@@ -643,6 +832,7 @@ def run_joint_dtosc(
                     joint_ctx,
                     joint_task_id,
                     scheme,
+                    search_cache,
                 ):
                     transitions += 1
                     stage_utility = float(

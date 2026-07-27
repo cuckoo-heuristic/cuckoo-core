@@ -33,13 +33,18 @@ def link_distance(ctx, src_sp_id: int, dst_sp_id: int) -> float:
     if src_sp_id == dst_sp_id:
         return 0.0
 
+    cache = ctx.setdefault("_link_distance_cache", {})
+    cache_key = (src_sp_id, dst_sp_id)
+    if cache_key in cache:
+        return float(cache[cache_key])
+
     src_position = ctx.get("sp_position", {}).get(src_sp_id)
     dst_position = ctx.get("sp_position", {}).get(dst_sp_id)
 
     if src_position is None or dst_position is None:
         raise ValueError(f"Missing position for link {src_sp_id}->{dst_sp_id}")
 
-    return float(
+    value = float(
         distance_3d(
             float(src_position[0]),
             float(src_position[1]),
@@ -49,6 +54,8 @@ def link_distance(ctx, src_sp_id: int, dst_sp_id: int) -> float:
             _provider_height(ctx, dst_sp_id),
         )
     )
+    cache[cache_key] = value
+    return value
 
 
 def _stable_seed(ctx, src_sp_id: int, dst_sp_id: int) -> int:
@@ -137,25 +144,43 @@ def channel_gain(ctx, sp_id: int, dst_sp_id: int | None = None) -> float:
 
 
 def compute_local_time(ctx) -> float:
-    return offloading_efficiency.all_local_execution_time(
+    cached = ctx.get("_t_loc_s_cache")
+    if cached is not None:
+        return float(cached)
+
+    value = offloading_efficiency.all_local_execution_time(
         cpu_cycles_list=list(ctx["cpu_cycles"].values()),
         f_max_local_hz=float(ctx.get("local_cpu_freq_hz", params_lib.fmax_vehicle_hz)),
     )
+    ctx["_t_loc_s_cache"] = float(value)
+    return float(value)
 
 
 def compute_local_energy(ctx) -> float:
-    return offloading_efficiency.all_local_execution_energy(
+    cached = ctx.get("_e_loc_j_cache")
+    if cached is not None:
+        return float(cached)
+
+    value = offloading_efficiency.all_local_execution_energy(
         kappa=float(params.k),
         cpu_cycles_list=list(ctx["cpu_cycles"].values()),
         f_max_local_hz=float(ctx.get("local_cpu_freq_hz", params_lib.fmax_vehicle_hz)),
     )
+    ctx["_e_loc_j_cache"] = float(value)
+    return float(value)
 
 
 def compute_reference_time(ctx) -> float:
-    return offloading_efficiency.reference_time(
+    cached = ctx.get("_t_ref_s_cache")
+    if cached is not None:
+        return float(cached)
+
+    value = offloading_efficiency.reference_time(
         t_loc_s=compute_local_time(ctx),
         t_ddl_s=float(ctx["t_ddl_s"]),
     )
+    ctx["_t_ref_s_cache"] = float(value)
+    return float(value)
 
 
 def y_function(ctx, sp_id: int, p: float, z_selected: float = 1.0, dst_sp_id: int | None = None) -> float:

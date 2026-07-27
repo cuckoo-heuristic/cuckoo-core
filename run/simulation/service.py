@@ -171,6 +171,27 @@ def _build_cfg(params) -> SimulationConfig:
     cfg.simulation_seed = simulation_seed
 
     return cfg
+
+
+def _refresh_vehicle_motion_for_simulation(total_time: int) -> None:
+    """Recompute every vehicle speed from its route length and simulation time.
+
+    This keeps the runtime worker aligned with ``Vehicle.compute_speed``:
+    each valid route is completed at ``total_time`` rather than assigning an
+    unrelated random speed in the 60--80 km/h range.
+    """
+    if int(total_time) <= 0:
+        raise ValueError("Simulation time must be positive")
+
+    vehicles = list(Vehicle.objects.all())
+    for vehicle in vehicles:
+        vehicle.length = vehicle.compute_length()
+        vehicle.speed = vehicle.compute_speed(int(total_time))
+
+    if vehicles:
+        Vehicle.objects.bulk_update(vehicles, ["length", "speed"])
+
+
 def _sim_now_dt(base_time, sim_time_s: float):
     bt = base_time or timezone.now()
     return bt + timedelta(seconds=float(sim_time_s))
@@ -475,6 +496,7 @@ def run_simulation(
         _set_sim_time_s(0.0)
         _set_stop_requested(False)
         ensure_service_providers()
+        _refresh_vehicle_motion_for_simulation(cfg.total_time)
 
         _clock_worker = ClockWorker(cfg=cfg)
         _vehicle_workers = [

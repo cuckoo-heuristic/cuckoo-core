@@ -226,16 +226,14 @@ class VehicleWorker(threading.Thread):
     def stop(self):
         self._stop_flag.set()
 
-    def _speed_kmh(self) -> float:
-        lower = float(getattr(self.cfg, "vehicle_speed_min_kmh", 60.0))
-        upper = float(getattr(self.cfg, "vehicle_speed_max_kmh", 80.0))
-        if lower <= 0.0 or upper <= 0.0 or upper < lower:
-            raise ValueError("Invalid vehicle speed range")
-        if lower == upper:
-            return lower
-        seed = int(getattr(self.cfg, "simulation_seed", 1))
-        rng = random.Random(seed * 1_000_003 + self.vehicle_id * 9_973)
-        return float(rng.uniform(lower, upper))
+    def _speed_kmh(self, vehicle: Vehicle) -> float:
+        """Use the route-derived speed stored on the Vehicle model."""
+        speed_kmh = float(vehicle.speed or 0.0)
+        if speed_kmh <= 0.0:
+            raise ValueError(
+                f"Vehicle {self.vehicle_id} has no valid route-derived speed"
+            )
+        return speed_kmh
 
     def run(self):
         close_old_connections()
@@ -252,7 +250,6 @@ class VehicleWorker(threading.Thread):
                 or 1.0
             ),
         )
-        speed_mps = self._speed_kmh() / 3.6
         get_sim_time = getattr(
             self.cfg,
             "get_sim_time_s",
@@ -306,12 +303,11 @@ class VehicleWorker(threading.Thread):
                         vehicle.path
                     )
                 )
-
-                travel_time = (
-                    path_length / speed_mps
-                    if path_length > 0.0
-                    else 0.0
-                )
+                if path_length > 0.0:
+                    speed_mps = self._speed_kmh(vehicle) / 3.6
+                    travel_time = path_length / speed_mps
+                else:
+                    travel_time = 0.0
 
                 route_active = (
                     travel_time > 0.0
