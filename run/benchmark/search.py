@@ -209,6 +209,7 @@ def greedy_initial_population(
     population_size: int,
     rng: random.Random,
     search_cache: _SearchStaticCache | None = None,
+    evaluation_memo: Dict[Tuple[int, ...], float] | None = None,
 ) -> List[List[NestItem]]:
     if search_cache is None:
         search_cache = _build_search_static_cache(joint_ctx)
@@ -263,18 +264,27 @@ def greedy_initial_population(
             )
             provider_map[joint_task_id] = selected_provider
 
-        total_efficiency = state.total_efficiency()
-        solutions.append(
-            (
-                _rebuild_nest(
-                    joint_ctx,
-                    task_order,
-                    provider_map,
-                    search_cache,
-                ),
-                total_efficiency,
-            )
+        total_efficiency = float(state.total_efficiency())
+        nest = _rebuild_nest(
+            joint_ctx,
+            task_order,
+            provider_map,
+            search_cache,
         )
+        solutions.append((nest, total_efficiency))
+
+        # The greedy constructor has already evaluated this exact assignment
+        # while building it.  Seed the per-run objective memo so the same nest
+        # is not scheduled and evaluated a second time immediately after
+        # initialization.  The signature is identical to _evaluate_population,
+        # therefore this changes runtime only and cannot change ordering,
+        # randomness, or the numerical result.
+        if evaluation_memo is not None:
+            signature = tuple(
+                int(provider_map[int(task_id)])
+                for task_id in task_order
+            )
+            evaluation_memo.setdefault(signature, total_efficiency)
 
     solutions.sort(key=lambda row: row[1], reverse=True)
     return [nest for nest, _quality in solutions]
@@ -495,8 +505,9 @@ def _evaluate_population(
             for task_id, provider_id, _rank in nest
         }
         signature = tuple(provider_by_task[int(task_id)] for task_id in task_order)
-        total_efficiency = memo.get(signature)
-        if total_efficiency is None:
+        if signature in memo:
+            total_efficiency = memo[signature]
+        else:
             total_efficiency = evaluate_joint_nest_total(
                 joint_ctx,
                 nest,
@@ -514,13 +525,19 @@ def _evaluate_population(
 def _history_row(
     iteration: int,
     evaluated: List[Tuple[List[NestItem], float]],
+    function_evaluations: int | None = None,
 ) -> Dict[str, Any]:
     population = [float(row[1]) for row in evaluated]
-    return {
+    row = {
         "iteration": float(iteration),
         "best_total_efficiency": float(max(population)),
         "population_total_efficiencies": population,
     }
+
+    if function_evaluations is not None:
+        row["function_evaluations"] = int(function_evaluations)
+
+    return row
 
 
 def run_joint_dcsga(
@@ -551,13 +568,15 @@ def run_joint_dcsga(
         search_cache,
     )
 
+    evaluation_memo: Dict[Tuple[int, ...], float] = {}
     population = greedy_initial_population(
         joint_ctx,
         scheme=scheme,
         population_size=S,
         rng=rng,
+        search_cache=search_cache,
+        evaluation_memo=evaluation_memo,
     )
-    evaluation_memo: Dict[Tuple[int, ...], float] = {}
     evaluated = _evaluate_population(
         joint_ctx,
         population,
@@ -568,7 +587,11 @@ def run_joint_dcsga(
     population = [row[0] for row in evaluated[:S]]
     best_nest = population[0]
     history: List[Dict[str, Any]] = [
-        _history_row(0, evaluated[:S])
+        _history_row(
+            0,
+            evaluated[:S],
+            function_evaluations=len(evaluation_memo),
+        )
     ]
 
     t = 1
@@ -639,7 +662,13 @@ def run_joint_dcsga(
         evaluated = evaluated[:S]
         population = [row[0] for row in evaluated]
         best_nest = population[0]
-        history.append(_history_row(t, evaluated))
+        history.append(
+            _history_row(
+                t,
+                evaluated,
+                function_evaluations=len(evaluation_memo),
+            )
+        )
         t += 1
 
     # Materialize the full, externally visible result exactly once for the

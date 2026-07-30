@@ -6,7 +6,7 @@ from typing import Any, Dict
 
 from django.core.management.base import BaseCommand, CommandError
 
-from run.baselines import PAPER_ALGORITHM_NAMES
+from run.baselines import JOINT_BENCHMARK_ALGORITHM_NAMES
 from run.benchmark.context import (
     build_joint_context,
     joint_context_summary,
@@ -16,7 +16,7 @@ from run.benchmark.runner import run_joint_benchmark
 
 class Command(BaseCommand):
     help = (
-        "Run the isolated joint five-scheme benchmark without modifying workers, "
+        "Run the isolated joint benchmark without modifying workers, "
         "simulation state, or TaskExecution rows."
     )
 
@@ -31,9 +31,9 @@ class Command(BaseCommand):
         parser.add_argument(
             "--algorithms",
             nargs="+",
-            default=list(PAPER_ALGORITHM_NAMES),
-            choices=list(PAPER_ALGORITHM_NAMES),
-            help="Algorithms included in the paper comparison.",
+            default=list(JOINT_BENCHMARK_ALGORITHM_NAMES),
+            choices=list(JOINT_BENCHMARK_ALGORITHM_NAMES),
+            help="Algorithms included in the joint comparison.",
         )
         parser.add_argument(
             "--seeds",

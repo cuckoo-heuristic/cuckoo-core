@@ -21,7 +21,11 @@ from dag.models import TaskType
 
 from system.build_context import MiniSystemContextBuilder
 
-from algorithm.main_dcsga import dcsga_run, evaluate_solution_quality
+from algorithm.main_dcsga import (
+    AlgorithmCancelled,
+    dcsga_run,
+    evaluate_solution_quality,
+)
 from algorithm.greedy_nests import rate
 from algorithm.low_complexity import channel_gain
 
@@ -48,16 +52,17 @@ def _unlock_application(application_id: int) -> None:
         )
 
 
-def _lock_runtime_scheduler() -> None:
-    """Serialize runtime scheduling so queue and cache snapshots stay consistent."""
+def _try_lock_runtime_scheduler() -> bool:
+    """Try to serialize runtime scheduling without blocking worker shutdown."""
     with connection.cursor() as cursor:
         cursor.execute(
-            "SELECT pg_advisory_lock(%s, %s)",
+            "SELECT pg_try_advisory_lock(%s, %s)",
             [
                 _RUNTIME_SCHEDULER_LOCK_NAMESPACE,
                 _RUNTIME_SCHEDULER_LOCK_KEY,
             ],
         )
+        return bool(cursor.fetchone()[0])
 
 
 def _unlock_runtime_scheduler() -> None:
@@ -118,7 +123,6 @@ class RSUWorker(threading.Thread):
         )
 
         fallback_time = 0.0
-        last_scan_time = None
 
         while not self._stop_flag.is_set():
             close_old_connections()
@@ -140,16 +144,10 @@ class RSUWorker(threading.Thread):
 
             current_time = int(t)
 
-            if (
-                last_scan_time is not None
-                and current_time == last_scan_time
-            ):
-                if self._stop_flag.wait(0.1):
-                    break
-                continue
-
-            last_scan_time = current_time
-
+            # Poll throughout the current simulation second.  Applications
+            # may be created after this worker's first scan of that second;
+            # limiting scans to one per integer time step could otherwise
+            # postpone them until the next simulated second.
             try:
                 vehicle_ids = list(
                     RSUVehicle.objects.filter(
@@ -194,8 +192,13 @@ class RSUWorker(threading.Thread):
                 scheduler_locked = False
 
                 try:
-                    _lock_runtime_scheduler()
-                    scheduler_locked = True
+                    scheduler_locked = _try_lock_runtime_scheduler()
+
+                    if not scheduler_locked:
+                        continue
+
+                    if self._stop_flag.is_set():
+                        continue
 
                     app = Application.objects.filter(
                         id=app_id,
@@ -216,6 +219,7 @@ class RSUWorker(threading.Thread):
                     ctx["seed"] = int(
                         getattr(self.cfg, "simulation_seed", 1)
                     )
+                    ctx["cancel_event"] = self._stop_flag
                     self._apply_runtime_queue_state(
                         ctx,
                         app,
@@ -228,11 +232,31 @@ class RSUWorker(threading.Thread):
 
                     task_order = dcsga_compute_ranks_and_order(ctx)
 
+                    # ``ctx`` contains ``cancel_event`` (a threading.Event).
+                    # The final evaluator deep-copies its input, while Python
+                    # thread locks are intentionally not deepcopy/pickle safe.
+                    # Use a plain evaluation snapshot without the runtime-only
+                    # cancellation handle.  Cancellation is checked immediately
+                    # before and after this short deterministic materialization,
+                    # so no result is persisted after a stop request.
+                    if self._stop_flag.is_set():
+                        raise AlgorithmCancelled(
+                            "Algorithm execution was cancelled"
+                        )
+
+                    evaluation_ctx = dict(ctx)
+                    evaluation_ctx.pop("cancel_event", None)
+
                     _, evaluated_cache, scheduled_ctx = evaluate_solution_quality(
-                        ctx,
+                        evaluation_ctx,
                         best_solution,
                         task_order,
                     )
+
+                    if self._stop_flag.is_set():
+                        raise AlgorithmCancelled(
+                            "Algorithm execution was cancelled"
+                        )
 
                     final_cache_state = (
                         evaluated_cache
@@ -263,6 +287,9 @@ class RSUWorker(threading.Thread):
                         lock_provider_ids=lock_provider_ids,
                         time_step=snapshot_time_step,
                     )
+
+                except AlgorithmCancelled:
+                    pass
 
                 except Exception:
                     traceback.print_exc()

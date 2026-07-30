@@ -29,6 +29,11 @@ from .serializer import (
         fields={
             "status": serializers.CharField(),
             "running": serializers.BooleanField(required=False),
+            "stopping": serializers.BooleanField(required=False),
+            "alive_workers": serializers.ListField(
+                child=serializers.CharField(),
+                required=False,
+            ),
         },
     ),
 )
@@ -64,14 +69,30 @@ def start_simulation(request):
         fields={
             "status": serializers.CharField(),
             "running": serializers.BooleanField(required=False),
+            "stopping": serializers.BooleanField(required=False),
+            "alive_workers": serializers.ListField(
+                child=serializers.CharField(),
+                required=False,
+            ),
         },
     )
 )
 @api_view(["POST"])
 def stop_simulation(request):
-    stop_simulation_fn()
+    stop_result = stop_simulation_fn()
+    current_status = status_fn()
+    response_status = (
+        "stopped"
+        if stop_result.get("stopped", False)
+        else "stopping"
+    )
+
     return Response(
-        {"status": "stopped", **status_fn()},
+        {
+            "status": response_status,
+            "alive_workers": stop_result.get("alive_workers", []),
+            **current_status,
+        },
         status=status.HTTP_200_OK,
     )
 
@@ -81,6 +102,7 @@ def stop_simulation(request):
         name="SimulationStatusResponse",
         fields={
             "running": serializers.BooleanField(),
+            "stopping": serializers.BooleanField(required=False),
         },
     )
 )
@@ -97,7 +119,18 @@ def simulation_status(request):
 )
 @api_view(["POST"])
 def reset_simulation(request):
-    stop_simulation_fn()
+    stop_result = stop_simulation_fn(wait_timeout=10.0)
+
+    if not stop_result.get("stopped", False):
+        return Response(
+            {
+                "status": "stopping",
+                "detail": "Simulation workers are still stopping. Retry reset shortly.",
+                "alive_workers": stop_result.get("alive_workers", []),
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
+
     reset_fn()
     return Response({"status": "reset"}, status=status.HTTP_200_OK)
 @extend_schema(
@@ -164,6 +197,17 @@ def benchmark(request):
                     10,
                 )
             ),
+            population_size=(
+                ser.validated_data.get(
+                    "population_size"
+                )
+            ),
+            export_artifacts=(
+                ser.validated_data.get(
+                    "export_artifacts",
+                    True,
+                )
+            ),
         )
 
     except ValueError as exc:
@@ -173,6 +217,30 @@ def benchmark(request):
             },
             status=status.HTTP_400_BAD_REQUEST,
         )
+
+    if ser.validated_data.get("summary_only", False):
+        compact_runs = []
+
+        for run in result.get("runs", []):
+            compact_runs.append(
+                {
+                    "algorithm": run.get("algorithm"),
+                    "seed": run.get("seed"),
+                    "population_size": run.get("population_size"),
+                    "tmax": run.get("tmax"),
+                    "total_efficiency": run.get("total_efficiency"),
+                    "metrics": run.get("metrics"),
+                    "runtime_seconds": run.get("runtime_seconds"),
+                    "final_function_evaluations": run.get(
+                        "final_function_evaluations"
+                    ),
+                    "convergence": run.get("convergence", {}),
+                    "iteration_history": run.get("iteration_history", []),
+                }
+            )
+
+        result["runs"] = compact_runs
+        result.pop("artifacts", None)
 
     return Response(
         result,
@@ -203,10 +271,35 @@ def paper_benchmark(request):
             seed_start=ser.validated_data.get("seed_start", 1),
             tmax=ser.validated_data.get("tmax", 15),
             population_size=ser.validated_data.get("population_size"),
+            algorithms=ser.validated_data.get("algorithms"),
+            diagnostic_vehicle_count=ser.validated_data.get(
+                "diagnostic_vehicle_count"
+            ),
+            export_artifacts=ser.validated_data.get("export_artifacts", True),
         )
     except (ValueError, KeyError, TypeError) as exc:
         return Response(
             {"detail": str(exc)},
             status=status.HTTP_400_BAD_REQUEST,
         )
+    if ser.validated_data.get("summary_only", False):
+        result = {
+            key: result.get(key)
+            for key in (
+                "figure",
+                "article_doi",
+                "repetitions",
+                "seeds",
+                "tmax",
+                "population_size",
+                "algorithms",
+                "comparison_mode",
+                "diagnostic_mode",
+                "diagnostic_vehicle_count",
+                "convergence_diagnostics",
+                "summary",
+                "artifacts",
+            )
+            if key in result
+        }
     return Response(result, status=status.HTTP_200_OK)

@@ -1,6 +1,7 @@
 import threading
 from datetime import timedelta
 import traceback
+from time import monotonic
 from django.db import close_old_connections, transaction
 from django.utils import timezone
 
@@ -27,6 +28,8 @@ _context_worker = None
 _clock_worker = None
 _application_generator_worker = None
 _running = False
+_stopping = False
+_stop_reaper = None
 _cfg: SimulationConfig | None = None
 _sim_time_s: float = 0.0
 _stop_requested: bool = False
@@ -479,12 +482,13 @@ def reset_simulation():
 def run_simulation(
     tmax: int = 10,
 ):
-    global _running, _vehicle_workers, _rsu_workers, _status_worker, _context_worker, _clock_worker, _application_generator_worker, _cfg
+    global _running, _stopping, _vehicle_workers, _rsu_workers, _status_worker, _context_worker, _clock_worker, _application_generator_worker, _cfg
 
     with _registry_lock:
-        if _running:
+        if _running or _stopping:
             return
         _running = True
+        _stopping = False
 
     try:
         params = load_params_obj()
@@ -511,19 +515,28 @@ def run_simulation(
         _status_worker = StatusWorker(cfg=cfg)
         _context_worker = ContextWorker(cfg=cfg)
 
-        _clock_worker.start()
-
+        # Initialize the runtime topology at simulation time zero before the
+        # clock is allowed to advance.  Vehicle workers need one motion tick
+        # to persist their initial RSU associations.  Starting the clock first
+        # made the application generator occasionally begin at t=1 and then
+        # backfill applications stamped at t=0, which introduced an artificial
+        # one-second waiting time against 30-100 ms deadlines.
         for worker in _vehicle_workers:
             worker.start()
 
         threading.Event().wait(cfg.motion_tick_seconds)
-        _application_generator_worker.start()
 
         for worker in _rsu_workers:
             worker.start()
 
         _status_worker.start()
         _context_worker.start()
+        _application_generator_worker.start()
+
+        # Start simulated time only after all workers are ready.  The
+        # generator therefore creates the t=0 batch at t=0, and later batches
+        # are released only when the simulation clock reaches their second.
+        _clock_worker.start()
 
     except Exception:
         cleanup_workers = [
@@ -555,6 +568,7 @@ def run_simulation(
 
         with _registry_lock:
             _running = False
+            _stopping = False
             _vehicle_workers = []
             _rsu_workers = []
             _status_worker = None
@@ -568,50 +582,134 @@ def run_simulation(
         raise
 
 
-def stop_simulation():
-    global _running
-    with _registry_lock:
-        if not _running:
-            return
-        workers = list(_vehicle_workers + _rsu_workers)
-        generator_w = _application_generator_worker
-        status_w = _status_worker
-        ctx_w = _context_worker
-        clock_w = _clock_worker
-    if generator_w:
-        generator_w.stop()
-    if status_w:
-        status_w.stop()
-    if ctx_w:
-        ctx_w.stop()
-    if clock_w:
-        clock_w.stop()
-    for w in workers:
-        w.stop()
-    cur = threading.current_thread()
-    if generator_w and generator_w is not cur:
-        generator_w.join()
-    if status_w and status_w is not cur:
-        status_w.join()
-    if ctx_w and ctx_w is not cur:
-        ctx_w.join()
-    if clock_w and clock_w is not cur:
-        clock_w.join()
-    for w in workers:
-        if w is not cur:
-            w.join()
-    with _registry_lock:
-        _running = False
+def _clear_worker_registry():
+    global _running, _stopping, _stop_reaper
+    global _vehicle_workers, _rsu_workers
+    global _status_worker, _context_worker, _clock_worker
+    global _application_generator_worker, _cfg
 
-    # Do not rewrite TaskExecution times, energy, or Application completion data
-    # during shutdown. Those values are outputs of the scheduling model and must
-    # remain unchanged for later verification and benchmark reporting.
+    _running = False
+    _stopping = False
+    _stop_reaper = None
+    _vehicle_workers = []
+    _rsu_workers = []
+    _status_worker = None
+    _context_worker = None
+    _clock_worker = None
+    _application_generator_worker = None
+    _cfg = None
+
+
+def _finish_stop_in_background(worker_rows):
+    for _name, worker in worker_rows:
+        try:
+            if worker.is_alive():
+                worker.join()
+        except Exception:
+            pass
+
+    with _registry_lock:
+        _clear_worker_registry()
+
+
+def stop_simulation(wait_timeout: float = 5.0):
+    global _stopping, _stop_reaper
+
+    with _registry_lock:
+        if not _running and not _stopping:
+            return {
+                "stopped": True,
+                "stopping": False,
+                "alive_workers": [],
+            }
+
+        _stopping = True
+        worker_rows = []
+
+        if _application_generator_worker is not None:
+            worker_rows.append(("task_generator", _application_generator_worker))
+        if _status_worker is not None:
+            worker_rows.append(("status", _status_worker))
+        if _context_worker is not None:
+            worker_rows.append(("context", _context_worker))
+        if _clock_worker is not None:
+            worker_rows.append(("clock", _clock_worker))
+
+        worker_rows.extend(
+            (f"vehicle:{index}", worker)
+            for index, worker in enumerate(_vehicle_workers, start=1)
+        )
+        worker_rows.extend(
+            (f"rsu:{index}", worker)
+            for index, worker in enumerate(_rsu_workers, start=1)
+        )
+
+    _set_stop_requested(True)
+
+    for _name, worker in worker_rows:
+        try:
+            worker.stop()
+        except Exception:
+            pass
+
+    current = threading.current_thread()
+    deadline = monotonic() + max(0.0, float(wait_timeout))
+
+    for _name, worker in worker_rows:
+        if worker is current:
+            continue
+
+        remaining = deadline - monotonic()
+        if remaining <= 0.0:
+            break
+
+        try:
+            if worker.is_alive():
+                worker.join(timeout=remaining)
+        except Exception:
+            pass
+
+    alive_rows = [
+        (name, worker)
+        for name, worker in worker_rows
+        if worker.is_alive()
+    ]
+
+    if not alive_rows:
+        with _registry_lock:
+            _clear_worker_registry()
+
+        return {
+            "stopped": True,
+            "stopping": False,
+            "alive_workers": [],
+        }
+
+    with _registry_lock:
+        if _stop_reaper is None or not _stop_reaper.is_alive():
+            _stop_reaper = threading.Thread(
+                target=_finish_stop_in_background,
+                args=(alive_rows,),
+                daemon=True,
+                name="simulation-stop-reaper",
+            )
+            _stop_reaper.start()
+
+    return {
+        "stopped": False,
+        "stopping": True,
+        "alive_workers": [name for name, _worker in alive_rows],
+    }
+
+    # TaskExecution times, energy, and Application completion data are not
+    # rewritten during shutdown. They remain available for benchmark reporting.
 
 
 def simulation_status():
     with _registry_lock:
         snap = dict(_snapshot)
         running = _running
+        stopping = _stopping
         v_workers = sum(
             1 for worker in _vehicle_workers
             if worker.is_alive()
@@ -697,6 +795,7 @@ def simulation_status():
 
     return {
         "running": running,
+        "stopping": stopping,
 
         "workers": {
             "vehicle": v_workers,

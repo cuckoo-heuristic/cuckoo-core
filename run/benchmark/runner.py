@@ -6,6 +6,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean, stdev
+from time import perf_counter
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 from uuid import uuid4
 
@@ -14,7 +15,10 @@ from django.conf import settings
 from application.models import Application
 from parameter.services import load_params_obj
 
-from run.baselines import PAPER_ALGORITHMS, PAPER_ALGORITHM_NAMES
+from run.baselines import (
+    JOINT_BENCHMARK_ALGORITHMS,
+    PAPER_ALGORITHM_NAMES,
+)
 
 from .context import build_benchmark_context, build_joint_context, joint_context_summary
 from .evaluator import configured_context, evaluate_metrics, normalize_algorithm_output
@@ -25,7 +29,7 @@ from .models import (
 )
 
 
-ALGORITHMS = PAPER_ALGORITHMS
+ALGORITHMS = JOINT_BENCHMARK_ALGORITHMS
 
 
 def _unique_ints(values: Iterable[int]) -> List[int]:
@@ -134,11 +138,77 @@ def _json_cache(cache_state: Dict[int, set[int]]) -> Dict[str, List[int]]:
     }
 
 
+def _run_convergence(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not history:
+        return {
+            "initial_best": 0.0,
+            "final_best": 0.0,
+            "absolute_gain": 0.0,
+            "relative_gain_percent": 0.0,
+            "improved_iterations": 0,
+            "stagnated": True,
+            "function_evaluations": 0,
+        }
+
+    best_values = [
+        float(item.get("best_total_efficiency", 0.0))
+        for item in history
+    ]
+    initial_best = best_values[0]
+    final_best = best_values[-1]
+    absolute_gain = final_best - initial_best
+    denominator = max(abs(initial_best), 1e-12)
+    improved_iterations = sum(
+        1
+        for previous, current in zip(best_values, best_values[1:])
+        if current > previous + 1e-12
+    )
+
+    return {
+        "initial_best": float(initial_best),
+        "final_best": float(final_best),
+        "absolute_gain": float(absolute_gain),
+        "relative_gain_percent": float(100.0 * absolute_gain / denominator),
+        "improved_iterations": int(improved_iterations),
+        "stagnated": bool(improved_iterations == 0),
+        "function_evaluations": int(
+            history[-1].get("function_evaluations", 0)
+        ),
+    }
+
+
 def _joint_summary(runs: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
     result: Dict[str, Dict[str, float]] = {}
     for algorithm in dict.fromkeys(run["algorithm"] for run in runs):
         selected = [run for run in runs if run["algorithm"] == algorithm]
-        result[algorithm] = _summary_row(selected)
+        row = _summary_row(selected)
+
+        runtime_stats = _metric_stats(
+            [float(run.get("runtime_seconds", 0.0)) for run in selected]
+        )
+        nfe_stats = _metric_stats(
+            [float(run.get("final_function_evaluations", 0)) for run in selected]
+        )
+        gain_stats = _metric_stats(
+            [
+                float(run.get("convergence", {}).get("absolute_gain", 0.0))
+                for run in selected
+            ]
+        )
+
+        row["runtime_seconds"] = runtime_stats["mean"]
+        row["runtime_seconds_std"] = runtime_stats["std"]
+        row["function_evaluations"] = nfe_stats["mean"]
+        row["function_evaluations_std"] = nfe_stats["std"]
+        row["convergence_gain"] = gain_stats["mean"]
+        row["convergence_gain_std"] = gain_stats["std"]
+        row["stagnated_seed_count"] = sum(
+            1
+            for run in selected
+            if bool(run.get("convergence", {}).get("stagnated", False))
+        )
+
+        result[algorithm] = row
     return result
 
 
@@ -183,6 +253,12 @@ def _raw_rows(result: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "article_exact": run.get("article_exact", False),
                     "implementation": run.get("implementation", "article-aligned"),
                     "reference_doi": run.get("reference_doi", ""),
+                    "discrete_reference_doi": run.get("discrete_reference_doi", ""),
+                    "runtime_seconds": run.get("runtime_seconds", 0.0),
+                    "function_evaluations": run.get(
+                        "final_function_evaluations",
+                        0,
+                    ),
                     "algorithm_article_exact": run.get("algorithm_article_exact", False),
                     "system_article_exact": run.get("system_article_exact", False),
                     "mission_vehicle_count": result.get("scenario", {}).get("mission_vehicle_count"),
@@ -204,6 +280,23 @@ def _summary_rows(result: Dict[str, Any]) -> List[Dict[str, Any]]:
     return rows
 
 
+def _iteration_diagnostics(item: Dict[str, Any]) -> Dict[str, Any]:
+    keys = (
+        "accepted_candidates",
+        "accepted_guided_trials",
+        "accepted_cache_trials",
+        "generated_trials",
+        "unique_trial_count",
+        "duplicate_trial_count",
+        "mean_trial_hamming",
+        "population_unique_count",
+        "population_mean_hamming",
+        "best_improved",
+        "stagnation_generations",
+    )
+    return {key: item.get(key) for key in keys}
+
+
 def _convergence_rows(result: Dict[str, Any]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for run in result.get("runs", []):
@@ -214,9 +307,14 @@ def _convergence_rows(result: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "algorithm": run.get("algorithm"),
                     "seed": run.get("seed"),
                     "iteration": iteration,
+                    "function_evaluations": item.get(
+                        "function_evaluations",
+                        0,
+                    ),
                     "point_type": "best",
                     "population_index": None,
                     "total_efficiency": item.get("best_total_efficiency"),
+                    **_iteration_diagnostics(item),
                 }
             )
             for index, value in enumerate(
@@ -227,9 +325,14 @@ def _convergence_rows(result: Dict[str, Any]) -> List[Dict[str, Any]]:
                         "algorithm": run.get("algorithm"),
                         "seed": run.get("seed"),
                         "iteration": iteration,
+                        "function_evaluations": item.get(
+                            "function_evaluations",
+                            0,
+                        ),
                         "point_type": "population",
                         "population_index": index,
                         "total_efficiency": value,
+                        **_iteration_diagnostics(item),
                     }
                 )
     return rows
@@ -413,6 +516,7 @@ def _export_benchmark_result(
                 "article_exact",
                 "implementation",
                 "reference_doi",
+                "discrete_reference_doi",
                 "algorithm_article_exact",
                 "system_article_exact",
                 "mission_vehicle_count",
@@ -593,12 +697,14 @@ def run_joint_context_benchmark(
     for seed in seed_values:
         for algorithm_name in algorithm_names:
             algorithm = ALGORITHMS[algorithm_name]
+            started_at = perf_counter()
             best_nest, evaluation, history = algorithm.run_joint(
                 copy.deepcopy(joint_ctx),
                 seed=int(seed),
                 tmax=max(1, int(tmax)),
                 population_size=population_size,
             )
+            runtime_seconds = perf_counter() - started_at
             uses_population = algorithm_name != "dtosc"
             result = JointAlgorithmResult(
                 algorithm=algorithm_name,
@@ -611,6 +717,11 @@ def run_joint_context_benchmark(
                 iteration_history=history,
                 scientific_status="article-aligned-with-declared-limitations",
             ).to_dict()
+            result["runtime_seconds"] = float(runtime_seconds)
+            result["convergence"] = _run_convergence(history)
+            result["final_function_evaluations"] = int(
+                result["convergence"]["function_evaluations"]
+            )
             result["best_nest"] = [
                 {
                     "joint_task_id": int(task_id),
@@ -622,8 +733,11 @@ def run_joint_context_benchmark(
             result["schedule"] = evaluation.schedule
             result["cache_state"] = _json_cache(evaluation.cache_state)
             result["algorithm_article_exact"] = bool(
-                algorithm_name != "dtosc"
-                or getattr(algorithm, "source_exact_verified", False)
+                getattr(
+                    algorithm,
+                    "article_exact",
+                    algorithm_name != "dtosc",
+                )
             )
             result["algorithm_complete"] = bool(
                 getattr(algorithm, "algorithm_complete", True)
@@ -642,6 +756,20 @@ def run_joint_context_benchmark(
                 )
                 result["source_exact_verified"] = bool(
                     getattr(algorithm, "source_exact_verified", False)
+                )
+                result["reference_alignment"] = str(
+                    getattr(algorithm, "reference_alignment", "")
+                )
+            elif algorithm_name == "gac_djaya":
+                result["scientific_status"] = "project-innovation-with-paper-evaluator"
+                result["implementation"] = str(
+                    getattr(algorithm, "implementation", "unknown")
+                )
+                result["reference_doi"] = str(
+                    getattr(algorithm, "reference_doi", "")
+                )
+                result["discrete_reference_doi"] = str(
+                    getattr(algorithm, "discrete_reference_doi", "")
                 )
                 result["reference_alignment"] = str(
                     getattr(algorithm, "reference_alignment", "")
@@ -680,12 +808,14 @@ def run_joint_context_benchmark(
             "dtosc_dynamic_programming_complete": True,
             "dtosc_source_exact_verified": False,
             "article_exact_dtosc": False,
+            "gac_djaya_is_project_innovation": True,
             "article_exact_system": False,
         },
         "warnings": [
             "DTOSC now uses a complete semi-distributed stage-wise dynamic-programming reconstruction; the 2022 source pseudocode is not present in the project, so line-by-line source verification remains explicitly unclaimed.",
             "The V2V channel and sender-side power model remain declared approximations.",
-            "The isolated benchmark models one simultaneous application snapshot and does not reproduce the runtime arrival process."
+            "The isolated benchmark models one simultaneous application snapshot and does not reproduce the runtime arrival process.",
+            "GAC-DJaya is a project innovation evaluated with the same paper-aligned objective; it is not presented as an exact algorithm from the IEEE article."
         ],
         "context": joint_context_summary(joint_ctx),
         "scenario": scenario,

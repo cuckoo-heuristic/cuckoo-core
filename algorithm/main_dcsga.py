@@ -44,6 +44,19 @@ def _refresh_algorithm_params():
     procedure3_module.levy_lambda = float(current_params.levy_lambda)
 
 
+
+
+class AlgorithmCancelled(RuntimeError):
+    pass
+
+
+def _raise_if_cancelled(ctx):
+    cancel_event = ctx.get("cancel_event") if isinstance(ctx, dict) else None
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise AlgorithmCancelled("Algorithm execution was cancelled")
+
+
 class _DCSGAContext(dict):
     """Use lightweight copies for per-solution mutable scheduling state."""
 
@@ -185,6 +198,7 @@ def dcsga_compute_ranks_and_order(ctx):
 
 
 def evaluate_solution_quality(base_ctx, nest, task_order):
+    _raise_if_cancelled(base_ctx)
     work_ctx = copy.deepcopy(base_ctx)
     _reset_assignment(work_ctx)
     work_ctx["_schedule_state"] = _empty_state(work_ctx)
@@ -222,6 +236,7 @@ def evaluate_solution_quality(base_ctx, nest, task_order):
     _apply_entry_task(work_ctx, work_ctx["_schedule_state"], rank_counter)
 
     for index, task_id in enumerate(normalized_order):
+        _raise_if_cancelled(work_ctx)
         sp_id = task_provider[task_id]
         rank_counter[sp_id] += 1
         _apply_assignment(work_ctx, work_ctx["_schedule_state"], task_id, sp_id, rank_counter[sp_id])
@@ -238,6 +253,7 @@ def sort_population(ctx, population, task_order, evaluation_cache=None):
 
     evaluated = []
     for nest in population:
+        _raise_if_cancelled(ctx)
         key = _nest_key(nest)
         cached = evaluation_cache.get(key)
 
@@ -279,6 +295,7 @@ def _materialize_solution(ctx, nest, task_order):
 def dcsga_run(ctx):
     _refresh_algorithm_params()
     ctx = _DCSGAContext(ctx)
+    _raise_if_cancelled(ctx)
 
     seed = ctx.get("seed")
     if seed is not None:
@@ -291,6 +308,7 @@ def dcsga_run(ctx):
     ctx["rates"] = {sp_id: rate(ctx, sp_id) for sp_id in _providers(ctx)}
     task_order = dcsga_compute_ranks_and_order(ctx)
     population = procedure1_greedy_initialization(S=S, task_order=task_order, ctx=ctx)
+    _raise_if_cancelled(ctx)
     evaluation_cache = {}
 
     population, quality, caches = sort_population(ctx, population, task_order, evaluation_cache)
@@ -299,14 +317,25 @@ def dcsga_run(ctx):
     X_best = population[0]
 
     while t < tmax:
+        _raise_if_cancelled(ctx)
         new_population = [X_best]
 
         for s in range(1, S):
+            _raise_if_cancelled(ctx)
             X_new = procedure3_generate_new_solution(population[s], X_best, copy.deepcopy(ctx))
             new_population.append(X_new)
 
         random_cuckoo = random.choice(new_population)
-        random_walk = [procedure3_generate_new_solution(random_cuckoo, None, copy.deepcopy(ctx)) for _ in range(S)]
+        random_walk = []
+        for _ in range(S):
+            _raise_if_cancelled(ctx)
+            random_walk.append(
+                procedure3_generate_new_solution(
+                    random_cuckoo,
+                    None,
+                    copy.deepcopy(ctx),
+                )
+            )
         combined = new_population + random_walk
 
         combined, combined_q, combined_caches = sort_population(ctx, combined, task_order, evaluation_cache)
@@ -314,7 +343,16 @@ def dcsga_run(ctx):
 
         if random.random() <= Pa:
             worst = combined[-1]
-            worst_walk = [procedure3_generate_new_solution(worst, None, copy.deepcopy(ctx)) for _ in range(S)]
+            worst_walk = []
+            for _ in range(S):
+                _raise_if_cancelled(ctx)
+                worst_walk.append(
+                    procedure3_generate_new_solution(
+                        worst,
+                        None,
+                        copy.deepcopy(ctx),
+                    )
+                )
             combined = combined[:-1] + worst_walk
             combined, combined_q, combined_caches = sort_population(ctx, combined, task_order, evaluation_cache)
 

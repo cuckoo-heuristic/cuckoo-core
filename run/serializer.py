@@ -49,6 +49,7 @@ class SimulationContextSerializer(serializers.Serializer):
 
 class SimulationStatusSerializer(serializers.Serializer):
     running = serializers.BooleanField()
+    stopping = serializers.BooleanField(required=False)
     workers = SimulationWorkersSerializer()
     counts = SimulationCountsSerializer()
     context = SimulationContextSerializer()
@@ -64,6 +65,7 @@ class BenchmarkRequestSerializer(serializers.Serializer):
         child=serializers.ChoiceField(
             choices=[
                 "dcsga",
+                "gac_djaya",
                 "dtosc",
                 "to_v2i",
                 "to_wo_c",
@@ -88,6 +90,23 @@ class BenchmarkRequestSerializer(serializers.Serializer):
         default=10,
     )
 
+    population_size = serializers.IntegerField(
+        required=False,
+        min_value=2,
+        max_value=500,
+        allow_null=True,
+    )
+
+    export_artifacts = serializers.BooleanField(
+        required=False,
+        default=True,
+    )
+
+    summary_only = serializers.BooleanField(
+        required=False,
+        default=False,
+    )
+
 class PaperExperimentRequestSerializer(serializers.Serializer):
     figure = serializers.ChoiceField(
         choices=[
@@ -99,6 +118,20 @@ class PaperExperimentRequestSerializer(serializers.Serializer):
             "all",
             "*",
         ]
+    )
+    algorithms = serializers.ListField(
+        child=serializers.ChoiceField(
+            choices=[
+                "dcsga",
+                "gac_djaya",
+                "dtosc",
+                "to_v2i",
+                "to_wo_c",
+                "to_wo_r",
+            ]
+        ),
+        required=False,
+        allow_empty=False,
     )
     repetitions = serializers.IntegerField(
         required=False,
@@ -120,4 +153,18 @@ class PaperExperimentRequestSerializer(serializers.Serializer):
         min_value=2,
         max_value=500,
         allow_null=True,
+    )
+    diagnostic_vehicle_count = serializers.IntegerField(
+        required=False,
+        min_value=2,
+        max_value=76,
+        allow_null=True,
+    )
+    export_artifacts = serializers.BooleanField(
+        required=False,
+        default=True,
+    )
+    summary_only = serializers.BooleanField(
+        required=False,
+        default=False,
     )

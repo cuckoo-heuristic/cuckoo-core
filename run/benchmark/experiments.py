@@ -27,17 +27,32 @@ VEHICLE_SPEEDS_KMH = (75, 80, 85, 90, 95, 100, 105)
 MEC_CAPACITIES_GHZ = (30, 40, 50, 60, 70, 80)
 ALGORITHM_LABELS = {
     "dcsga": "DCSGA",
+    "gac_djaya": "GAC-DJaya",
     "dtosc": "DTOSC",
     "to_v2i": "TO-V2I",
     "to_wo_c": "TO-w.o.-C",
     "to_wo_r": "TO-w.o.-R",
 }
-FIGURE_ALGORITHMS = {
+PAPER_FIGURE_ALGORITHMS = {
     "figure_6": ("dcsga",),
     "figure_7": ("dcsga", "dtosc", "to_v2i", "to_wo_c", "to_wo_r"),
     "figure_8": ("dcsga", "to_wo_c", "to_wo_r"),
     "figure_9": ("dcsga", "dtosc"),
     "figure_10": ("dcsga", "dtosc"),
+}
+
+# Default run set. Figure 7 always includes the proposed GAC-DJaya beside
+# the five schemes used in the reference article.
+FIGURE_ALGORITHMS = {
+    **PAPER_FIGURE_ALGORITHMS,
+    "figure_7": (
+        "dcsga",
+        "gac_djaya",
+        "dtosc",
+        "to_v2i",
+        "to_wo_c",
+        "to_wo_r",
+    ),
 }
 
 
@@ -375,20 +390,53 @@ def _assignments(
     mission_vehicle_count: int,
     app_types: Dict[int, ApplicationType],
     seed: int,
+    *,
+    assignment_pool_count: int | None = None,
 ) -> List[Dict[str, int]]:
+    """Build deterministic mission assignments for one seeded scenario.
+
+    ``assignment_pool_count`` is used by Figure 7 to create one master
+    76-vehicle assignment and then take prefixes of length 52, 56, ..., 76.
+    Consequently, increasing the mission-vehicle count adds new applications
+    without changing the vehicles or deadlines already present at smaller
+    sweep points. Other figures keep their previous behavior by leaving this
+    argument as ``None``.
+    """
     if mission_vehicle_count > len(road_vehicle_ids):
         raise ValueError("Mission vehicle count exceeds road vehicle count")
+
+    pool_count = (
+        int(mission_vehicle_count)
+        if assignment_pool_count is None
+        else int(assignment_pool_count)
+    )
+    if pool_count < mission_vehicle_count:
+        raise ValueError(
+            "assignment_pool_count cannot be smaller than mission_vehicle_count"
+        )
+    if pool_count > len(road_vehicle_ids):
+        raise ValueError("assignment_pool_count exceeds road vehicle count")
+
     rng = random.Random(int(seed) * 1000033 + 104729)
+
+    # One stable mission order per seed. Figure 7 reuses the same full order
+    # for every sweep point and only changes the prefix length.
     mission_order = list(road_vehicle_ids)
     rng.shuffle(mission_order)
-    mission_order = mission_order[:mission_vehicle_count]
+    mission_order = mission_order[:pool_count]
+
+    # Deadlines are assigned once over the full pool. This fixes the old
+    # behavior where the same vehicle could receive a different deadline when
+    # the sweep changed from, for example, 52 to 56 mission vehicles.
     deadline_sequence = [
         DEADLINES_MS[index % len(DEADLINES_MS)]
-        for index in range(mission_vehicle_count)
+        for index in range(pool_count)
     ]
     rng.shuffle(deadline_sequence)
+
     rows: List[Dict[str, int]] = []
-    for index, vehicle_id in enumerate(mission_order):
+    for index in range(mission_vehicle_count):
+        vehicle_id = mission_order[index]
         deadline_ms = deadline_sequence[index]
         rows.append(
             {
@@ -414,6 +462,8 @@ def _build_scenario(
         List[RSU],
         Dict[int, ApplicationType],
     ],
+    *,
+    assignment_pool_count: int | None = None,
 ) -> Dict[str, Any]:
     vehicles, rsus, app_types = environment
     snapshot, road_vehicle_ids, speeds, road_metadata = _road_state(
@@ -428,6 +478,7 @@ def _build_scenario(
         mission_vehicle_count,
         app_types,
         seed,
+        assignment_pool_count=assignment_pool_count,
     )
     metadata = {
         "experiment_name": figure,
@@ -436,6 +487,12 @@ def _build_scenario(
         "sweep_parameter": sweep_parameter,
         "sweep_value": float(sweep_value),
         "mission_vehicle_count": int(mission_vehicle_count),
+        "assignment_pool_count": int(
+            assignment_pool_count
+            if assignment_pool_count is not None
+            else mission_vehicle_count
+        ),
+        "nested_mission_prefix": bool(assignment_pool_count is not None),
         "mean_mec_capacity_ghz": float(mec_capacity_ghz),
         "deadlines_s": [float(value) / 1000.0 for value in DEADLINES_MS],
         "article_speed_density_model": figure == "figure_9",
@@ -592,7 +649,7 @@ def _figure_6_summary_rows(
 ) -> List[Dict[str, Any]]:
     return _summary_rows(
         rows,
-        ("figure", "iteration", "point_type"),
+        ("figure", "algorithm", "iteration", "point_type"),
         ("total_efficiency",),
     )
 
@@ -644,11 +701,35 @@ def _execution_audit_rows(
     return rows
 
 
+def _iteration_diagnostics(item: Dict[str, Any]) -> Dict[str, Any]:
+    keys = (
+        "accepted_candidates",
+        "accepted_guided_trials",
+        "accepted_cache_trials",
+        "generated_trials",
+        "unique_trial_count",
+        "duplicate_trial_count",
+        "mean_trial_hamming",
+        "population_unique_count",
+        "population_mean_hamming",
+        "best_improved",
+        "stagnation_generations",
+        "initial_greedy_target",
+        "initial_genetic_target",
+        "initial_random_target",
+        "initial_greedy_selected",
+        "initial_genetic_selected",
+        "initial_random_selected",
+        "ga_generations",
+        "genetic_candidate_pool_size",
+        "random_candidate_pool_size",
+    )
+    return {key: item.get(key) for key in keys}
+
+
 def _figure_6_rows(result: Dict[str, Any]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for run in result["runs"]:
-        if run["algorithm"] != "dcsga":
-            continue
         for item in run.get("iteration_history", []):
             iteration = int(float(item["iteration"]))
             population = item.get("population_total_efficiencies", [])
@@ -656,24 +737,123 @@ def _figure_6_rows(result: Dict[str, Any]) -> List[Dict[str, Any]]:
                 rows.append(
                     {
                         "figure": "figure_6",
+                        "algorithm": str(run["algorithm"]),
                         "seed": int(run["seed"]),
                         "iteration": iteration,
+                        "function_evaluations": int(
+                            item.get("function_evaluations", 0)
+                        ),
                         "point_type": "population",
                         "population_index": index,
                         "total_efficiency": float(value),
+                        "runtime_seconds": run.get("runtime_seconds"),
+                        **_iteration_diagnostics(item),
                     }
                 )
             rows.append(
                 {
                     "figure": "figure_6",
+                    "algorithm": str(run["algorithm"]),
                     "seed": int(run["seed"]),
                     "iteration": iteration,
+                    "function_evaluations": int(
+                        item.get("function_evaluations", 0)
+                    ),
                     "point_type": "best",
                     "population_index": None,
                     "total_efficiency": float(item["best_total_efficiency"]),
+                    "runtime_seconds": run.get("runtime_seconds"),
+                    **_iteration_diagnostics(item),
                 }
             )
     return rows
+
+
+def _convergence_diagnostics(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    grouped: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+    for row in rows:
+        if row.get("point_type") != "best":
+            continue
+        key = (str(row["algorithm"]), int(row["seed"]))
+        grouped.setdefault(key, []).append(row)
+
+    diagnostics = []
+    for (algorithm, seed), selected in sorted(grouped.items()):
+        selected.sort(key=lambda row: int(row["iteration"]))
+        initial = selected[0]
+        final = selected[-1]
+        accepted = sum(
+            int(row.get("accepted_candidates") or 0)
+            for row in selected[1:]
+        )
+        generated = sum(
+            int(row.get("generated_trials") or 0)
+            for row in selected[1:]
+        )
+        unique_trials = sum(
+            int(row.get("unique_trial_count") or 0)
+            for row in selected[1:]
+        )
+        initial_best = float(initial["total_efficiency"])
+        final_best = float(final["total_efficiency"])
+        absolute_gain = final_best - initial_best
+        improved_iterations = sum(
+            1
+            for previous, current in zip(selected, selected[1:])
+            if float(current["total_efficiency"])
+            > float(previous["total_efficiency"])
+        )
+        diagnostics.append(
+            {
+                "algorithm": algorithm,
+                "seed": seed,
+                "initial_best": initial_best,
+                "final_best": final_best,
+                "absolute_gain": absolute_gain,
+                "relative_gain_percent": (
+                    100.0 * absolute_gain / abs(initial_best)
+                    if initial_best != 0.0
+                    else None
+                ),
+                "improved_iterations": improved_iterations,
+                "accepted_candidates": (
+                    accepted if generated else None
+                ),
+                "generated_trials": generated if generated else None,
+                "unique_trial_count": unique_trials if generated else None,
+                "acceptance_rate": (
+                    float(accepted / generated) if generated else None
+                ),
+                "function_evaluations": int(
+                    final.get("function_evaluations", 0)
+                ),
+                "runtime_seconds": final.get("runtime_seconds"),
+                "final_population_unique_count": final.get(
+                    "population_unique_count"
+                ),
+                "final_population_mean_hamming": final.get(
+                    "population_mean_hamming"
+                ),
+                "initial_greedy_selected": initial.get(
+                    "initial_greedy_selected"
+                ),
+                "initial_genetic_selected": initial.get(
+                    "initial_genetic_selected"
+                ),
+                "initial_random_selected": initial.get(
+                    "initial_random_selected"
+                ),
+                "ga_generations": initial.get("ga_generations"),
+                "genetic_candidate_pool_size": initial.get(
+                    "genetic_candidate_pool_size"
+                ),
+                "random_candidate_pool_size": initial.get(
+                    "random_candidate_pool_size"
+                ),
+                "stagnated": absolute_gain <= 0.0,
+            }
+        )
+    return diagnostics
 
 
 def _write_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
@@ -697,49 +877,234 @@ def _relative_path(path: Path) -> str:
         return str(resolved)
 
 
-def _plot_figure_6(rows: Sequence[Dict[str, Any]], output_base: Path) -> None:
+def _algorithms_from_rows(rows: Sequence[Dict[str, Any]]) -> List[str]:
+    algorithms: List[str] = []
+    for row in rows:
+        algorithm = str(row.get("algorithm", "")).strip()
+        if algorithm and algorithm not in algorithms:
+            algorithms.append(algorithm)
+    return algorithms
+
+
+def _plot_figure_6(rows: Sequence[Dict[str, Any]],output_base: Path,) -> None:
+    """Plot all population members as points using the paper's axis scale."""
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    population = [row for row in rows if row["point_type"] == "population"]
-    if not population:
-        raise ValueError("Figure 6 has no population convergence points")
-    figure, axis = plt.subplots()
-    axis.scatter(
-        [row["iteration"] for row in population],
-        [row["total_efficiency"] for row in population],
-        s=7,
+    algorithms = _algorithms_from_rows(rows)
+    if not algorithms:
+        raise ValueError("Figure 6 has no algorithm data")
+
+    population_rows = [
+        row
+        for row in rows
+        if str(row.get("point_type", "")).strip().lower() == "population"
+    ]
+    if not population_rows:
+        raise ValueError("Figure 6 has no population data")
+
+    styles = {
+        "dcsga": {"color": "#0072B2", "marker": "o"},
+        "gac_djaya": {"color": "#D55E00", "marker": "s"},
+    }
+
+    figure, axis = plt.subplots(figsize=(8.0, 5.2))
+    paper_mode = algorithms == ["dcsga"]
+
+    if paper_mode:
+        selected_rows = [
+            row
+            for row in population_rows
+            if str(row["algorithm"]) == "dcsga"
+        ]
+        selected_rows.sort(
+            key=lambda row: (
+                int(row["iteration"]),
+                int(row["seed"]),
+                int(row.get("population_index") or 0),
+            )
+        )
+        axis.scatter(
+            [int(row["iteration"]) for row in selected_rows],
+            [float(row["total_efficiency"]) for row in selected_rows],
+            s=13,
+            color="black",
+            alpha=0.80,
+            marker="o",
+            linewidths=0,
+        )
+    else:
+        algorithm_count = len(algorithms)
+        offset_step = 0.14
+        center = (algorithm_count - 1) / 2.0
+
+        for algorithm_index, algorithm in enumerate(algorithms):
+            selected_rows = [
+                row
+                for row in population_rows
+                if str(row["algorithm"]) == algorithm
+            ]
+            if not selected_rows:
+                continue
+
+            selected_rows.sort(
+                key=lambda row: (
+                    int(row["iteration"]),
+                    int(row["seed"]),
+                    int(row.get("population_index") or 0),
+                )
+            )
+
+            style = styles.get(
+                algorithm,
+                {"color": None, "marker": "o"},
+            )
+            x_offset = (algorithm_index - center) * offset_step
+
+            axis.scatter(
+                [
+                    float(row["iteration"]) + x_offset
+                    for row in selected_rows
+                ],
+                [
+                    float(row["total_efficiency"])
+                    for row in selected_rows
+                ],
+                s=16,
+                color=style["color"],
+                marker=style["marker"],
+                alpha=0.72,
+                linewidths=0,
+                label=ALGORITHM_LABELS.get(algorithm, algorithm),
+            )
+
+    iterations = sorted({
+        int(row["iteration"])
+        for row in population_rows
+    })
+    max_iteration = max(iterations)
+    article_x_max = max(
+        5,
+        ((max_iteration + 4) // 5) * 5,
     )
-    iterations = sorted({int(row["iteration"]) for row in population})
-    axis.set_xticks(iterations)
+
+    # Article-style axes:
+    # x: 5 iterations per major tick
+    # y: 18 to 25 with unit spacing
+    axis.set_xlim(-0.5, article_x_max + 0.5)
+    axis.set_xticks(list(range(0, article_x_max + 1, 5)))
+    axis.set_ylim(18.0, 25.0)
+    axis.set_yticks([
+        18.0, 19.0, 20.0, 21.0,
+        22.0, 23.0, 24.0, 25.0,
+    ])
+
     axis.set_xlabel("Number of iterations")
     axis.set_ylabel("Total offloading efficiency")
+    axis.grid(alpha=0.25, linestyle=":")
+
+    if not paper_mode:
+        axis.legend(frameon=False)
+
     figure.tight_layout()
     figure.savefig(output_base.with_suffix(".png"), dpi=300)
     figure.savefig(output_base.with_suffix(".pdf"))
     plt.close(figure)
 
+def _line_panel(axis, rows: Sequence[Dict[str, Any]], metric: str, x_key: str, x_label: str, y_label: str,
+) -> None:
+    """Draw one Figure 7/8 panel from aggregated summary rows.
 
-def _line_panel(axis, rows, metric, x_key, x_label, y_label) -> None:
-    algorithms = FIGURE_ALGORITHMS[rows[0]["figure"]]
+    Standard deviations remain available in CSV/JSON outputs, but uncertainty
+    bands are intentionally not drawn so the exported figures match the
+    article layout and completion-rate plots never extend below zero.
+    """
+    algorithms = _algorithms_from_rows(rows)
+    if not algorithms:
+        raise ValueError("The plot has no algorithm data")
+
+    styles = {
+        "dcsga": {
+            "color": "#0072B2",
+            "marker": "o",
+            "linestyle": "-",
+        },
+        "gac_djaya": {
+            "color": "#D55E00",
+            "marker": "s",
+            "linestyle": "--",
+        },
+        "dtosc": {
+            "color": "#009E73",
+            "marker": "^",
+            "linestyle": "-.",
+        },
+        "to_v2i": {
+            "color": "#CC79A7",
+            "marker": "D",
+            "linestyle": ":",
+        },
+        "to_wo_c": {
+            "color": "#56B4E9",
+            "marker": "v",
+            "linestyle": (0, (5, 2)),
+        },
+        "to_wo_r": {
+            "color": "#E69F00",
+            "marker": "P",
+            "linestyle": (0, (1, 1)),
+        },
+    }
+
+    all_x_values = set()
+
     for algorithm in algorithms:
-        selected = sorted(
-            (row for row in rows if row["algorithm"] == algorithm),
+        algorithm_rows = sorted(
+            (
+                row
+                for row in rows
+                if row.get("algorithm") == algorithm
+                and row.get(x_key) is not None
+                and row.get(metric) is not None
+            ),
             key=lambda row: float(row[x_key]),
         )
-        axis.plot(
-            [row[x_key] for row in selected],
-            [row[metric] for row in selected],
-            marker="o",
-            label=ALGORITHM_LABELS[algorithm],
+        if not algorithm_rows:
+            continue
+
+        style = styles.get(
+            algorithm,
+            {
+                "color": None,
+                "marker": "o",
+                "linestyle": "-",
+            },
         )
+        x_values = [float(row[x_key]) for row in algorithm_rows]
+        y_values = [float(row[metric]) for row in algorithm_rows]
+        all_x_values.update(x_values)
+
+        axis.plot(
+            x_values,
+            y_values,
+            color=style["color"],
+            marker=style["marker"],
+            linestyle=style["linestyle"],
+            linewidth=2.2,
+            markersize=5.5,
+            label=ALGORITHM_LABELS.get(algorithm, algorithm),
+        )
+
+    if not all_x_values:
+        raise ValueError(f"The plot has no valid values for {metric}")
+
+    axis.set_xticks(sorted(all_x_values))
     axis.set_xlabel(x_label)
     axis.set_ylabel(y_label)
-    axis.grid(alpha=0.3)
-    axis.legend()
-
+    axis.grid(alpha=0.25, linestyle=":")
+    axis.legend(frameon=False)
 
 def _plot_figure_7(rows: Sequence[Dict[str, Any]], output_base: Path) -> None:
     import matplotlib
@@ -749,12 +1114,32 @@ def _plot_figure_7(rows: Sequence[Dict[str, Any]], output_base: Path) -> None:
 
     figure, axes = plt.subplots(2, 2, figsize=(10, 8))
     specs = (
-        ("avg_delay", "Average delay (s)"),
-        ("avg_efficiency", "Average offloading efficiency"),
-        ("total_efficiency", "Total offloading efficiency"),
-        ("completion_rate", "Rate of completion"),
+        (
+            "avg_delay",
+            "Average delay (s)",
+            (0.02, 0.07),
+            [0.02, 0.03, 0.04, 0.05, 0.06, 0.07],
+        ),
+        (
+            "avg_efficiency",
+            "Average offloading efficiency",
+            (0.0, 0.6),
+            [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        ),
+        (
+            "total_efficiency",
+            "Total offloading efficiency",
+            (0.0, 40.0),
+            [0.0, 10.0, 20.0, 30.0, 40.0],
+        ),
+        (
+            "completion_rate",
+            "Rate of completion",
+            (0.6, 1.0),
+            [0.6, 0.7, 0.8, 0.9, 1.0],
+        ),
     )
-    for axis, (metric, y_label) in zip(axes.flat, specs):
+    for axis, (metric, y_label, y_limits, y_ticks) in zip(axes.flat, specs):
         _line_panel(
             axis,
             list(rows),
@@ -763,19 +1148,24 @@ def _plot_figure_7(rows: Sequence[Dict[str, Any]], output_base: Path) -> None:
             "Number of vehicles",
             y_label,
         )
+        axis.set_ylim(*y_limits)
+        axis.set_yticks(y_ticks)
+
     figure.tight_layout()
     figure.savefig(output_base.with_suffix(".png"), dpi=300)
     figure.savefig(output_base.with_suffix(".pdf"))
     plt.close(figure)
 
 
-def _plot_figure_8(rows: Sequence[Dict[str, Any]], output_base: Path) -> None:
+
+def _plot_figure_8(rows: Sequence[Dict[str, Any]],output_base: Path,) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     figure, axes = plt.subplots(1, 2, figsize=(10, 4))
+
     _line_panel(
         axes[0],
         list(rows),
@@ -792,88 +1182,209 @@ def _plot_figure_8(rows: Sequence[Dict[str, Any]], output_base: Path) -> None:
         "Deadline of application (s)",
         "Rate of completion",
     )
+
+    deadline_ticks = [
+        0.03, 0.04, 0.05, 0.06,
+        0.07, 0.08, 0.09, 0.10,
+    ]
+    for axis in axes:
+        axis.set_xticks(deadline_ticks)
+
+    # Figure 8(a): 0.02 to 0.08, one-hundredth spacing.
+    axes[0].set_ylim(0.02, 0.08)
+    axes[0].set_yticks([
+        0.02, 0.03, 0.04, 0.05,
+        0.06, 0.07, 0.08,
+    ])
+
+    # Figure 8(b): 0 to 1, 0.2 spacing.
+    axes[1].set_ylim(0.0, 1.0)
+    axes[1].set_yticks([
+        0.0, 0.2, 0.4, 0.6, 0.8, 1.0,
+    ])
+
     figure.tight_layout()
     figure.savefig(output_base.with_suffix(".png"), dpi=300)
     figure.savefig(output_base.with_suffix(".pdf"))
     plt.close(figure)
 
-
-def _plot_figure_9(rows: Sequence[Dict[str, Any]], output_base: Path) -> None:
+def _plot_figure_9(rows: Sequence[Dict[str, Any]],output_base: Path,) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     speeds = list(VEHICLE_SPEEDS_KMH)
-    algorithms = FIGURE_ALGORITHMS["figure_9"]
-    width = 0.36
+    algorithms = _algorithms_from_rows(rows)
+    width = 0.8 / max(1, len(algorithms))
     x_values = list(range(len(speeds)))
+
     figure, axis = plt.subplots()
+
     for algorithm_index, algorithm in enumerate(algorithms):
         values_by_speed = {
-            int(round(float(row["speed_kmh"]))): float(row["total_efficiency"])
+            int(round(float(row["speed_kmh"]))): float(
+                row["total_efficiency"]
+            )
             for row in rows
             if row["algorithm"] == algorithm
         }
-        offset = (algorithm_index - 0.5) * width
+        offset = (
+            algorithm_index - (len(algorithms) - 1) / 2.0
+        ) * width
+
         axis.bar(
             [value + offset for value in x_values],
-            [values_by_speed[speed] for speed in speeds],
+            [
+                values_by_speed.get(speed, 0.0)
+                for speed in speeds
+            ],
             width=width,
-            label=ALGORITHM_LABELS[algorithm],
+            label=ALGORITHM_LABELS.get(algorithm, algorithm),
         )
-    axis.set_xticks(x_values, [str(speed) for speed in speeds])
+
+    # Article-style axes:
+    # x: 75 to 105 km/h, 5 km/h spacing
+    # y: 20 to 25, unit spacing
+    axis.set_xticks(
+        x_values,
+        [str(speed) for speed in speeds],
+    )
+    axis.set_ylim(20.0, 25.0)
+    axis.set_yticks([
+        20.0, 21.0, 22.0,
+        23.0, 24.0, 25.0,
+    ])
+
     axis.set_xlabel("Speed of vehicles (km/h)")
     axis.set_ylabel("Total offloading efficiency")
     axis.grid(axis="y", alpha=0.3)
     axis.legend()
+
     figure.tight_layout()
     figure.savefig(output_base.with_suffix(".png"), dpi=300)
     figure.savefig(output_base.with_suffix(".pdf"))
     plt.close(figure)
 
-
-def _plot_figure_10(rows: Sequence[Dict[str, Any]], output_base: Path) -> None:
+def _plot_figure_10(
+    rows: Sequence[Dict[str, Any]],
+    output_base: Path,
+) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    figure, efficiency_axis = plt.subplots()
+    figure, efficiency_axis = plt.subplots(figsize=(8.0, 5.2))
     completion_axis = efficiency_axis.twinx()
-    for algorithm in FIGURE_ALGORITHMS["figure_10"]:
+
+    styles = {
+        "dcsga": {"color": "#0072B2", "marker": "o"},
+        "gac_djaya": {"color": "#D55E00", "marker": "s"},
+        "dtosc": {"color": "#009E73", "marker": "^"},
+    }
+
+    for algorithm in _algorithms_from_rows(rows):
         selected = sorted(
-            (row for row in rows if row["algorithm"] == algorithm),
+            (
+                row
+                for row in rows
+                if row["algorithm"] == algorithm
+            ),
             key=lambda row: float(row["mec_capacity_ghz"]),
         )
-        x_values = [row["mec_capacity_ghz"] for row in selected]
+        if not selected:
+            continue
+
+        style = styles.get(
+            algorithm,
+            {"color": None, "marker": "o"},
+        )
+        x_values = [
+            float(row["mec_capacity_ghz"])
+            for row in selected
+        ]
+        label = ALGORITHM_LABELS.get(algorithm, algorithm)
+
         efficiency_axis.plot(
             x_values,
-            [row["avg_efficiency"] for row in selected],
-            marker="o",
+            [
+                float(row["avg_efficiency"])
+                for row in selected
+            ],
+            color=style["color"],
+            marker=style["marker"],
             linestyle="-",
-            label=f"{ALGORITHM_LABELS[algorithm]} efficiency",
+            linewidth=2.2,
+            markersize=5.5,
+            label=f"{label} efficiency",
         )
         completion_axis.plot(
             x_values,
-            [row["completion_rate"] for row in selected],
-            marker="o",
+            [
+                float(row["completion_rate"])
+                for row in selected
+            ],
+            color=style["color"],
+            marker=style["marker"],
             linestyle="--",
-            label=f"{ALGORITHM_LABELS[algorithm]} completion",
+            linewidth=1.8,
+            markersize=5.0,
+            label=f"{label} completion",
         )
-    efficiency_axis.set_xlabel("Computing capacity of MEC servers (GHz)")
-    efficiency_axis.set_ylabel("Average offloading efficiency")
-    completion_axis.set_ylabel("Rate of completion")
-    efficiency_axis.grid(alpha=0.3)
-    handles_a, labels_a = efficiency_axis.get_legend_handles_labels()
-    handles_b, labels_b = completion_axis.get_legend_handles_labels()
-    efficiency_axis.legend(handles_a + handles_b, labels_a + labels_b)
-    figure.tight_layout()
-    figure.savefig(output_base.with_suffix(".png"), dpi=300)
-    figure.savefig(output_base.with_suffix(".pdf"))
+
+    efficiency_axis.set_xlim(28.0, 82.0)
+    efficiency_axis.set_xticks([30, 40, 50, 60, 70, 80])
+
+    efficiency_axis.set_ylim(0.20, 0.50)
+    efficiency_axis.set_yticks([
+        0.20, 0.25, 0.30, 0.35,
+        0.40, 0.45, 0.50,
+    ])
+
+    completion_axis.set_ylim(0.988, 1.000)
+    completion_axis.set_yticks([
+        0.988, 0.990, 0.992, 0.994,
+        0.996, 0.998, 1.000,
+    ])
+
+    efficiency_axis.set_xlabel(
+        "Computing capacity of MEC servers (GHz)"
+    )
+    efficiency_axis.set_ylabel(
+        "Average offloading efficiency"
+    )
+    completion_axis.set_ylabel(
+        "Rate of completion"
+    )
+    efficiency_axis.grid(alpha=0.3, linestyle=":")
+
+    handles_a, labels_a = (
+        efficiency_axis.get_legend_handles_labels()
+    )
+    handles_b, labels_b = (
+        completion_axis.get_legend_handles_labels()
+    )
+    figure.legend(
+        handles_a + handles_b,
+        labels_a + labels_b,
+        loc="lower center",
+        bbox_to_anchor=(0.5, -0.02),
+        ncol=3,
+        frameon=False,
+    )
+
+    figure.tight_layout(rect=(0.0, 0.12, 1.0, 1.0))
+    figure.savefig(
+        output_base.with_suffix(".png"),
+        dpi=300,
+        bbox_inches="tight",
+    )
+    figure.savefig(
+        output_base.with_suffix(".pdf"),
+        bbox_inches="tight",
+    )
     plt.close(figure)
-
-
 def _export_experiment(
     figure: str,
     raw_rows: Sequence[Dict[str, Any]],
@@ -885,10 +1396,15 @@ def _export_experiment(
         f"{figure}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_"
         f"{uuid4().hex[:8]}"
     )
+    experiment_folder = (
+        "algorithm_comparison"
+        if metadata.get("comparison_mode", False)
+        else "paper_figures"
+    )
     output_dir = (
         Path(settings.BASE_DIR)
         / "benchmark_results"
-        / "paper_figures"
+        / experiment_folder
         / figure
         / run_id
     )
@@ -931,6 +1447,9 @@ def run_paper_experiment(
     seed_start: int = 1,
     tmax: int = 15,
     population_size: int | None = None,
+    algorithms: Iterable[str] | None = None,
+    diagnostic_vehicle_count: int | None = None,
+    export_artifacts: bool = True,
 ) -> Dict[str, Any]:
     figure = _normalize_figure(figure)
     if figure == "all":
@@ -950,6 +1469,9 @@ def run_paper_experiment(
                     seed_start=seed_start,
                     tmax=tmax,
                     population_size=population_size,
+                    algorithms=algorithms,
+                    diagnostic_vehicle_count=None,
+                    export_artifacts=export_artifacts,
                 )
                 for item in figures
             },
@@ -964,8 +1486,36 @@ def run_paper_experiment(
         raise ValueError("tmax must be positive")
     if population_size is not None and int(population_size) < 2:
         raise ValueError("population_size must be at least 2")
+    if diagnostic_vehicle_count is not None:
+        diagnostic_vehicle_count = int(diagnostic_vehicle_count)
+        if figure != "figure_6":
+            raise ValueError(
+                "diagnostic_vehicle_count is supported only for figure_6"
+            )
+        if diagnostic_vehicle_count < 2 or diagnostic_vehicle_count > 76:
+            raise ValueError(
+                "diagnostic_vehicle_count must be between 2 and 76"
+            )
     seeds = [int(seed_start) + index for index in range(repetitions)]
-    algorithms = FIGURE_ALGORITHMS[figure]
+    default_algorithms = FIGURE_ALGORITHMS[figure]
+    paper_algorithms = PAPER_FIGURE_ALGORITHMS[figure]
+    if algorithms is None:
+        selected_algorithms = tuple(default_algorithms)
+    else:
+        selected_algorithms = tuple(
+            dict.fromkeys(str(name).strip().lower() for name in algorithms)
+        )
+    if not selected_algorithms:
+        raise ValueError("At least one algorithm is required")
+    unknown_algorithms = [
+        name for name in selected_algorithms if name not in ALGORITHM_LABELS
+    ]
+    if unknown_algorithms:
+        raise ValueError(f"Unsupported comparison algorithms: {unknown_algorithms}")
+    if figure == "figure_6" and "dtosc" in selected_algorithms:
+        raise ValueError("DTOSC has no population convergence history for Figure 6")
+    algorithms = selected_algorithms
+    comparison_mode = tuple(algorithms) != tuple(paper_algorithms)
     environment = _load_paper_environment()
     raw_rows: List[Dict[str, Any]] = []
     application_rows: List[Dict[str, Any]] = []
@@ -973,12 +1523,13 @@ def run_paper_experiment(
     scenario_records: List[Dict[str, Any]] = []
 
     if figure == "figure_6":
+        figure_6_vehicle_count = int(diagnostic_vehicle_count or 76)
         for seed in seeds:
             joint_ctx = _build_scenario(
                 figure,
                 seed,
-                mission_vehicle_count=76,
-                road_vehicle_count=76,
+                mission_vehicle_count=figure_6_vehicle_count,
+                road_vehicle_count=figure_6_vehicle_count,
                 speed_kmh=None,
                 mec_capacity_ghz=50.0,
                 sweep_parameter="iteration",
@@ -1011,6 +1562,7 @@ def run_paper_experiment(
                     sweep_parameter="mission_vehicle_count",
                     sweep_value=float(vehicle_count),
                     environment=environment,
+                    assignment_pool_count=max(VEHICLE_COUNTS),
                 )
                 result = _run_scenario(
                     joint_ctx,
@@ -1022,6 +1574,10 @@ def run_paper_experiment(
                 run_rows, apps = _standard_rows(figure, result)
                 raw_rows.extend(run_rows)
                 application_rows.extend(apps)
+                execution_audit.extend(
+                    _execution_audit_rows(figure, result)
+                )
+                scenario_records.append(dict(result["scenario"]))
         summary_rows = _summary_rows(
             raw_rows,
             ("figure", "mission_vehicle_count", "algorithm"),
@@ -1050,6 +1606,10 @@ def run_paper_experiment(
             deadline_rows, apps = _figure_8_rows(result)
             raw_rows.extend(deadline_rows)
             application_rows.extend(apps)
+            execution_audit.extend(
+                _execution_audit_rows(figure, result)
+            )
+            scenario_records.append(dict(result["scenario"]))
         summary_rows = _summary_rows(
             raw_rows,
             ("figure", "deadline_s", "deadline_ms", "algorithm"),
@@ -1083,6 +1643,10 @@ def run_paper_experiment(
                     row["speed_kmh"] = float(speed_kmh)
                 raw_rows.extend(run_rows)
                 application_rows.extend(apps)
+                execution_audit.extend(
+                    _execution_audit_rows(figure, result)
+                )
+                scenario_records.append(dict(result["scenario"]))
         summary_rows = _summary_rows(
             raw_rows,
             ("figure", "speed_kmh", "algorithm"),
@@ -1114,6 +1678,10 @@ def run_paper_experiment(
                     row["mec_capacity_ghz"] = float(capacity_ghz)
                 raw_rows.extend(run_rows)
                 application_rows.extend(apps)
+                execution_audit.extend(
+                    _execution_audit_rows(figure, result)
+                )
+                scenario_records.append(dict(result["scenario"]))
         summary_rows = _summary_rows(
             raw_rows,
             ("figure", "mec_capacity_ghz", "algorithm"),
@@ -1133,6 +1701,35 @@ def run_paper_experiment(
             population_size if population_size is not None else load_params_obj().S
         ) == 50,
         "algorithms": list(algorithms),
+        "comparison_mode": comparison_mode,
+        "diagnostic_mode": bool(
+            figure == "figure_6"
+            and diagnostic_vehicle_count is not None
+            and int(diagnostic_vehicle_count) != 76
+        ),
+        "diagnostic_vehicle_count": (
+            None
+            if diagnostic_vehicle_count is None
+            else int(diagnostic_vehicle_count)
+        ),
+        "default_paper_algorithms": list(paper_algorithms),
+        "default_run_algorithms": list(default_algorithms),
+        "arrival_model": {
+            "application_rate_per_second": float(
+                load_params_obj().application_rate_per_second
+            ),
+            "dynamic_arrivals_applied": False,
+            "figure_7_scheduling_epoch": (
+                "one concurrent application per mission vehicle"
+            ),
+            "reason": (
+                "The article reports 10 applications per second but does not "
+                "specify the arrival distribution, observation horizon, or "
+                "whether the rate is per vehicle or system-wide. Figure 7 is "
+                "therefore evaluated as the joint scheduling epoch defined by "
+                "Algorithm 2 instead of imposing an unverified arrival model."
+            ),
+        },
         "article_parameters": {
             "vehicle_counts": list(VEHICLE_COUNTS),
             "deadlines_ms": list(DEADLINES_MS),
@@ -1147,7 +1744,7 @@ def run_paper_experiment(
         "declared_limitations": [
             "DTOSC uses a complete semi-distributed stage-wise dynamic-programming reconstruction aligned with the published description; source-exact line-by-line verification is not claimed because the 2022 pseudocode is not bundled with the project.",
             "The channel and sender-side power models remain declared approximations.",
-            "The isolated figures use simultaneous application snapshots and do not reproduce the runtime arrival process.",
+            "Figures 6-10 evaluate one joint scheduling epoch. The article reports 10 applications per second but does not define a reproducible arrival distribution, observation horizon, or whether that rate is per vehicle or system-wide; no unverified arrival process is imposed on the paper figures.",
             "For Figures 7, 8, and 10, the road vehicle pool is fixed at the available 76 vehicles while the paper-specified mission vehicle count is varied or fixed; the paper does not report a separate total road vehicle count for these figures.",
             "Figure 9 uses a finite spatial-Poisson realization conditioned on the speed-derived lane vehicle counts because the database contains 76 vehicle records.",
             "The service compile workload Wk is not reported in Table III and is set equal to the corresponding task workload as a declared deterministic assumption.",
@@ -1156,15 +1753,23 @@ def run_paper_experiment(
         "scenario_records": scenario_records,
         "execution_audit": execution_audit,
     }
-    artifacts = _export_experiment(
-        figure,
-        raw_rows,
-        summary_rows,
-        application_rows,
-        metadata,
+    convergence_diagnostics = (
+        _convergence_diagnostics(raw_rows)
+        if figure == "figure_6"
+        else []
     )
+    artifacts = {}
+    if export_artifacts:
+        artifacts = _export_experiment(
+            figure,
+            raw_rows,
+            summary_rows,
+            application_rows,
+            metadata,
+        )
     return {
         **metadata,
+        "convergence_diagnostics": convergence_diagnostics,
         "summary": summary_rows,
         "artifacts": artifacts,
     }
