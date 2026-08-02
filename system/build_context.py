@@ -39,11 +39,10 @@ class MiniSystemContextBuilder:
         if vehicle is None:
             raise ValueError(f"Application {app.id} has no vehicle")
 
-        deadline_s = float(app_type.deadline) / 1000.0
-        if deadline_s <= 0.0:
-            raise ValueError(f"Application {app.id} has an invalid deadline")
+        deadline_ms = float(app_type.deadline)
+        deadline_s = deadline_ms / 1000.0
 
-        alpha_n = 0.01 / deadline_s + 0.6
+        alpha_n = 0.01 / deadline_ms + 0.6
         beta_n = 1.0 - alpha_n
 
         if not 0.0 <= alpha_n <= 1.0 or not 0.0 <= beta_n <= 1.0:

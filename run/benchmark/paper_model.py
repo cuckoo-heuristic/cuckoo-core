@@ -75,18 +75,19 @@ def watts_to_dbm(watts: float) -> float:
 
 
 def article_weights(deadline_s: float) -> ApplicationWeights:
-    """Return Table III's application-specific delay and energy weights."""
     deadline_s = _positive_finite(deadline_s, "deadline_s")
-    alpha = 0.01 / deadline_s + 0.6
+
+    deadline_ms = deadline_s * 1000.0
+
+    alpha = 0.01 / deadline_ms + 0.6
     beta = 1.0 - alpha
     if not (0.0 <= alpha <= 1.0 and 0.0 <= beta <= 1.0):
-        raise PaperModelError(
-            "The article weight formula is outside [0,1]. "
-            "Use the paper's deadline range in seconds (normally 0.03..0.10)."
-        )
-    return ApplicationWeights(alpha=float(alpha), beta=float(beta))
+        raise PaperModelError("The article weights must be between zero and one")
 
-
+    return ApplicationWeights(
+        alpha=float(alpha),
+        beta=float(beta),
+    )
 def local_reference(
     cpu_cycles: Iterable[float],
     *,

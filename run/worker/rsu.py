@@ -18,6 +18,10 @@ from cache.models import cache as CacheModel
 from resource.models import Resource
 from state.models import State
 from dag.models import TaskType
+from parameter.services import load_params_obj
+
+from run.benchmark.context import build_joint_context
+from run.benchmark.search import run_joint_dcsga
 
 from system.build_context import MiniSystemContextBuilder
 
@@ -108,71 +112,399 @@ class RSUWorker(threading.Thread):
     def run(self):
         close_old_connections()
 
-        total_time = float(
-            getattr(
-                self.cfg,
-                "total_time",
-                120,
-            )
+        coordinator_id = int(
+            getattr(self.cfg, "runtime_coordinator_rsu_id", self.rsu_id)
+            or self.rsu_id
         )
 
-        get_sim_time = getattr(
-            self.cfg,
-            "get_sim_time_s",
-            None,
-        )
-
-        fallback_time = 0.0
+        # Keep the existing RSU worker registry intact, but let exactly one
+        # worker coordinate each system-wide mission batch.  Vehicle workers
+        # continue to maintain all RSU associations and V2V topology.
+        if self.rsu_id != coordinator_id:
+            while not self._stop_flag.is_set():
+                if self._stop_flag.wait(0.2):
+                    break
+            close_old_connections()
+            return
 
         while not self._stop_flag.is_set():
             close_old_connections()
-
-            if callable(get_sim_time):
-                t = min(
-                    total_time,
-                    max(
-                        0.0,
-                        float(get_sim_time()),
-                    ),
-                )
-            else:
-                t = min(
-                    total_time,
-                    fallback_time,
-                )
-                fallback_time += 1.0
-
-            current_time = int(t)
-
-            # Poll throughout the current simulation second.  Applications
-            # may be created after this worker's first scan of that second;
-            # limiting scans to one per integer time step could otherwise
-            # postpone them until the next simulated second.
-            try:
-                vehicle_ids = list(
-                    RSUVehicle.objects.filter(
-                        rsu_id_id=self.rsu_id,
-                        end_time__isnull=True,
-                        is_current=True,
-                    ).values_list(
-                        "vehicle_id_id",
-                        flat=True,
-                    )
-                )
-            except Exception:
-                vehicle_ids = []
-
-            for vehicle_id in vehicle_ids:
-                if self._stop_flag.is_set():
-                    break
-
-                self._handle_vehicle(
-                    vehicle_id,
-                    current_time,
-                )
-
-            if self._stop_flag.wait(0.1):
+            processed = self._process_next_batch()
+            if not processed and self._stop_flag.wait(0.1):
                 break
+
+        close_old_connections()
+
+    def _next_pending_batch(self) -> List[Application]:
+        first = (
+            Application.objects.filter(
+                is_progress=True,
+                start_at__isnull=False,
+            )
+            .order_by("start_at", "id")
+            .first()
+        )
+        if first is None:
+            return []
+
+        return list(
+            Application.objects.filter(
+                is_progress=True,
+                start_at=first.start_at,
+            )
+            .select_related("vehicle_id", "application_type_id")
+            .order_by("id")
+        )
+
+    def _runtime_cache_map(self, provider_ids: Iterable[int]) -> Dict[int, set[int]]:
+        normalized_ids = sorted({int(provider_id) for provider_id in provider_ids})
+        result = {provider_id: set() for provider_id in normalized_ids}
+        for provider_id, task_type_id in CacheModel.objects.filter(
+            sp_id_id__in=normalized_ids
+        ).values_list("sp_id_id", "task_type_id_id"):
+            result[int(provider_id)].add(int(task_type_id))
+        return result
+
+    def _prepare_joint_runtime_context(
+        self,
+        applications: List[Application],
+    ) -> Dict[str, Any]:
+        application_ids = [int(app.id) for app in applications]
+        joint_ctx = build_joint_context(application_ids)
+        mission_vehicle_ids = {
+            int(app.vehicle_id_id)
+            for app in applications
+        }
+
+        # Mission vehicles execute their own local entry task but are not used
+        # as V2V helpers for the other mission applications in the same batch.
+        # This leaves the non-mission vehicles available for cooperation.
+        allowed_by_application: Dict[int, List[int]] = {}
+        for app_id, app_ctx in joint_ctx["applications"].items():
+            local_sp_id = int(app_ctx["local_sp_id"])
+            allowed: List[int] = []
+
+            for provider_id in app_ctx.get("provider_ids", []):
+                provider_id = int(provider_id)
+                provider_type = app_ctx.get("sp_types", {}).get(provider_id)
+                provider_vehicle_id = app_ctx.get("sp_vehicle_ids", {}).get(provider_id)
+
+                if (
+                    provider_type == "vehicle"
+                    and provider_vehicle_id is not None
+                    and int(provider_vehicle_id) in mission_vehicle_ids
+                    and provider_id != local_sp_id
+                ):
+                    continue
+
+                allowed.append(provider_id)
+
+            if local_sp_id not in allowed:
+                allowed.append(local_sp_id)
+
+            allowed_by_application[int(app_id)] = list(dict.fromkeys(allowed))
+            app_ctx["provider_ids"] = list(allowed_by_application[int(app_id)])
+
+        for joint_task_id, task_ref in joint_ctx["task_refs"].items():
+            joint_ctx["task_domains"][int(joint_task_id)] = list(
+                allowed_by_application[int(task_ref.application_id)]
+            )
+
+        provider_ids = sorted({
+            int(provider_id)
+            for provider_list in allowed_by_application.values()
+            for provider_id in provider_list
+        })
+        joint_ctx["provider_ids"] = provider_ids
+        joint_ctx["initial_cache"] = self._runtime_cache_map(provider_ids)
+
+        batch_start = applications[0].start_at
+        provider_initial_finish = {
+            provider_id: 0.0
+            for provider_id in provider_ids
+        }
+
+        if batch_start is not None and provider_ids:
+            latest_rows = (
+                TaskExecution.objects.filter(
+                    sp_id_id__in=provider_ids,
+                    end_time__isnull=False,
+                    end_time__gt=batch_start,
+                )
+                .exclude(application_id_id__in=application_ids)
+                .values("sp_id_id")
+                .annotate(latest_end=Max("end_time"))
+            )
+            for row in latest_rows:
+                latest_end = row["latest_end"]
+                if latest_end is None:
+                    continue
+                provider_initial_finish[int(row["sp_id_id"])] = max(
+                    0.0,
+                    float((latest_end - batch_start).total_seconds()),
+                )
+
+        joint_ctx["initial_provider_finish"] = provider_initial_finish
+        joint_ctx["scenario_metadata"] = {
+            **dict(joint_ctx.get("scenario_metadata", {})),
+            "runtime_mode": "fixed_seeded_mission_batch",
+            "runtime_batch_size": len(applications),
+            "runtime_mission_vehicle_ids": sorted(mission_vehicle_ids),
+            "runtime_v2v_helper_vehicle_count": max(
+                0,
+                int(ServiceProvider.objects.filter(type="vehicle").count())
+                - len(mission_vehicle_ids),
+            ),
+        }
+        return joint_ctx
+
+    def _process_next_batch(self) -> bool:
+        applications = self._next_pending_batch()
+        if not applications:
+            return False
+
+        scheduler_busy = getattr(self.cfg, "runtime_scheduler_busy", None)
+        if scheduler_busy is not None:
+            scheduler_busy.set()
+
+        scheduler_locked = False
+        completed = False
+
+        try:
+            scheduler_locked = _try_lock_runtime_scheduler()
+            if not scheduler_locked:
+                return False
+
+            # Re-read after acquiring the process-wide scheduler lock.
+            applications = self._next_pending_batch()
+            if not applications:
+                completed = True
+                return False
+
+            start_at = applications[0].start_at
+            base_time = getattr(self.cfg, "base_time", None) or start_at or timezone.now()
+            time_step = max(
+                0,
+                int(round((start_at - base_time).total_seconds()))
+                if start_at is not None
+                else 0,
+            )
+
+            joint_ctx = self._prepare_joint_runtime_context(applications)
+            params = load_params_obj()
+            seed = int(getattr(self.cfg, "simulation_seed", 1)) + int(time_step)
+
+            _best_nest, evaluation, history = run_joint_dcsga(
+                joint_ctx,
+                algorithm="dcsga",
+                seed=seed,
+                tmax=int(getattr(self.cfg, "tmax", 10)),
+                population_size=int(params.S),
+            )
+
+            self._persist_joint_batch(
+                applications=applications,
+                joint_ctx=joint_ctx,
+                evaluation=evaluation,
+                time_step=time_step,
+            )
+
+            self.cfg.runtime_batches_completed = int(
+                getattr(self.cfg, "runtime_batches_completed", 0) or 0
+            ) + 1
+            self.cfg.runtime_last_error = None
+            self.cfg.runtime_last_batch_metrics = {
+                **dict(evaluation.metrics),
+                "application_count": len(applications),
+                "history_iterations": len(history),
+                "time_step": int(time_step),
+            }
+            completed = True
+            return True
+
+        except AlgorithmCancelled:
+            return False
+
+        except Exception:
+            self.cfg.runtime_last_error = traceback.format_exc()
+            traceback.print_exc()
+            return False
+
+        finally:
+            if scheduler_locked:
+                _unlock_runtime_scheduler()
+
+            # On failure, keep the logical clock frozen so the same batch is
+            # retried instead of silently advancing and losing workload.
+            if completed and scheduler_busy is not None:
+                scheduler_busy.clear()
+
+    def _persist_joint_batch(
+        self,
+        *,
+        applications: List[Application],
+        joint_ctx: Dict[str, Any],
+        evaluation,
+        time_step: int,
+    ) -> None:
+        application_ids = [int(app.id) for app in applications]
+        schedule_rows = sorted(
+            list(evaluation.schedule),
+            key=lambda row: (
+                int(row["application_id"]),
+                float(row["start_s"]),
+                int(row["task_id"]),
+            ),
+        )
+
+        used_provider_ids = {
+            int(row["provider_id"])
+            for row in schedule_rows
+        }
+
+        with transaction.atomic():
+            locked_apps = list(
+                Application.objects.select_for_update(of=("self",))
+                .filter(id__in=application_ids, is_progress=True)
+                .select_related("vehicle_id")
+                .order_by("id")
+            )
+            if {int(app.id) for app in locked_apps} != set(application_ids):
+                raise ValueError(
+                    "Runtime batch changed while it was being scheduled"
+                )
+
+            app_by_id = {int(app.id): app for app in locked_apps}
+            final_cache = {
+                int(provider_id): {
+                    int(task_type_id)
+                    for task_type_id in task_type_ids
+                }
+                for provider_id, task_type_ids in evaluation.cache_state.items()
+            }
+            current_cache = self._runtime_cache_map(final_cache.keys())
+            changed_cache_provider_ids = {
+                provider_id
+                for provider_id, task_type_ids in final_cache.items()
+                if task_type_ids != current_cache.get(provider_id, set())
+            }
+
+            lock_provider_ids = sorted(
+                used_provider_ids | changed_cache_provider_ids
+            )
+            resources = self._lock_resources(lock_provider_ids)
+            providers = ServiceProvider.objects.select_related(
+                "vehicle_id",
+                "rsu_id",
+            ).in_bulk(lock_provider_ids)
+
+            missing_providers = sorted(set(lock_provider_ids) - set(providers))
+            if missing_providers:
+                raise ValueError(
+                    f"Missing service providers: {missing_providers}"
+                )
+
+            TaskExecution.objects.filter(
+                application_id_id__in=application_ids
+            ).delete()
+
+            cpu_increments = {
+                provider_id: 0
+                for provider_id in used_provider_ids
+            }
+            max_finish_by_application = {
+                app_id: 0.0
+                for app_id in application_ids
+            }
+
+            for row in schedule_rows:
+                app_id = int(row["application_id"])
+                task_id = int(row["task_id"])
+                provider_id = int(row["provider_id"])
+                start_s = float(row["start_s"])
+                finish_s = float(row["finish_s"])
+                energy_j = float(row.get("energy_j", 0.0) or 0.0)
+
+                if start_s < 0.0 or finish_s < start_s:
+                    raise ValueError(
+                        f"Invalid joint schedule for task {task_id}: "
+                        f"start={start_s}, finish={finish_s}"
+                    )
+
+                app = app_by_id[app_id]
+                app_ctx = joint_ctx["applications"][app_id]
+                provider = providers[provider_id]
+                local_sp_id = int(app_ctx["local_sp_id"])
+                is_local = provider_id == local_sp_id
+                sim_start = app.start_at or (
+                    getattr(self.cfg, "base_time", None) or timezone.now()
+                )
+
+                gain_value = 0.0
+                rate_value = 0.0
+                distance_value = 0.0
+                if not is_local:
+                    gain_value = float(channel_gain(app_ctx, provider_id))
+                    rate_value = float(rate(app_ctx, provider_id))
+                    distance_value = float(
+                        app_ctx.get("distance", {}).get(provider_id, 0.0)
+                    )
+
+                task_execution = TaskExecution.objects.create(
+                    application_id=app,
+                    sp_id=provider,
+                    task_id_id=task_id,
+                    start_time=sim_start + timedelta(seconds=start_s),
+                    end_time=sim_start + timedelta(seconds=finish_s),
+                    exec_time=finish_s - start_s,
+                    energy=energy_j,
+                )
+
+                State.objects.create(
+                    time_step=int(time_step),
+                    task_execution_id=task_execution,
+                    from_vehicle_id=app.vehicle_id,
+                    to_vehicle_id=(
+                        provider.vehicle_id
+                        if provider.vehicle_id_id
+                        else None
+                    ),
+                    to_rsu_id=(
+                        provider.rsu_id
+                        if provider.rsu_id_id
+                        else None
+                    ),
+                    gain=gain_value,
+                    distance=distance_value,
+                    rate=rate_value,
+                )
+
+                cpu_increments[provider_id] += int(
+                    app_ctx["cpu_cycles"].get(task_id, 0)
+                )
+                max_finish_by_application[app_id] = max(
+                    max_finish_by_application[app_id],
+                    finish_s,
+                )
+
+            for provider_id, increment in cpu_increments.items():
+                resource = resources[provider_id]
+                resource.cpu_used = int(resource.cpu_used or 0) + int(increment)
+                resource.save(update_fields=["cpu_used"])
+
+            self.apply_cache(
+                final_cache,
+                changed_cache_provider_ids,
+                resources,
+            )
+
+            for app_id, app in app_by_id.items():
+                self._finalize_application(
+                    app,
+                    int(time_step),
+                    max_finish_by_application[app_id],
+                )
+
     def _handle_vehicle(self, vehicle_id: int, t: int):
         try:
             app_ids = list(

@@ -249,12 +249,10 @@ def build_synthetic_benchmark_context(
     application_type: ApplicationType,
     snapshot: BenchmarkSnapshot,
 ) -> Dict[str, Any]:
-    deadline_s = float(application_type.deadline) / 1000.0
-    if deadline_s <= 0.0:
-        raise ValueError(
-            f"Application type {application_type.id} has an invalid deadline"
-        )
-    alpha_n = 0.01 / deadline_s + 0.6
+    deadline_ms = float(application_type.deadline)
+    deadline_s = deadline_ms / 1000.0
+
+    alpha_n = 0.01 / deadline_ms + 0.6
     beta_n = 1.0 - alpha_n
     if not 0.0 <= alpha_n <= 1.0 or not 0.0 <= beta_n <= 1.0:
         raise ValueError(

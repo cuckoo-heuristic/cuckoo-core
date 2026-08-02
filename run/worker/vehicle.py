@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 import threading
+import traceback
 from datetime import timedelta
 from typing import Optional, Tuple, List
 
@@ -420,48 +421,107 @@ class VehicleWorker(threading.Thread):
 
 
 class ApplicationGeneratorWorker(threading.Thread):
+    """Release one deterministic mission batch at fixed simulation intervals.
+
+    The runtime simulation is intentionally separate from the paper benchmark:
+    one fixed, seeded set of mission vehicles receives a new application at
+    t=0, interval, 2*interval, ... while the remaining connected vehicles stay
+    available as V2V helpers.
+    """
+
     def __init__(self, cfg: SimulationConfig):
         super().__init__(daemon=True)
         self.cfg = cfg
         self._stop_flag = threading.Event()
         params = load_params_obj()
         self.min_tasks = int(getattr(params, "min_tasks_per_app_type", 3) or 3)
-        self.rate = max(0.0, float(getattr(cfg, "application_rate_per_second", 10.0)))
         self.seed = int(getattr(cfg, "simulation_seed", 1))
+        self.interval_s = max(
+            1,
+            int(getattr(cfg, "runtime_batch_interval_s", 30) or 30),
+        )
+        self.batch_size = max(
+            1,
+            int(getattr(cfg, "runtime_batch_size", 20) or 20),
+        )
+        self._mission_vehicle_ids: List[int] = []
+        self._released_batches = 0
+        self._created_applications = 0
+        self._skipped_applications = 0
+        self._publish_runtime_state()
 
     def stop(self):
         self._stop_flag.set()
 
-    def _create_batch(self, sim_second: int, count: int) -> int:
-        if count <= 0:
-            return 0
-        connected_vehicle_ids = list(
-            RSUVehicle.objects.filter(
-                is_current=True,
-                end_time__isnull=True,
-                vehicle_id_id__isnull=False,
-            )
-            .order_by("vehicle_id_id")
-            .values_list("vehicle_id_id", flat=True)
-            .distinct()
-        )
-        active_vehicle_ids = set(
-            Application.objects.filter(is_progress=True)
-            .values_list("vehicle_id_id", flat=True)
-        )
-        candidate_ids = [
+    def _publish_runtime_state(self) -> None:
+        self.cfg.runtime_mission_vehicle_ids = list(self._mission_vehicle_ids)
+        self.cfg.runtime_batches_released = int(self._released_batches)
+        self.cfg.runtime_created_applications = int(self._created_applications)
+        self.cfg.runtime_skipped_applications = int(self._skipped_applications)
+
+    def _connected_vehicle_ids(self) -> List[int]:
+        return [
             int(vehicle_id)
-            for vehicle_id in connected_vehicle_ids
-            if int(vehicle_id) not in active_vehicle_ids
+            for vehicle_id in (
+                RSUVehicle.objects.filter(
+                    is_current=True,
+                    end_time__isnull=True,
+                    vehicle_id_id__isnull=False,
+                )
+                .order_by("vehicle_id_id")
+                .values_list("vehicle_id_id", flat=True)
+                .distinct()
+            )
         ]
-        if not candidate_ids:
+
+    def _select_mission_vehicle_ids(self, sim_second: int) -> List[int]:
+        connected_ids = self._connected_vehicle_ids()
+        connected_set = set(connected_ids)
+
+        # Keep the original mission set whenever those vehicles remain connected.
+        retained = [
+            vehicle_id
+            for vehicle_id in self._mission_vehicle_ids
+            if vehicle_id in connected_set
+        ]
+
+        needed = min(self.batch_size, len(connected_ids)) - len(retained)
+        if needed > 0:
+            replacement_pool = [
+                vehicle_id
+                for vehicle_id in connected_ids
+                if vehicle_id not in set(retained)
+            ]
+            rng = random.Random(
+                self.seed * 1_000_003
+                + int(sim_second) * 97_409
+                + self._released_batches * 65_537
+            )
+            rng.shuffle(replacement_pool)
+            retained.extend(replacement_pool[:needed])
+
+        self._mission_vehicle_ids = retained[: self.batch_size]
+        self._publish_runtime_state()
+        return list(self._mission_vehicle_ids)
+
+    def _create_batch(self, sim_second: int) -> int:
+        selected_ids = self._select_mission_vehicle_ids(sim_second)
+        requested = int(self.batch_size)
+
+        if not selected_ids:
+            self._released_batches += 1
+            self._skipped_applications += requested
+            self._publish_runtime_state()
             return 0
 
-        rng = random.Random(self.seed * 1_000_003 + int(sim_second) * 97_409)
-        rng.shuffle(candidate_ids)
-        selected_ids = candidate_ids[: min(int(count), len(candidate_ids))]
         start_at = _sim_datetime(self.cfg, float(sim_second))
         created = 0
+        skipped = max(0, requested - len(selected_ids))
+        rng = random.Random(
+            self.seed * 1_000_003
+            + int(sim_second) * 97_409
+            + 17
+        )
 
         with transaction.atomic():
             locked_ids = list(
@@ -470,19 +530,27 @@ class ApplicationGeneratorWorker(threading.Thread):
                 .order_by("id")
                 .values_list("id", flat=True)
             )
+
             for vehicle_id in locked_ids:
+                # Normally the previous batch is already complete because the
+                # logical clock pauses while DCSGA is running.  This guard keeps
+                # a failed/stuck application from being duplicated silently.
                 if Application.objects.filter(
                     vehicle_id_id=int(vehicle_id),
                     is_progress=True,
                 ).exists():
+                    skipped += 1
                     continue
+
                 app_type_id = _pick_application_type_id(
                     int(vehicle_id),
                     min_tasks=self.min_tasks,
                     rng=rng,
                 )
                 if app_type_id is None:
+                    skipped += 1
                     continue
+
                 Application.objects.create(
                     vehicle_id_id=int(vehicle_id),
                     application_type_id_id=int(app_type_id),
@@ -491,21 +559,23 @@ class ApplicationGeneratorWorker(threading.Thread):
                     is_progress=True,
                 )
                 created += 1
+
+        self._released_batches += 1
+        self._created_applications += created
+        self._skipped_applications += skipped
+        self.cfg.runtime_last_batch_time_s = int(sim_second)
+        self.cfg.runtime_last_batch_requested = requested
+        self.cfg.runtime_last_batch_created = created
+        self.cfg.runtime_last_batch_skipped = skipped
+        self._publish_runtime_state()
         return created
 
     def run(self):
         close_old_connections()
-
-        tick = 1.0
-        next_second = 0
-        carry = 0.0
         total_time = int(self.cfg.total_time)
-
-        get_sim_time = getattr(
-            self.cfg,
-            "get_sim_time_s",
-            None,
-        )
+        next_batch_time = 0
+        get_sim_time = getattr(self.cfg, "get_sim_time_s", None)
+        scheduler_busy = getattr(self.cfg, "runtime_scheduler_busy", None)
 
         while not self._stop_flag.is_set():
             close_old_connections()
@@ -513,39 +583,45 @@ class ApplicationGeneratorWorker(threading.Thread):
             if callable(get_sim_time):
                 current_second = min(
                     total_time,
-                    max(
-                        0,
-                        int(float(get_sim_time())),
-                    ),
+                    max(0, int(float(get_sim_time()))),
                 )
             else:
-                current_second = min(
-                    total_time,
-                    next_second,
-                )
+                current_second = min(total_time, next_batch_time)
 
-            upper_bound = min(
-                total_time,
-                current_second + 1,
-            )
+            while (
+                next_batch_time < total_time
+                and current_second >= next_batch_time
+                and not self._stop_flag.is_set()
+            ):
+                # Freeze logical time at the release instant.  Vehicle workers
+                # still run and can finish the topology snapshot for this tick.
+                if scheduler_busy is not None:
+                    scheduler_busy.set()
 
-            while next_second < upper_bound:
-                carry += self.rate * tick
+                if self._stop_flag.wait(0.2):
+                    break
 
-                requested = int(carry)
-                carry -= requested
+                try:
+                    created = self._create_batch(next_batch_time)
+                except Exception:
+                    self.cfg.runtime_last_error = traceback.format_exc()
+                    traceback.print_exc()
+                    if scheduler_busy is not None:
+                        scheduler_busy.clear()
+                    if self._stop_flag.wait(0.5):
+                        break
+                    continue
 
-                self._create_batch(
-                    next_second,
-                    requested,
-                )
+                if created <= 0 and scheduler_busy is not None:
+                    scheduler_busy.clear()
 
-                next_second += 1
+                next_batch_time += self.interval_s
 
-            if current_second >= total_time:
+            if current_second >= total_time and next_batch_time >= total_time:
                 break
 
             if self._stop_flag.wait(0.1):
                 break
 
         close_old_connections()
+

@@ -123,6 +123,10 @@ def _build_cfg(params) -> SimulationConfig:
         getattr(params, "application_rate_per_second", None),
         "application_rate_per_second",
     )
+    runtime_batch_interval = _safe_int(
+        getattr(params, "taking_task_time", None),
+        "taking_task_time",
+    )
     cell_radius_rsu = _safe_float(
         getattr(params, "cell_radius_rsu", None),
         "cell_radius_rsu",
@@ -137,6 +141,11 @@ def _build_cfg(params) -> SimulationConfig:
             "Invalid parameter: "
             f"application_rate_per_second={application_rate}"
         )
+    if runtime_batch_interval <= 0 or runtime_batch_interval > total_time:
+        raise ValueError(
+            "Invalid parameter: "
+            f"taking_task_time={runtime_batch_interval}"
+        )
     if cell_radius_rsu <= 0.0:
         raise ValueError(
             f"Invalid parameter: cell_radius_rsu={cell_radius_rsu}"
@@ -145,7 +154,7 @@ def _build_cfg(params) -> SimulationConfig:
 
     cfg = SimulationConfig(
         total_time=total_time,
-        tick_seconds=1,
+        tick_seconds=runtime_batch_interval,
         cell_radius_rsu=cell_radius_rsu,
         base_time=base_time,
     )
@@ -172,6 +181,22 @@ def _build_cfg(params) -> SimulationConfig:
     cfg.vehicle_speed_max_kmh = speed_max
     cfg.application_rate_per_second = application_rate
     cfg.simulation_seed = simulation_seed
+
+    # Runtime-only workload controls.  Benchmark code and algorithm files are
+    # intentionally untouched.  ``taking_task_time`` is the release interval;
+    # a fixed seeded set of 20 mission vehicles receives one application per
+    # interval, leaving the other vehicles available for V2V cooperation.
+    cfg.runtime_batch_interval_s = int(runtime_batch_interval)
+    cfg.runtime_batch_size = 20
+    cfg.runtime_scheduler_busy = threading.Event()
+    cfg.runtime_coordinator_rsu_id = None
+    cfg.runtime_mission_vehicle_ids = []
+    cfg.runtime_batches_released = 0
+    cfg.runtime_batches_completed = 0
+    cfg.runtime_created_applications = 0
+    cfg.runtime_skipped_applications = 0
+    cfg.runtime_last_error = None
+    cfg.runtime_last_batch_metrics = None
 
     return cfg
 
@@ -325,9 +350,29 @@ class ClockWorker(threading.Thread):
         t = 0.0
         _set_sim_time_s(0.0)
         _set_stop_requested(False)
+        scheduler_busy = getattr(self.cfg, "runtime_scheduler_busy", None)
+
         while (not self._stop_flag.is_set()) and (t < float(total_time)):
+            # Algorithm wall-clock time is not simulation time.  Pause the
+            # logical clock while a whole mission batch is being optimized and
+            # persisted, then continue from the same release instant.
+            while (
+                scheduler_busy is not None
+                and scheduler_busy.is_set()
+                and not self._stop_flag.is_set()
+            ):
+                if self._stop_flag.wait(0.1):
+                    break
+
+            if self._stop_flag.is_set():
+                break
+
             if self._stop_flag.wait(clock_tick):
                 break
+
+            if scheduler_busy is not None and scheduler_busy.is_set():
+                continue
+
             t = min(float(total_time), t + float(clock_tick))
             _set_sim_time_s(t)
         if not self._stop_flag.is_set():
@@ -508,9 +553,15 @@ def run_simulation(
             for vehicle in Vehicle.objects.all()
         ]
         _application_generator_worker = ApplicationGeneratorWorker(cfg=cfg)
+        runtime_rsu_ids = list(
+            RSU.objects.order_by("id").values_list("id", flat=True)
+        )
+        if not runtime_rsu_ids:
+            raise ValueError("At least one RSU is required for runtime scheduling")
+        cfg.runtime_coordinator_rsu_id = int(runtime_rsu_ids[0])
         _rsu_workers = [
-            RSUWorker(rsu_id=rsu.id, cfg=cfg)
-            for rsu in RSU.objects.order_by("id")
+            RSUWorker(rsu_id=rsu_id, cfg=cfg)
+            for rsu_id in runtime_rsu_ids
         ]
         _status_worker = StatusWorker(cfg=cfg)
         _context_worker = ContextWorker(cfg=cfg)
@@ -845,6 +896,37 @@ def simulation_status():
             ) if cfg else None,
             "application_rate_per_second": float(
                 getattr(cfg, "application_rate_per_second", 0.0) or 0.0
+            ) if cfg else None,
+            "runtime_batch_interval_s": int(
+                getattr(cfg, "runtime_batch_interval_s", 0) or 0
+            ) if cfg else None,
+            "runtime_batch_size": int(
+                getattr(cfg, "runtime_batch_size", 0) or 0
+            ) if cfg else None,
+            "runtime_mission_vehicle_ids": list(
+                getattr(cfg, "runtime_mission_vehicle_ids", []) or []
+            ) if cfg else [],
+            "runtime_batches_released": int(
+                getattr(cfg, "runtime_batches_released", 0) or 0
+            ) if cfg else 0,
+            "runtime_batches_completed": int(
+                getattr(cfg, "runtime_batches_completed", 0) or 0
+            ) if cfg else 0,
+            "runtime_created_applications": int(
+                getattr(cfg, "runtime_created_applications", 0) or 0
+            ) if cfg else 0,
+            "runtime_skipped_applications": int(
+                getattr(cfg, "runtime_skipped_applications", 0) or 0
+            ) if cfg else 0,
+            "runtime_scheduler_busy": bool(
+                getattr(cfg, "runtime_scheduler_busy", None)
+                and cfg.runtime_scheduler_busy.is_set()
+            ) if cfg else False,
+            "runtime_last_error": getattr(
+                cfg, "runtime_last_error", None
+            ) if cfg else None,
+            "runtime_last_batch_metrics": getattr(
+                cfg, "runtime_last_batch_metrics", None
             ) if cfg else None,
             "tmax": int(
                 getattr(cfg, "tmax", 10) or 10

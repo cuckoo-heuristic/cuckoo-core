@@ -995,10 +995,10 @@ def _plot_figure_6(rows: Sequence[Dict[str, Any]],output_base: Path,) -> None:
     # y: 18 to 25 with unit spacing
     axis.set_xlim(-0.5, article_x_max + 0.5)
     axis.set_xticks(list(range(0, article_x_max + 1, 5)))
-    axis.set_ylim(18.0, 25.0)
+    axis.set_ylim(18.0, 29.0)
     axis.set_yticks([
         18.0, 19.0, 20.0, 21.0,
-        22.0, 23.0, 24.0, 25.0,
+        22.0, 23.0, 24.0, 25.0, 26.0, 27.0, 28.0, 29.0,
     ])
 
     axis.set_xlabel("Number of iterations")
