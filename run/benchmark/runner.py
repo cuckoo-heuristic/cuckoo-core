@@ -253,7 +253,6 @@ def _raw_rows(result: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "article_exact": run.get("article_exact", False),
                     "implementation": run.get("implementation", "article-aligned"),
                     "reference_doi": run.get("reference_doi", ""),
-                    "discrete_reference_doi": run.get("discrete_reference_doi", ""),
                     "runtime_seconds": run.get("runtime_seconds", 0.0),
                     "function_evaluations": run.get(
                         "final_function_evaluations",
@@ -516,7 +515,6 @@ def _export_benchmark_result(
                 "article_exact",
                 "implementation",
                 "reference_doi",
-                "discrete_reference_doi",
                 "algorithm_article_exact",
                 "system_article_exact",
                 "mission_vehicle_count",
@@ -760,20 +758,6 @@ def run_joint_context_benchmark(
                 result["reference_alignment"] = str(
                     getattr(algorithm, "reference_alignment", "")
                 )
-            elif algorithm_name == "gac_djaya":
-                result["scientific_status"] = "project-innovation-with-paper-evaluator"
-                result["implementation"] = str(
-                    getattr(algorithm, "implementation", "unknown")
-                )
-                result["reference_doi"] = str(
-                    getattr(algorithm, "reference_doi", "")
-                )
-                result["discrete_reference_doi"] = str(
-                    getattr(algorithm, "discrete_reference_doi", "")
-                )
-                result["reference_alignment"] = str(
-                    getattr(algorithm, "reference_alignment", "")
-                )
             elif algorithm_name == "dcsga":
                 result["implementation"] = "article-aligned-dcsga"
                 result["reference_doi"] = "10.1109/TVT.2025.3540639"
@@ -808,14 +792,12 @@ def run_joint_context_benchmark(
             "dtosc_dynamic_programming_complete": True,
             "dtosc_source_exact_verified": False,
             "article_exact_dtosc": False,
-            "gac_djaya_is_project_innovation": True,
             "article_exact_system": False,
         },
         "warnings": [
             "DTOSC now uses a complete semi-distributed stage-wise dynamic-programming reconstruction; the 2022 source pseudocode is not present in the project, so line-by-line source verification remains explicitly unclaimed.",
             "The V2V channel and sender-side power model remain declared approximations.",
             "The isolated benchmark models one simultaneous application snapshot and does not reproduce the runtime arrival process.",
-            "GAC-DJaya is a project innovation evaluated with the same paper-aligned objective; it is not presented as an exact algorithm from the IEEE article."
         ],
         "context": joint_context_summary(joint_ctx),
         "scenario": scenario,

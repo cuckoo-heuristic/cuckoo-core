@@ -23,7 +23,6 @@ class JointScheme:
 
 SCHEMES: Dict[str, JointScheme] = {
     "dcsga": JointScheme("dcsga", True, True, False, "all"),
-    "gac_djaya": JointScheme("gac_djaya", True, True, False, "all"),
     "dtosc": JointScheme("dtosc", True, True, False, "local_and_rsu"),
     "to_v2i": JointScheme("to_v2i", True, True, True, "rsu_only"),
     "to_wo_c": JointScheme("to_wo_c", True, False, False, "all"),

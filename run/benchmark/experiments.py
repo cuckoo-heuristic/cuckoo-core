@@ -27,7 +27,6 @@ VEHICLE_SPEEDS_KMH = (75, 80, 85, 90, 95, 100, 105)
 MEC_CAPACITIES_GHZ = (30, 40, 50, 60, 70, 80)
 ALGORITHM_LABELS = {
     "dcsga": "DCSGA",
-    "gac_djaya": "GAC-DJaya",
     "dtosc": "DTOSC",
     "to_v2i": "TO-V2I",
     "to_wo_c": "TO-w.o.-C",
@@ -41,19 +40,7 @@ PAPER_FIGURE_ALGORITHMS = {
     "figure_10": ("dcsga", "dtosc"),
 }
 
-# Default run set. Figure 7 always includes the proposed GAC-DJaya beside
-# the five schemes used in the reference article.
-FIGURE_ALGORITHMS = {
-    **PAPER_FIGURE_ALGORITHMS,
-    "figure_7": (
-        "dcsga",
-        "gac_djaya",
-        "dtosc",
-        "to_v2i",
-        "to_wo_c",
-        "to_wo_r",
-    ),
-}
+FIGURE_ALGORITHMS = dict(PAPER_FIGURE_ALGORITHMS)
 
 
 
@@ -907,7 +894,6 @@ def _plot_figure_6(rows: Sequence[Dict[str, Any]],output_base: Path,) -> None:
 
     styles = {
         "dcsga": {"color": "#0072B2", "marker": "o"},
-        "gac_djaya": {"color": "#D55E00", "marker": "s"},
     }
 
     figure, axis = plt.subplots(figsize=(8.0, 5.2))
@@ -1030,11 +1016,6 @@ def _line_panel(axis, rows: Sequence[Dict[str, Any]], metric: str, x_key: str, x
             "color": "#0072B2",
             "marker": "o",
             "linestyle": "-",
-        },
-        "gac_djaya": {
-            "color": "#D55E00",
-            "marker": "s",
-            "linestyle": "--",
         },
         "dtosc": {
             "color": "#009E73",
@@ -1280,7 +1261,6 @@ def _plot_figure_10(
 
     styles = {
         "dcsga": {"color": "#0072B2", "marker": "o"},
-        "gac_djaya": {"color": "#D55E00", "marker": "s"},
         "dtosc": {"color": "#009E73", "marker": "^"},
     }
 

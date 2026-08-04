@@ -65,7 +65,6 @@ class BenchmarkRequestSerializer(serializers.Serializer):
         child=serializers.ChoiceField(
             choices=[
                 "dcsga",
-                "gac_djaya",
                 "dtosc",
                 "to_v2i",
                 "to_wo_c",
@@ -123,7 +122,6 @@ class PaperExperimentRequestSerializer(serializers.Serializer):
         child=serializers.ChoiceField(
             choices=[
                 "dcsga",
-                "gac_djaya",
                 "dtosc",
                 "to_v2i",
                 "to_wo_c",
