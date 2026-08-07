@@ -80,7 +80,12 @@ def _vehicle_position(vehicle: Vehicle, time_step_s: float) -> Tuple[float, floa
     )
 
 
-def _build_snapshot(applications: List[Application], snapshot_at: datetime) -> BenchmarkSnapshot:
+def _build_snapshot(
+    applications: List[Application],
+    snapshot_at: datetime,
+    *,
+    use_live_vehicle_positions: bool = False,
+) -> BenchmarkSnapshot:
     vehicle_rsu_ids = _active_relation_map(snapshot_at)
     rsu_vehicle_counts: Dict[int, int] = {}
     for rsu_id in vehicle_rsu_ids.values():
@@ -96,10 +101,20 @@ def _build_snapshot(applications: List[Application], snapshot_at: datetime) -> B
     missing = sorted(vehicle_ids - set(int(vehicle_id) for vehicle_id in vehicles))
     if missing:
         raise ValueError(f"Vehicles not found for benchmark snapshot: {missing}")
-    positions = {
-        int(vehicle_id): _vehicle_position(vehicle, time_step_s)
-        for vehicle_id, vehicle in vehicles.items()
-    }
+    if use_live_vehicle_positions:
+        # Runtime simulation already advances Vehicle.x_coord/y_coord with the
+        # route-derived speed.  Reconstructing positions here from the paper
+        # seed speed would make the radio snapshot disagree with the active
+        # RSUVehicle relation.  Use the frozen live coordinates instead.
+        positions = {
+            int(vehicle_id): (float(vehicle.x_coord), float(vehicle.y_coord))
+            for vehicle_id, vehicle in vehicles.items()
+        }
+    else:
+        positions = {
+            int(vehicle_id): _vehicle_position(vehicle, time_step_s)
+            for vehicle_id, vehicle in vehicles.items()
+        }
     return BenchmarkSnapshot(
         at=snapshot_at,
         time_step_s=time_step_s,
@@ -138,6 +153,8 @@ def _apply_snapshot_context(
     ctx: Dict[str, Any],
     app: Application,
     snapshot: BenchmarkSnapshot,
+    *,
+    route_remote_mec_via_access_rsu: bool = False,
 ) -> None:
     params = load_params_obj()
     vehicle_id = int(app.vehicle_id_id)
@@ -146,10 +163,34 @@ def _apply_snapshot_context(
     mission_x, mission_y = snapshot.positions[vehicle_id]
     vehicle_height = float(params.h_vehicle)
     rsu_height = float(params.h_rsu)
-    sp_positions = copy.deepcopy(ctx.get("sp_position", {}))
+    compute_sp_positions = copy.deepcopy(ctx.get("sp_position", {}))
+    sp_positions = copy.deepcopy(compute_sp_positions)
+    access_rsu_id = snapshot.vehicle_rsu_ids.get(vehicle_id)
+    access_rsu_provider_id = None
+    access_rsu_position = None
+    if route_remote_mec_via_access_rsu:
+        if access_rsu_id is None:
+            raise ValueError(
+                f"Mission vehicle {vehicle_id} has no access RSU in the paper scenario"
+            )
+        for provider_id, provider_rsu_id in ctx.get("sp_rsu_ids", {}).items():
+            if provider_rsu_id is not None and int(provider_rsu_id) == int(access_rsu_id):
+                access_rsu_provider_id = int(provider_id)
+                break
+        if access_rsu_provider_id is None:
+            raise ValueError(
+                f"Access RSU {access_rsu_id} has no service provider in the paper scenario"
+            )
+        access_rsu_position = compute_sp_positions.get(access_rsu_provider_id)
+        if access_rsu_position is None:
+            raise ValueError(
+                f"Access RSU provider {access_rsu_provider_id} has no position"
+            )
+
     for sp_id in ctx.get("provider_ids", []):
         sp_id = int(sp_id)
-        if ctx.get("sp_types", {}).get(sp_id) == "vehicle":
+        provider_type = ctx.get("sp_types", {}).get(sp_id)
+        if provider_type == "vehicle":
             provider_vehicle_id = ctx.get("sp_vehicle_ids", {}).get(sp_id)
             if provider_vehicle_id is None:
                 raise ValueError(f"Vehicle provider {sp_id} has no vehicle")
@@ -159,9 +200,16 @@ def _apply_snapshot_context(
                     f"Vehicle provider {sp_id} has no benchmark snapshot position"
                 )
             sp_positions[sp_id] = snapshot.positions[provider_vehicle_id]
+        elif provider_type == "rsu" and route_remote_mec_via_access_rsu:
+            # The paper states that a vehicle accesses exactly one RSU.  A task
+            # may still execute on another MEC server through broadband RSU
+            # cooperation.  Therefore every MEC candidate uses the wireless
+            # endpoint of the mission vehicle's access RSU; the MEC provider ID
+            # remains unchanged for CPU, queue and cache accounting.
+            sp_positions[sp_id] = access_rsu_position
+
     distances: Dict[int, float] = {}
     connected_counts: Dict[int, float] = {}
-    access_rsu_id = snapshot.vehicle_rsu_ids.get(vehicle_id)
     alliance_count = float(
         max(snapshot.rsu_vehicle_counts.get(int(access_rsu_id), 0), 1)
         if access_rsu_id is not None
@@ -183,17 +231,30 @@ def _apply_snapshot_context(
             )
         )
         if provider_type == "rsu":
-            rsu_id = ctx.get("sp_rsu_ids", {}).get(sp_id)
-            connected_counts[sp_id] = float(
-                max(snapshot.rsu_vehicle_counts.get(int(rsu_id), 0), 1)
-                if rsu_id is not None
-                else 1
-            )
+            if route_remote_mec_via_access_rsu:
+                # Wireless bandwidth is shared at the access RSU, even when
+                # the selected compute server is a remote MEC reached through
+                # the broadband RSU backhaul.
+                connected_counts[sp_id] = alliance_count
+            else:
+                rsu_id = ctx.get("sp_rsu_ids", {}).get(sp_id)
+                connected_counts[sp_id] = float(
+                    max(snapshot.rsu_vehicle_counts.get(int(rsu_id), 0), 1)
+                    if rsu_id is not None
+                    else 1
+                )
         else:
             connected_counts[sp_id] = alliance_count
     ctx["sp_position"] = sp_positions
     ctx["distance"] = distances
     ctx["v_m"] = connected_counts
+    if route_remote_mec_via_access_rsu:
+        ctx["sp_compute_position"] = compute_sp_positions
+        ctx["access_rsu_id"] = int(access_rsu_id)
+        ctx["access_rsu_provider_id"] = int(access_rsu_provider_id)
+        ctx["paper_access_rsu_routing"] = True
+        ctx["remote_mec_backhaul_model"] = "broadband-zero-added-delay"
+        ctx["remote_mec_backhaul_delay_s"] = 0.0
     ctx["connected_vehicles_count"] = connected_counts
     ctx["cache"] = {
         int(sp_id): set()
@@ -211,6 +272,9 @@ def _apply_snapshot_context(
 def build_benchmark_context(
     application_id: int,
     snapshot: BenchmarkSnapshot | None = None,
+    *,
+    route_remote_mec_via_access_rsu: bool = False,
+    use_live_vehicle_positions: bool = False,
 ) -> dict:
     app = (
         Application.objects.select_related("vehicle_id", "application_type_id")
@@ -219,7 +283,11 @@ def build_benchmark_context(
     if app.vehicle_id_id is None:
         raise ValueError(f"Application {application_id} has no vehicle")
     if snapshot is None:
-        snapshot = _build_snapshot([app], app.start_at)
+        snapshot = _build_snapshot(
+            [app],
+            app.start_at,
+            use_live_vehicle_positions=use_live_vehicle_positions,
+        )
     if app.start_at != snapshot.at:
         raise ValueError(
             f"Application {application_id} does not belong to benchmark snapshot "
@@ -239,7 +307,12 @@ def build_benchmark_context(
             django_cache.set(cache_key, previous_value, timeout=600)
     if not ctx.get("provider_ids"):
         raise ValueError(f"Application {application_id} has no available providers")
-    _apply_snapshot_context(ctx, app, snapshot)
+    _apply_snapshot_context(
+        ctx,
+        app,
+        snapshot,
+        route_remote_mec_via_access_rsu=route_remote_mec_via_access_rsu,
+    )
     return ctx
 
 
@@ -301,7 +374,12 @@ def build_synthetic_benchmark_context(
         raise ValueError(
             f"Synthetic application {application_id} has no available providers"
         )
-    _apply_snapshot_context(ctx, app_ref, snapshot)
+    _apply_snapshot_context(
+        ctx,
+        app_ref,
+        snapshot,
+        route_remote_mec_via_access_rsu=True,
+    )
     return ctx
 
 
@@ -651,6 +729,7 @@ def _assemble_joint_context(
     joint_cpu_cycles: Dict[int, float] = {}
     joint_task_type_ids: Dict[int, int | None] = {}
     joint_service_size_bits: Dict[int, int] = {}
+    joint_source_program_size_bits: Dict[int, int] = {}
     joint_compile_workloads: Dict[int, float] = {}
 
     for joint_task_id, ref in task_refs.items():
@@ -664,6 +743,15 @@ def _assemble_joint_context(
             joint_service_size_bits[int(task_type_id)] = int(
                 app_ctx.get("service_size_bits", {}).get(task_type_id, 0)
             )
+            source_size_bits = int(
+                app_ctx.get("source_program_size_bits", {}).get(task_type_id, 0)
+            )
+            if source_size_bits <= 0:
+                raise ValueError(
+                    "Application context is missing a valid source-program size "
+                    f"for task type {task_type_id}"
+                )
+            joint_source_program_size_bits[int(task_type_id)] = source_size_bits
             joint_compile_workloads[int(task_type_id)] = float(
                 app_ctx.get("compile_workloads", {}).get(task_type_id, 0.0)
             )
@@ -686,6 +774,21 @@ def _assemble_joint_context(
             "sp_cache_capacity",
         ),
         "service_size_bits": joint_service_size_bits,
+        "source_program_size_bits": joint_source_program_size_bits,
+        "source_program_size_model": application_contexts[application_ids[0]].get(
+            "source_program_size_model"
+        ),
+        "source_program_size_ratio": application_contexts[application_ids[0]].get(
+            "source_program_size_ratio"
+        ),
+        "source_program_size_reference_doi": application_contexts[
+            application_ids[0]
+        ].get("source_program_size_reference_doi"),
+        "source_program_size_article_exact": bool(
+            application_contexts[application_ids[0]].get(
+                "source_program_size_article_exact", False
+            )
+        ),
         "compile_workloads": joint_compile_workloads,
         "cpu_cycles": joint_cpu_cycles,
         "task_type_ids": joint_task_type_ids,
@@ -699,7 +802,10 @@ def _assemble_joint_context(
             "article_exact_cpu_allocation": True,
             "article_exact_channel_model": False,
             "article_exact_power_sender_model": False,
-            "dtosc_dynamic_programming_complete": True,
+            "dtosc_provider_path_dynamic_programming": True,
+            "dtosc_cache_knapsack_dynamic_programming": True,
+            "dtosc_legacy_pre_repair_baseline": True,
+            "dtosc_2022_policy_adapted_to_2025_model": False,
             "dtosc_source_exact_verified": False,
             "article_exact_dtosc": False,
         },
@@ -710,15 +816,21 @@ def _assemble_joint_context(
             ),
             (
                 "The physical channel and sender-side transmission-power integration "
-                "remain declared approximations. DTOSC uses the complete project-level "
-                "dynamic-programming reconstruction, while source-exact verification "
-                "remains unclaimed because the 2022 pseudocode is not bundled."
+                "remain declared approximations. DTOSC uses the legacy pre-repair "
+                "stage-wise provider-path dynamic-programming reconstruction with the "
+                "common benchmark evaluator. It is retained as a reproducibility and "
+                "sensitivity baseline and is not claimed to be source-exact DTOSC 2022."
             ),
         ],
     }
 
 
-def build_joint_context(application_ids: Iterable[int]) -> Dict[str, Any]:
+def build_joint_context(
+    application_ids: Iterable[int],
+    *,
+    route_remote_mec_via_access_rsu: bool = False,
+    use_live_vehicle_positions: bool = False,
+) -> Dict[str, Any]:
     application_ids = _unique_ints(application_ids)
     if not application_ids:
         raise ValueError("At least one application_id is required")
@@ -745,11 +857,16 @@ def build_joint_context(application_ids: Iterable[int]) -> Dict[str, Any]:
     snapshot = _build_snapshot(
         [by_id[app_id] for app_id in application_ids],
         snapshot_at,
+        use_live_vehicle_positions=use_live_vehicle_positions,
     )
     application_contexts: Dict[int, Dict[str, Any]] = {}
     for app_id in application_ids:
         app_ctx = copy.deepcopy(
-            build_benchmark_context(app_id, snapshot=snapshot)
+            build_benchmark_context(
+                app_id,
+                snapshot=snapshot,
+                route_remote_mec_via_access_rsu=route_remote_mec_via_access_rsu,
+            )
         )
         app_ctx["application_id"] = int(app_id)
         app_ctx["application_start_at"] = snapshot_at.isoformat()

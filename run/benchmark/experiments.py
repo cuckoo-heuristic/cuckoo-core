@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import random
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +16,7 @@ from dag.models import ApplicationType, Task
 from monarch_pylib.model import transmission
 from object.models import RSU, ServiceProvider, Vehicle
 from parameter.services import load_params_obj
+from resource.models import Resource
 
 from .context import BenchmarkSnapshot, build_synthetic_joint_context
 from .runner import run_joint_context_benchmark
@@ -23,6 +25,8 @@ from .runner import run_joint_context_benchmark
 ARTICLE_DOI = "10.1109/TVT.2025.3540639"
 DEADLINES_MS = (30, 40, 50, 60, 70, 80, 90, 100)
 VEHICLE_COUNTS = (52, 56, 60, 64, 68, 72, 76)
+PAPER_MAX_MISSION_VEHICLES = max(VEHICLE_COUNTS)
+TABLE_III_MIN_SPEED_KMH = 60.0
 VEHICLE_SPEEDS_KMH = (75, 80, 85, 90, 95, 100, 105)
 MEC_CAPACITIES_GHZ = (30, 40, 50, 60, 70, 80)
 ALGORITHM_LABELS = {
@@ -201,14 +205,28 @@ def _stats(values: Sequence[float]) -> Dict[str, float]:
 
 
 def _load_paper_environment() -> Tuple[List[Vehicle], List[RSU], Dict[int, ApplicationType]]:
-    vehicles = list(
-        Vehicle.objects.filter(is_mission=True).order_by("id")
-    )
-    if len(vehicles) < 76:
-        raise ValueError(
-            f"The paper experiments require at least 76 mission vehicles; found {len(vehicles)}"
+    # Database ``is_mission`` is not used to choose the paper mission set.
+    # A vehicle is eligible when it has a vehicle service-provider row; the
+    # actual mission subset is selected per figure (52..76), and all remaining
+    # selected road vehicles stay available as V2V cooperative providers.
+    eligible_vehicle_ids = list(
+        ServiceProvider.objects.filter(
+            type="vehicle",
+            vehicle_id_id__isnull=False,
         )
-    vehicles = vehicles[:76]
+        .order_by("vehicle_id_id")
+        .values_list("vehicle_id_id", flat=True)
+        .distinct()
+    )
+    vehicles = list(
+        Vehicle.objects.filter(id__in=eligible_vehicle_ids).order_by("id")
+    )
+    if len(vehicles) < PAPER_MAX_MISSION_VEHICLES:
+        raise ValueError(
+            "The paper experiments require at least "
+            f"{PAPER_MAX_MISSION_VEHICLES} eligible vehicle service providers; "
+            f"found {len(vehicles)}"
+        )
     rsus = list(RSU.objects.order_by("id")[:5])
     if len(rsus) != 5:
         raise ValueError(f"The paper experiments require 5 RSUs; found {len(rsus)}")
@@ -218,6 +236,29 @@ def _load_paper_environment() -> Tuple[List[Vehicle], List[RSU], Dict[int, Appli
     ).values("vehicle_id_id").distinct().count()
     if local_provider_count != len(vehicles):
         raise ValueError("Every paper vehicle must have one local service provider")
+    vehicle_provider_ids = list(
+        ServiceProvider.objects.filter(
+            type="vehicle",
+            vehicle_id_id__in=[vehicle.id for vehicle in vehicles],
+        )
+        .order_by("id")
+        .values_list("id", flat=True)
+    )
+    if len(vehicle_provider_ids) != len(vehicles):
+        raise ValueError(
+            "Every paper vehicle must have exactly one local service provider"
+        )
+    vehicle_resources = Resource.objects.filter(
+        sp_id_id__in=vehicle_provider_ids
+    )
+    if (
+        vehicle_resources.count() != len(vehicle_provider_ids)
+        or vehicle_resources.values("sp_id_id").distinct().count()
+        != len(vehicle_provider_ids)
+    ):
+        raise ValueError(
+            "Every eligible vehicle service provider must have exactly one resource row"
+        )
     rsu_provider_count = ServiceProvider.objects.filter(
         type="rsu",
         rsu_id_id__in=[rsu.id for rsu in rsus],
@@ -295,10 +336,48 @@ def _nearest_rsu_id(
     return nearest_id
 
 
-def _vehicle_count_for_speed(speed_kmh: float, road_length_m: float) -> int:
+def _vehicle_count_for_speed(
+    speed_kmh: float,
+    road_length_m: float,
+    available_vehicle_count: int | None = None,
+) -> int:
+    """Return the 3GPP speed-density road population.
+
+    The article uses a mean inter-vehicle distance of 2.5 seconds times
+    vehicle speed.  The physical count is therefore derived from speed and
+    road geometry, not hard-coded to the database size.  When a finite
+    database pool is supplied, the result is capped by that available pool.
+    """
     spacing_m = 2.5 * (float(speed_kmh) / 3.6)
-    expected = (4.0 * float(road_length_m)) / spacing_m
-    return max(1, min(76, int(round(expected))))
+    expected = max(1, int(round((4.0 * float(road_length_m)) / spacing_m)))
+    if available_vehicle_count is None:
+        return expected
+    return min(expected, max(1, int(available_vehicle_count)))
+
+
+def _fixed_road_vehicle_count(vehicles: Sequence[Vehicle]) -> int:
+    """Choose a stable paper-compatible road pool for Figures 6, 7, 8, 10.
+
+    The paper publishes mission counts but not a separate total road count.
+    We use every eligible database vehicle up to the maximum physically
+    consistent Table-III density (four 1-km lanes at 60 km/h).  Thus changing
+    the database size requires no code edit, while an unrealistically large
+    database cannot make the road denser than the paper model permits.
+    """
+    road_length_m, _ = _road_geometry(vehicles)
+    physical_cap = _vehicle_count_for_speed(
+        TABLE_III_MIN_SPEED_KMH,
+        road_length_m,
+    )
+    selected_count = min(len(vehicles), physical_cap)
+    if selected_count < PAPER_MAX_MISSION_VEHICLES:
+        raise ValueError(
+            "The paper mission sweep requires at least "
+            f"{PAPER_MAX_MISSION_VEHICLES} road vehicles; "
+            f"only {selected_count} are available after applying the "
+            "Table-III density model"
+        )
+    return int(selected_count)
 
 
 def _road_state(
@@ -483,6 +562,20 @@ def _build_scenario(
         "mean_mec_capacity_ghz": float(mec_capacity_ghz),
         "deadlines_s": [float(value) / 1000.0 for value in DEADLINES_MS],
         "article_speed_density_model": figure == "figure_9",
+        "mission_vehicle_count_article_exact": True,
+        "total_road_vehicle_count_article_exact": False,
+        "road_vehicle_count_model": (
+            "speed-derived-density-capped-by-database-pool"
+            if figure == "figure_9"
+            else "dynamic-database-pool-capped-at-table-iii-maximum-density"
+        ),
+        "vehicle_role_model": (
+            "one active application per selected mission vehicle; all same-RSU "
+            "peer vehicles may provide V2V service, including other mission vehicles"
+        ),
+        "mec_access_path_model": (
+            "vehicle-to-single-access-rsu-then-zero-added-delay-broadband-to-selected-mec"
+        ),
     }
     metadata.update(road_metadata)
     if speed_kmh is not None:
@@ -976,16 +1069,36 @@ def _plot_figure_6(rows: Sequence[Dict[str, Any]],output_base: Path,) -> None:
         ((max_iteration + 4) // 5) * 5,
     )
 
-    # Article-style axes:
-    # x: 5 iterations per major tick
-    # y: 18 to 25 with unit spacing
+    # Keep the paper's five-iteration x spacing.  Preserve the article-like
+    # 18..25 y scale whenever it contains the generated population, but expand
+    # it when necessary so no valid population member is silently clipped.
     axis.set_xlim(-0.5, article_x_max + 0.5)
     axis.set_xticks(list(range(0, article_x_max + 1, 5)))
-    axis.set_ylim(18.0, 29.0)
-    axis.set_yticks([
-        18.0, 19.0, 20.0, 21.0,
-        22.0, 23.0, 24.0, 25.0, 26.0, 27.0, 28.0, 29.0,
-    ])
+
+    population_values = [
+        float(row["total_efficiency"])
+        for row in population_rows
+    ]
+    data_min = min(population_values)
+    data_max = max(population_values)
+    y_lower = (
+        18.0
+        if data_min >= 18.0
+        else float(int(data_min // 1) - 1)
+    )
+    y_upper = (
+        25.0
+        if data_max <= 25.0
+        else float(int(-(-data_max // 1)) + 1)
+    )
+    if y_upper <= y_lower:
+        y_upper = y_lower + 1.0
+    y_span = y_upper - y_lower
+    y_step = 1 if y_span <= 16 else 5 if y_span <= 80 else 10
+    first_tick = int(-(-y_lower // y_step)) * y_step
+    last_tick = int(y_upper // y_step) * y_step
+    axis.set_ylim(y_lower, y_upper)
+    axis.set_yticks(list(range(first_tick, last_tick + 1, y_step)))
 
     axis.set_xlabel("Number of iterations")
     axis.set_ylabel("Total offloading efficiency")
@@ -1224,18 +1337,41 @@ def _plot_figure_9(rows: Sequence[Dict[str, Any]],output_base: Path,) -> None:
             label=ALGORITHM_LABELS.get(algorithm, algorithm),
         )
 
-    # Article-style axes:
-    # x: 75 to 105 km/h, 5 km/h spacing
-    # y: 20 to 25, unit spacing
+    # Keep the paper's 20-25 range when the generated values fit it.
+    # Otherwise expand the axis so no bar is clipped. This changes only
+    # the visualization; benchmark values and algorithm behavior are untouched.
     axis.set_xticks(
         x_values,
         [str(speed) for speed in speeds],
     )
-    axis.set_ylim(20.0, 25.0)
-    axis.set_yticks([
-        20.0, 21.0, 22.0,
-        23.0, 24.0, 25.0,
-    ])
+    plotted_values = [
+        float(row["total_efficiency"])
+        for row in rows
+        if row.get("total_efficiency") is not None
+    ]
+    if plotted_values and not (
+        min(plotted_values) >= 20.0
+        and max(plotted_values) <= 25.0
+    ):
+        data_min = min(plotted_values)
+        data_max = max(plotted_values)
+        data_span = max(0.0, data_max - data_min)
+        padding = max(0.5, data_span * 0.10)
+        y_lower = math.floor(data_min - padding)
+        y_upper = math.ceil(data_max + padding)
+        if y_upper <= y_lower:
+            y_upper = y_lower + 1
+        axis.set_ylim(float(y_lower), float(y_upper))
+        axis.set_yticks([
+            float(value)
+            for value in range(y_lower, y_upper + 1)
+        ])
+    else:
+        axis.set_ylim(20.0, 25.0)
+        axis.set_yticks([
+            20.0, 21.0, 22.0,
+            23.0, 24.0, 25.0,
+        ])
 
     axis.set_xlabel("Speed of vehicles (km/h)")
     axis.set_ylabel("Total offloading efficiency")
@@ -1316,17 +1452,93 @@ def _plot_figure_10(
     efficiency_axis.set_xlim(28.0, 82.0)
     efficiency_axis.set_xticks([30, 40, 50, 60, 70, 80])
 
-    efficiency_axis.set_ylim(0.20, 0.50)
-    efficiency_axis.set_yticks([
-        0.20, 0.25, 0.30, 0.35,
-        0.40, 0.45, 0.50,
-    ])
+    # Preserve the paper-style limits when the data fit them. Otherwise,
+    # expand each Y-axis independently so every efficiency and completion
+    # point remains visible. This is a plotting-only adjustment.
+    efficiency_values = [
+        float(row["avg_efficiency"])
+        for row in rows
+        if row.get("avg_efficiency") is not None
+    ]
+    if efficiency_values and not (
+        min(efficiency_values) >= 0.20
+        and max(efficiency_values) <= 0.50
+    ):
+        efficiency_min = min(efficiency_values)
+        efficiency_max = max(efficiency_values)
+        efficiency_span = max(0.0, efficiency_max - efficiency_min)
+        efficiency_padding = max(0.02, efficiency_span * 0.10)
+        efficiency_lower = max(
+            0.0,
+            math.floor(
+                (efficiency_min - efficiency_padding) / 0.05
+            ) * 0.05,
+        )
+        efficiency_upper = math.ceil(
+            (efficiency_max + efficiency_padding) / 0.05
+        ) * 0.05
+        if efficiency_upper <= efficiency_lower:
+            efficiency_upper = efficiency_lower + 0.05
+        efficiency_axis.set_ylim(
+            efficiency_lower, efficiency_upper
+        )
+        tick_count = int(round(
+            (efficiency_upper - efficiency_lower) / 0.05
+        ))
+        efficiency_axis.set_yticks([
+            round(efficiency_lower + index * 0.05, 10)
+            for index in range(tick_count + 1)
+        ])
+    else:
+        efficiency_axis.set_ylim(0.20, 0.50)
+        efficiency_axis.set_yticks([
+            0.20, 0.25, 0.30, 0.35,
+            0.40, 0.45, 0.50,
+        ])
 
-    completion_axis.set_ylim(0.988, 1.000)
-    completion_axis.set_yticks([
-        0.988, 0.990, 0.992, 0.994,
-        0.996, 0.998, 1.000,
-    ])
+    completion_values = [
+        float(row["completion_rate"])
+        for row in rows
+        if row.get("completion_rate") is not None
+    ]
+    if completion_values and not (
+        min(completion_values) >= 0.988
+        and max(completion_values) <= 1.000
+    ):
+        completion_min = min(completion_values)
+        completion_max = max(completion_values)
+        completion_span = max(0.0, completion_max - completion_min)
+        completion_padding = max(0.005, completion_span * 0.10)
+        completion_lower = max(
+            0.0,
+            math.floor(
+                (completion_min - completion_padding) / 0.02
+            ) * 0.02,
+        )
+        completion_upper = min(
+            1.0,
+            math.ceil(
+                (completion_max + completion_padding) / 0.02
+            ) * 0.02,
+        )
+        if completion_upper <= completion_lower:
+            completion_lower = max(0.0, completion_upper - 0.02)
+        completion_axis.set_ylim(
+            completion_lower, completion_upper
+        )
+        tick_count = int(round(
+            (completion_upper - completion_lower) / 0.02
+        ))
+        completion_axis.set_yticks([
+            round(completion_lower + index * 0.02, 10)
+            for index in range(tick_count + 1)
+        ])
+    else:
+        completion_axis.set_ylim(0.988, 1.000)
+        completion_axis.set_yticks([
+            0.988, 0.990, 0.992, 0.994,
+            0.996, 0.998, 1.000,
+        ])
 
     efficiency_axis.set_xlabel(
         "Computing capacity of MEC servers (GHz)"
@@ -1468,9 +1680,9 @@ def run_paper_experiment(
         raise ValueError("population_size must be at least 2")
     if diagnostic_vehicle_count is not None:
         diagnostic_vehicle_count = int(diagnostic_vehicle_count)
-        if figure != "figure_6":
+        if figure not in {"figure_6", "figure_7"}:
             raise ValueError(
-                "diagnostic_vehicle_count is supported only for figure_6"
+                "diagnostic_vehicle_count is supported only for figure_6 or figure_7"
             )
         if diagnostic_vehicle_count < 2 or diagnostic_vehicle_count > 76:
             raise ValueError(
@@ -1497,6 +1709,8 @@ def run_paper_experiment(
     algorithms = selected_algorithms
     comparison_mode = tuple(algorithms) != tuple(paper_algorithms)
     environment = _load_paper_environment()
+    available_vehicle_count = len(environment[0])
+    fixed_road_vehicle_count = _fixed_road_vehicle_count(environment[0])
     raw_rows: List[Dict[str, Any]] = []
     application_rows: List[Dict[str, Any]] = []
     execution_audit: List[Dict[str, Any]] = []
@@ -1509,7 +1723,7 @@ def run_paper_experiment(
                 figure,
                 seed,
                 mission_vehicle_count=figure_6_vehicle_count,
-                road_vehicle_count=figure_6_vehicle_count,
+                road_vehicle_count=fixed_road_vehicle_count,
                 speed_kmh=None,
                 mec_capacity_ghz=50.0,
                 sweep_parameter="iteration",
@@ -1530,13 +1744,18 @@ def run_paper_experiment(
             scenario_records.append(dict(result["scenario"]))
         summary_rows = _figure_6_summary_rows(raw_rows)
     elif figure == "figure_7":
-        for vehicle_count in VEHICLE_COUNTS:
+        figure_7_vehicle_counts = (
+            (int(diagnostic_vehicle_count),)
+            if diagnostic_vehicle_count is not None
+            else VEHICLE_COUNTS
+        )
+        for vehicle_count in figure_7_vehicle_counts:
             for seed in seeds:
                 joint_ctx = _build_scenario(
                     figure,
                     seed,
                     mission_vehicle_count=vehicle_count,
-                    road_vehicle_count=76,
+                    road_vehicle_count=fixed_road_vehicle_count,
                     speed_kmh=None,
                     mec_capacity_ghz=50.0,
                     sweep_parameter="mission_vehicle_count",
@@ -1569,7 +1788,7 @@ def run_paper_experiment(
                 figure,
                 seed,
                 mission_vehicle_count=68,
-                road_vehicle_count=76,
+                road_vehicle_count=fixed_road_vehicle_count,
                 speed_kmh=None,
                 mec_capacity_ghz=50.0,
                 sweep_parameter="deadline_s",
@@ -1598,7 +1817,11 @@ def run_paper_experiment(
     elif figure == "figure_9":
         road_length_m, _ = _road_geometry(environment[0])
         for speed_kmh in VEHICLE_SPEEDS_KMH:
-            vehicle_count = _vehicle_count_for_speed(speed_kmh, road_length_m)
+            vehicle_count = _vehicle_count_for_speed(
+                speed_kmh,
+                road_length_m,
+                available_vehicle_count=available_vehicle_count,
+            )
             for seed in seeds:
                 joint_ctx = _build_scenario(
                     figure,
@@ -1639,7 +1862,7 @@ def run_paper_experiment(
                     figure,
                     seed,
                     mission_vehicle_count=68,
-                    road_vehicle_count=76,
+                    road_vehicle_count=fixed_road_vehicle_count,
                     speed_kmh=None,
                     mec_capacity_ghz=float(capacity_ghz),
                     sweep_parameter="mec_capacity_ghz",
@@ -1680,12 +1903,16 @@ def run_paper_experiment(
         "population_size_matches_paper": int(
             population_size if population_size is not None else load_params_obj().S
         ) == 50,
+        "dcsga_rank_seed_aligned": True,
+        "dcsga_rank_recomputed_per_run": True,
         "algorithms": list(algorithms),
         "comparison_mode": comparison_mode,
         "diagnostic_mode": bool(
-            figure == "figure_6"
-            and diagnostic_vehicle_count is not None
-            and int(diagnostic_vehicle_count) != 76
+            diagnostic_vehicle_count is not None
+            and (
+                figure == "figure_7"
+                or int(diagnostic_vehicle_count) != 76
+            )
         ),
         "diagnostic_vehicle_count": (
             None
@@ -1710,6 +1937,21 @@ def run_paper_experiment(
                 "Algorithm 2 instead of imposing an unverified arrival model."
             ),
         },
+        "vehicle_pool": {
+            "database_eligible_vehicle_count": int(available_vehicle_count),
+            "fixed_road_vehicle_count": int(fixed_road_vehicle_count),
+            "paper_max_mission_vehicle_count": int(PAPER_MAX_MISSION_VEHICLES),
+            "table_iii_max_density_vehicle_count": int(
+                _vehicle_count_for_speed(
+                    TABLE_III_MIN_SPEED_KMH,
+                    _road_geometry(environment[0])[0],
+                )
+            ),
+            "selection_rule": (
+                "mission count follows each paper figure; remaining selected "
+                "road vehicles are cooperative V2V candidates"
+            ),
+        },
         "article_parameters": {
             "vehicle_counts": list(VEHICLE_COUNTS),
             "deadlines_ms": list(DEADLINES_MS),
@@ -1722,11 +1964,13 @@ def run_paper_experiment(
             "speed_density_rule": "mean inter-vehicle distance equals 2.5 times mean speed in m/s",
         },
         "declared_limitations": [
-            "DTOSC uses a complete semi-distributed stage-wise dynamic-programming reconstruction aligned with the published description; source-exact line-by-line verification is not claimed because the 2022 pseudocode is not bundled with the project.",
+            "DTOSC uses the legacy pre-repair stage-wise provider-path dynamic-programming reconstruction with the common benchmark evaluator. This compatibility baseline is intentionally retained for reproducibility/sensitivity and is not claimed to be source-exact DTOSC 2022.",
             "The channel and sender-side power models remain declared approximations.",
             "Figures 6-10 evaluate one joint scheduling epoch. The article reports 10 applications per second but does not define a reproducible arrival distribution, observation horizon, or whether that rate is per vehicle or system-wide; no unverified arrival process is imposed on the paper figures.",
-            "For Figures 7, 8, and 10, the road vehicle pool is fixed at the available 76 vehicles while the paper-specified mission vehicle count is varied or fixed; the paper does not report a separate total road vehicle count for these figures.",
-            "Figure 9 uses a finite spatial-Poisson realization conditioned on the speed-derived lane vehicle counts because the database contains 76 vehicle records.",
+            "For Figures 6, 7, 8, and 10, the mission count remains exactly paper-specified, while the total road pool is selected dynamically as min(valid database vehicles, the Table-III maximum-density count); the paper does not publish a separate total road count for these figures.",
+            "Mission and cooperative roles are not forced to be disjoint: a mission vehicle may also provide V2V service to a same-RSU peer, consistent with the paper's alliance domain V_n excluding n; the paper does not publish a separate cooperative-only vehicle count.",
+            "Each mission vehicle uses exactly one wireless access RSU. A selected remote MEC is reached through that access RSU and the inter-RSU broadband path adds zero modeled delay/energy because the paper does not publish backhaul parameters.",
+            "Figure 9 uses the article speed-density equation and caps only when the finite database pool is smaller than the derived road population.",
             "The service compile workload Wk is not reported in Table III and is set equal to the corresponding task workload as a declared deterministic assumption.",
             "The available application types use the same seeded ten-task DAG structure with different deadlines, so the DAG diversity of reference [48] is not reproduced.",
         ],

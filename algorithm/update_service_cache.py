@@ -40,11 +40,20 @@ def _remaining_tasks(ctx, remaining_task_ids: Optional[Iterable[int]]) -> List[i
     return list(ctx.get("task_ids", []))
 
 
-def _mu(ctx, task_type_id: int) -> float:
+def _mu(ctx, sp_id: int, task_type_id: int) -> float:
     if not ctx.get("use_caching", True):
         return 0.0
 
-    return float(sum(1 for cached in ctx.get("cache", {}).values() if task_type_id in cached))
+    # In Eq. (40), mu_kj is the number of OTHER service providers
+    # that already cache the same service type. The provider whose
+    # cache is currently being updated must not be counted.
+    return float(
+        sum(
+            1
+            for other_sp_id, cached in ctx.get("cache", {}).items()
+            if int(other_sp_id) != int(sp_id) and task_type_id in cached
+        )
+    )
 
 
 def cache_value(ctx, sp_id: int, task_type_id: int, candidates: Iterable[int], remaining_task_ids: Optional[Iterable[int]] = None) -> float:
@@ -58,7 +67,7 @@ def cache_value(ctx, sp_id: int, task_type_id: int, candidates: Iterable[int], r
     return policy.cache_service_value_score(
         cpu_cycles_list=cpu_cycles_list,
         v_kj_list=v_kj_list,
-        mu_kj=_mu(ctx, task_type_id),
+        mu_kj=_mu(ctx, sp_id, task_type_id),
         denom_cpu_cycles_list=cpu_cycles_list,
         denom_v_kj_list=denom_v_kj_list,
     )

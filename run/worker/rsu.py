@@ -170,7 +170,11 @@ class RSUWorker(threading.Thread):
         applications: List[Application],
     ) -> Dict[str, Any]:
         application_ids = [int(app.id) for app in applications]
-        joint_ctx = build_joint_context(application_ids)
+        joint_ctx = build_joint_context(
+            application_ids,
+            route_remote_mec_via_access_rsu=True,
+            use_live_vehicle_positions=True,
+        )
         mission_vehicle_ids = {
             int(app.vehicle_id_id)
             for app in applications
@@ -255,6 +259,8 @@ class RSUWorker(threading.Thread):
                 int(ServiceProvider.objects.filter(type="vehicle").count())
                 - len(mission_vehicle_ids),
             ),
+            "runtime_position_source": "live_vehicle_coordinates",
+            "runtime_remote_mec_routing": "via_access_rsu_zero_backhaul_delay",
         }
         return joint_ctx
 
@@ -460,6 +466,19 @@ class RSUWorker(threading.Thread):
                     energy=energy_j,
                 )
 
+                # State describes the physical wireless hop.  When a task is
+                # computed on a remote MEC, TaskExecution.sp_id remains that
+                # remote compute provider, while the radio hop terminates at
+                # the mission vehicle's currently accessed RSU.
+                access_rsu_id = app_ctx.get("access_rsu_id")
+                state_rsu_id = None
+                if provider.rsu_id_id:
+                    state_rsu_id = int(
+                        access_rsu_id
+                        if access_rsu_id is not None
+                        else provider.rsu_id_id
+                    )
+
                 State.objects.create(
                     time_step=int(time_step),
                     task_execution_id=task_execution,
@@ -469,14 +488,24 @@ class RSUWorker(threading.Thread):
                         if provider.vehicle_id_id
                         else None
                     ),
-                    to_rsu_id=(
-                        provider.rsu_id
-                        if provider.rsu_id_id
-                        else None
-                    ),
+                    to_rsu_id_id=state_rsu_id,
                     gain=gain_value,
                     distance=distance_value,
                     rate=rate_value,
+                    initial_snapshot={
+                        "compute_provider_id": int(provider_id),
+                        "compute_rsu_id": (
+                            int(provider.rsu_id_id)
+                            if provider.rsu_id_id
+                            else None
+                        ),
+                        "wireless_access_rsu_id": state_rsu_id,
+                        "remote_mec_via_access_rsu": bool(
+                            provider.rsu_id_id
+                            and state_rsu_id is not None
+                            and int(provider.rsu_id_id) != int(state_rsu_id)
+                        ),
+                    },
                 )
 
                 cpu_increments[provider_id] += int(

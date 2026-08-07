@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import math
 import random
 from dataclasses import dataclass, field
-from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 from parameter.services import load_params_obj
+from algorithm.main_dcsga import compute_local_ranks
+from algorithm.dcsga_core import mutate_provider_map, run_population_search
 
 from .evaluator import (
     JointEvaluation,
@@ -26,9 +26,10 @@ from .schemes import (
 class _SearchStaticCache:
     """Per-run immutable lookup cache for search-only structural data.
 
-    The cached values are derived exclusively from the already-built joint
-    scenario.  They do not depend on the random seed, the current nest, cache
-    contents, queues, or any mutable scheduling state.
+    The cached values are derived from the seeded joint scenario before the
+    first nest is generated. They remain fixed during one run and do not
+    depend on the current nest, cache contents, queues, or other mutable
+    scheduling state.
     """
 
     ranked_task_ids: Tuple[int, ...]
@@ -81,6 +82,87 @@ def _prepare_joint_context_seed(
         app_ctx.pop("_t_loc_s_cache", None)
         app_ctx.pop("_e_loc_j_cache", None)
         app_ctx.pop("_t_ref_s_cache", None)
+
+
+def _seed_aligned_dcsga_ranked_task_ids(
+    joint_ctx: Dict[str, Any],
+) -> Tuple[int, ...]:
+    """Recompute DCSGA ranks after installing the benchmark run seed.
+
+    The former paper-benchmark path calculated DCSGA ranks while building the
+    joint context, before a run seed existed. Rank calculation uses stochastic
+    channel rates, whereas nest fitness was later evaluated with the requested
+    seed. DTOSC already installs its seed before calculating its own ranks.
+
+    DCSGA searches provider assignments only; it cannot repair a stale task
+    order. This helper puts ranking, greedy initialization, Levy search and
+    final fitness on the same channel realization.
+    """
+
+    max_deadline_s = max(
+        float(joint_ctx["applications"][int(app_id)]["deadline_s"])
+        for app_id in joint_ctx["application_ids"]
+    )
+    ranked_rows: List[Tuple[int, float]] = []
+
+    for app_id in joint_ctx["application_ids"]:
+        app_id = int(app_id)
+        app_ctx = joint_ctx["applications"][app_id]
+        local_ranks = compute_local_ranks(app_ctx)
+        urgency = max_deadline_s - float(app_ctx["deadline_s"])
+
+        for joint_task_id, ref in joint_ctx["task_refs"].items():
+            if int(ref.application_id) != app_id or bool(ref.is_entry):
+                continue
+            original_task_id = int(ref.task_id)
+            ranked_rows.append(
+                (
+                    int(joint_task_id),
+                    float(local_ranks[original_task_id]) + urgency,
+                )
+            )
+
+    ranked_task_ids = tuple(
+        int(joint_task_id)
+        for joint_task_id, _rank in sorted(
+            ranked_rows,
+            key=lambda row: (-row[1], row[0]),
+        )
+    )
+
+    expected = {int(value) for value in joint_ctx["optimized_task_ids"]}
+    actual = set(ranked_task_ids)
+    if actual != expected or len(ranked_task_ids) != len(expected):
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        raise RuntimeError(
+            f"DCSGA seeded rank order mismatch; missing={missing}, extra={extra}"
+        )
+
+    positions = {task_id: index for index, task_id in enumerate(ranked_task_ids)}
+    reverse_refs = joint_ctx["reverse_task_refs"]
+    for app_id in joint_ctx["application_ids"]:
+        app_id = int(app_id)
+        app_ctx = joint_ctx["applications"][app_id]
+        entry_task_id = int(app_ctx["entry_task_id"])
+        for child_id, predecessors in app_ctx.get("dependencies", {}).items():
+            child_id = int(child_id)
+            if child_id == entry_task_id:
+                continue
+            child_joint = int(reverse_refs[(app_id, child_id)])
+            for predecessor_id in predecessors:
+                predecessor_id = int(predecessor_id)
+                if predecessor_id == entry_task_id:
+                    continue
+                predecessor_joint = int(reverse_refs[(app_id, predecessor_id)])
+                if positions[predecessor_joint] >= positions[child_joint]:
+                    raise ValueError(
+                        "Seed-aligned DCSGA ranking produced a dependency-invalid "
+                        f"order: application={app_id}, predecessor={predecessor_id}, "
+                        f"child={child_id}"
+                    )
+
+    return ranked_task_ids
 
 
 def task_order_for_scheme(
@@ -290,76 +372,6 @@ def greedy_initial_population(
     return [nest for nest, _quality in solutions]
 
 
-@lru_cache(maxsize=16)
-def _levy_sigma(beta: float) -> float:
-    beta = float(beta)
-    return (
-        math.gamma(1.0 + beta)
-        * math.sin(math.pi * beta / 2.0)
-        / (
-            math.gamma((1.0 + beta) / 2.0)
-            * beta
-            * (2.0 ** ((beta - 1.0) / 2.0))
-        )
-    ) ** (1.0 / beta)
-
-
-def _levy(beta: float, rng: random.Random) -> float:
-    sigma = _levy_sigma(float(beta))
-    u = rng.gauss(0.0, sigma)
-    v = rng.gauss(0.0, 1.0)
-    return u / (abs(v) ** (1.0 / beta))
-
-
-def _normalized_levy(beta: float, rng: random.Random) -> float:
-    value = abs(_levy(beta, rng))
-    return value / (1.0 + value)
-
-
-def _random_provider_same_mode(
-    joint_ctx: Dict[str, Any],
-    joint_task_id: int,
-    current_provider: int,
-    target_mode: str,
-    scheme: JointScheme,
-    rng: random.Random,
-    search_cache: _SearchStaticCache | None = None,
-) -> int:
-    domain = _domain(
-        joint_ctx,
-        joint_task_id,
-        scheme,
-        search_cache,
-    )
-    candidates = [
-        provider_id
-        for provider_id in domain
-        if provider_id != current_provider
-        and _mode_for_task(
-            joint_ctx,
-            joint_task_id,
-            provider_id,
-            search_cache,
-        ) == target_mode
-    ]
-    if not candidates:
-        candidates = [
-            provider_id
-            for provider_id in domain
-            if _mode_for_task(
-                joint_ctx,
-                joint_task_id,
-                provider_id,
-                search_cache,
-            ) == target_mode
-        ]
-    if not candidates:
-        candidates = [provider_id for provider_id in domain if provider_id != current_provider]
-    if not candidates:
-        return int(current_provider)
-    return int(rng.choice(candidates))
-
-
 def generate_new_solution(
     joint_ctx: Dict[str, Any],
     source_nest: Sequence[NestItem],
@@ -370,6 +382,7 @@ def generate_new_solution(
     rng: random.Random,
     search_cache: _SearchStaticCache | None = None,
 ) -> List[NestItem]:
+    """Joint-benchmark adapter for the shared canonical Procedure 3 kernel."""
     task_order = [int(task_id) for task_id, _provider_id, _rank in source_nest]
     source = {
         int(task_id): int(provider_id)
@@ -383,101 +396,32 @@ def generate_new_solution(
         if best_nest is not None
         else None
     )
-    new_map = dict(source)
-    I = len(task_order)
-    if I == 0:
-        return []
 
-    if best is None:
-        hamming = I
-    else:
-        hamming = sum(1 for task_id in task_order if source[task_id] != best[task_id])
-
-    if hamming <= 0:
-        length = 0
-    else:
-        length = round(2 * hamming * _normalized_levy(levy_lambda, rng))
-        length = max(0, min(int(length), 2 * I))
-
-    quotient, remainder = divmod(length, 2)
-    transformed: set[int] = set()
-
-    if best is not None and hamming != I:
-        different = [
-            task_id for task_id in task_order if new_map[task_id] != best[task_id]
-        ]
-        if quotient and different:
-            selected = rng.sample(different, min(quotient, len(different)))
-            for task_id in selected:
-                new_map[task_id] = best[task_id]
-                transformed.add(task_id)
-
-        if remainder:
-            remaining = [
-                task_id
-                for task_id in different
-                if task_id not in transformed and new_map[task_id] != best[task_id]
-            ]
-            if remaining:
-                task_id = rng.choice(remaining)
-                target_mode = _mode_for_task(
-                    joint_ctx,
-                    task_id,
-                    best[task_id],
-                    search_cache,
-                )
-                new_map[task_id] = _random_provider_same_mode(
-                    joint_ctx,
-                    task_id,
-                    new_map[task_id],
-                    target_mode,
-                    scheme,
-                    rng,
-                    search_cache,
-                )
-    else:
-        if quotient:
-            selected = rng.sample(task_order, min(quotient, len(task_order)))
-            for task_id in selected:
-                new_map[task_id] = int(
-                    rng.choice(
-                        _domain(
-                            joint_ctx,
-                            task_id,
-                            scheme,
-                            search_cache,
-                        )
-                    )
-                )
-                transformed.add(task_id)
-
-        if remainder:
-            remaining = [task_id for task_id in task_order if task_id not in transformed]
-            if remaining:
-                task_id = rng.choice(remaining)
-                current_mode = _mode_for_task(
-                    joint_ctx,
-                    task_id,
-                    new_map[task_id],
-                    search_cache,
-                )
-                new_map[task_id] = _random_provider_same_mode(
-                    joint_ctx,
-                    task_id,
-                    new_map[task_id],
-                    current_mode,
-                    scheme,
-                    rng,
-                    search_cache,
-                )
-
+    provider_map = mutate_provider_map(
+        task_order,
+        source,
+        best,
+        levy_lambda=float(levy_lambda),
+        rng=rng,
+        domain_for_task=lambda task_id: _domain(
+            joint_ctx,
+            int(task_id),
+            scheme,
+            search_cache,
+        ),
+        mode_for_task_provider=lambda task_id, provider_id: _mode_for_task(
+            joint_ctx,
+            int(task_id),
+            int(provider_id),
+            search_cache,
+        ),
+    )
     return _rebuild_nest(
         joint_ctx,
         task_order,
-        new_map,
+        provider_map,
         search_cache,
     )
-
 
 def _evaluate_population(
     joint_ctx: Dict[str, Any],
@@ -550,6 +494,12 @@ def run_joint_dcsga(
 ) -> Tuple[List[NestItem], JointEvaluation, List[Dict[str, Any]]]:
     _prepare_joint_context_seed(joint_ctx, seed)
     scheme = get_joint_scheme(algorithm)
+    if scheme.use_ranking:
+        joint_ctx["ranked_task_ids"] = list(
+            _seed_aligned_dcsga_ranked_task_ids(joint_ctx)
+        )
+        joint_ctx["dcsga_rank_seed"] = int(seed)
+        joint_ctx["dcsga_rank_seed_aligned"] = True
     search_cache = _build_search_static_cache(joint_ctx)
     if scheme.name == "dtosc":
         raise ValueError("DTOSC must be executed with run_joint_dtosc")
@@ -561,7 +511,6 @@ def run_joint_dcsga(
     tmax = max(1, int(tmax))
     rng = random.Random(int(seed))
     levy_lambda = float(params.levy_lambda)
-    discard_probability = float(params.p_discard_init)
     task_order = task_order_for_scheme(
         joint_ctx,
         scheme,
@@ -569,7 +518,7 @@ def run_joint_dcsga(
     )
 
     evaluation_memo: Dict[Tuple[int, ...], float] = {}
-    population = greedy_initial_population(
+    initial_population = greedy_initial_population(
         joint_ctx,
         scheme=scheme,
         population_size=S,
@@ -577,104 +526,51 @@ def run_joint_dcsga(
         search_cache=search_cache,
         evaluation_memo=evaluation_memo,
     )
-    evaluated = _evaluate_population(
-        joint_ctx,
-        population,
-        task_order=task_order,
-        scheme=scheme,
-        memo=evaluation_memo,
-    )
-    population = [row[0] for row in evaluated[:S]]
-    best_nest = population[0]
-    history: List[Dict[str, Any]] = [
-        _history_row(
-            0,
-            evaluated[:S],
-            function_evaluations=len(evaluation_memo),
-        )
-    ]
+    history: List[Dict[str, Any]] = []
 
-    t = 1
-    while t < tmax:
-        new_population: List[List[NestItem]] = [best_nest]
-        for index in range(1, S):
-            new_population.append(
-                generate_new_solution(
-                    joint_ctx,
-                    population[index],
-                    best_nest,
-                    scheme=scheme,
-                    levy_lambda=levy_lambda,
-                    rng=rng,
-                    search_cache=search_cache,
-                )
-            )
-
-        random_cuckoo = rng.choice(new_population)
-        random_walk = [
-            generate_new_solution(
-                joint_ctx,
-                random_cuckoo,
-                None,
-                scheme=scheme,
-                levy_lambda=levy_lambda,
-                rng=rng,
-                search_cache=search_cache,
-            )
-            for _ in range(S)
-        ]
-
-        evaluated = _evaluate_population(
+    def evaluate_population(population):
+        return _evaluate_population(
             joint_ctx,
-            new_population + random_walk,
+            population,
             task_order=task_order,
             scheme=scheme,
             memo=evaluation_memo,
         )
 
-        discard_probability = min(
-            1.0,
-            (2.0 * discard_probability) / max(t, 1),
+    def generate(source_nest, best_nest):
+        return generate_new_solution(
+            joint_ctx,
+            source_nest,
+            best_nest,
+            scheme=scheme,
+            levy_lambda=levy_lambda,
+            rng=rng,
+            search_cache=search_cache,
         )
 
-        if rng.random() <= discard_probability:
-            worst_nest = evaluated[-1][0]
-            worst_walk = [
-                generate_new_solution(
-                    joint_ctx,
-                    worst_nest,
-                    None,
-                    scheme=scheme,
-                    levy_lambda=levy_lambda,
-                    rng=rng,
-                    search_cache=search_cache,
-                )
-                for _ in range(S)
-            ]
-            evaluated = _evaluate_population(
-                joint_ctx,
-                [row[0] for row in evaluated[:-1]] + worst_walk,
-                task_order=task_order,
-                scheme=scheme,
-                memo=evaluation_memo,
-            )
-
-        evaluated = evaluated[:S]
-        population = [row[0] for row in evaluated]
-        best_nest = population[0]
+    def record_history(iteration, evaluated):
         history.append(
             _history_row(
-                t,
+                iteration,
                 evaluated,
                 function_evaluations=len(evaluation_memo),
             )
         )
-        t += 1
+
+    _population, best_nest, _evaluated = run_population_search(
+        initial_population,
+        population_size=S,
+        tmax=tmax,
+        initial_discard_probability=float(params.p_discard_init),
+        rng=rng,
+        generate_new_solution=generate,
+        evaluate_population=evaluate_population,
+        on_iteration=record_history,
+    )
 
     # Materialize the full, externally visible result exactly once for the
-    # final winner.  CSV/JSON/XLSX rows, cache state, schedule rows, delays,
-    # energies and completion metrics still come from the unchanged full
-    # evaluator.
+    # final winner. CSV/JSON/XLSX rows, cache state, schedule rows, delays,
+    # energies and completion metrics still come from the unchanged evaluator.
     best_evaluation = evaluate_joint_nest(
         joint_ctx,
         best_nest,
@@ -683,6 +579,7 @@ def run_joint_dcsga(
         v2i_only=scheme.v2i_only,
     )
     return best_nest, best_evaluation, history
+
 
 @dataclass
 class _JointDTOSCDPNode:

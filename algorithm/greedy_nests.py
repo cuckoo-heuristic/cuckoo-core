@@ -269,9 +269,26 @@ def _service_program_energy(ctx, sp_id: int, task_id: int) -> float:
     if ctx.get("use_caching", True) and task_type in ctx.get("cache", {}).get(sp_id, set()):
         return 0.0
 
-    size_bits = float(ctx.get("service_size_bits", {}).get(task_type, 0.0))
+    # Source-program size is derived once by the context builder and shared by
+    # runtime and benchmark.  Do not fall back to L_k here: doing so would make
+    # cache-miss transfer energy depend on which execution path built the ctx.
+    source_program_sizes = ctx.get("source_program_size_bits")
+    if source_program_sizes is None:
+        raise ValueError(
+            "Context is missing source_program_size_bits; rebuild it with "
+            "MiniSystemContextBuilder"
+        )
+
+    if task_type not in source_program_sizes:
+        raise ValueError(
+            f"No source-program size is defined for task type {task_type}"
+        )
+
+    size_bits = float(source_program_sizes[task_type])
     if size_bits <= 0.0:
-        return 0.0
+        raise ValueError(
+            f"Source-program size must be positive for task type {task_type}"
+        )
 
     service_energy_cache = ctx.setdefault("_service_program_energy_cache", {})
     cache_key = (int(sp_id), int(task_type), size_bits)

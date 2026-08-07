@@ -17,6 +17,7 @@ from .greedy_nests import (
     link_rate,
 )
 from .procedure3_generate_new_solution import procedure3_generate_new_solution
+from .dcsga_core import run_population_search
 from . import greedy_nests as greedy_nests_module
 from . import low_complexity as low_complexity_module
 from . import procedure3_generate_new_solution as procedure3_module
@@ -303,63 +304,40 @@ def dcsga_run(ctx):
 
     tmax = int(ctx.get("tmax", 10))
     S = int(params.S)
-    Pa = float(params.p_discard_init)
-
     ctx["rates"] = {sp_id: rate(ctx, sp_id) for sp_id in _providers(ctx)}
     task_order = dcsga_compute_ranks_and_order(ctx)
-    population = procedure1_greedy_initialization(S=S, task_order=task_order, ctx=ctx)
+    initial_population = procedure1_greedy_initialization(
+        S=S,
+        task_order=task_order,
+        ctx=ctx,
+    )
     _raise_if_cancelled(ctx)
     evaluation_cache = {}
 
-    population, quality, caches = sort_population(ctx, population, task_order, evaluation_cache)
+    def evaluate_population(population):
+        ranked, qualities, _caches = sort_population(
+            ctx,
+            list(population),
+            task_order,
+            evaluation_cache,
+        )
+        return list(zip(ranked, qualities))
 
-    t = 1
-    X_best = population[0]
+    def generate(source_nest, best_nest):
+        return procedure3_generate_new_solution(
+            source_nest,
+            best_nest,
+            copy.deepcopy(ctx),
+        )
 
-    while t < tmax:
-        _raise_if_cancelled(ctx)
-        new_population = [X_best]
-
-        for s in range(1, S):
-            _raise_if_cancelled(ctx)
-            X_new = procedure3_generate_new_solution(population[s], X_best, copy.deepcopy(ctx))
-            new_population.append(X_new)
-
-        random_cuckoo = random.choice(new_population)
-        random_walk = []
-        for _ in range(S):
-            _raise_if_cancelled(ctx)
-            random_walk.append(
-                procedure3_generate_new_solution(
-                    random_cuckoo,
-                    None,
-                    copy.deepcopy(ctx),
-                )
-            )
-        combined = new_population + random_walk
-
-        combined, combined_q, combined_caches = sort_population(ctx, combined, task_order, evaluation_cache)
-        Pa = min(1.0, (2.0 * Pa) / max(t, 1))
-
-        if random.random() <= Pa:
-            worst = combined[-1]
-            worst_walk = []
-            for _ in range(S):
-                _raise_if_cancelled(ctx)
-                worst_walk.append(
-                    procedure3_generate_new_solution(
-                        worst,
-                        None,
-                        copy.deepcopy(ctx),
-                    )
-                )
-            combined = combined[:-1] + worst_walk
-            combined, combined_q, combined_caches = sort_population(ctx, combined, task_order, evaluation_cache)
-
-        population = combined[:S]
-        quality = combined_q[:S]
-        caches = combined_caches[:S]
-        X_best = population[0]
-        t += 1
-
-    return _materialize_solution(ctx, population[0], task_order)
+    _population, best_nest, _evaluated = run_population_search(
+        initial_population,
+        population_size=S,
+        tmax=tmax,
+        initial_discard_probability=float(params.p_discard_init),
+        rng=random,
+        generate_new_solution=generate,
+        evaluate_population=evaluate_population,
+        cancel_check=lambda: _raise_if_cancelled(ctx),
+    )
+    return _materialize_solution(ctx, best_nest, task_order)

@@ -10,6 +10,15 @@ from parameter.services import load_params_for_lib, load_params_obj
 from monarch_pylib.model.transmission import distance_3d
 
 
+# The 2025 paper does not publish a separate numerical source-program size.
+# Keep L_k (cached service-environment size) untouched and derive the source
+# program size once, centrally, from the DTOSC-2022 reported ranges
+# (50..100 Mb source versus 500..1000 Mb cached environment).  Every runtime
+# and benchmark consumer must read ``source_program_size_bits`` from context.
+SOURCE_PROGRAM_TO_ENVIRONMENT_RATIO = 0.1
+SOURCE_PROGRAM_SIZE_REFERENCE_DOI = "10.1109/TVT.2022.3196544"
+
+
 class MiniSystemContextBuilder:
     def __init__(self, application_id: int):
         self.application_id = int(application_id)
@@ -86,6 +95,7 @@ class MiniSystemContextBuilder:
         task_type_size_bits = {}
         service_size_bits = {}
         service_size_bytes = {}
+        source_program_size_bits = {}
 
         for task in tasks:
             task_id = int(task.id)
@@ -122,9 +132,14 @@ class MiniSystemContextBuilder:
             task_type_ids[task_id] = task_type_id
             task_indexes[task_id] = str(task.index or "")
             task_output_size_bits[task_id] = output_bits
-            task_type_size_bits[task_type_id] = service_bytes * 8
-            service_size_bits[task_type_id] = service_bytes * 8
+            service_bits = service_bytes * 8
+            task_type_size_bits[task_type_id] = service_bits
+            service_size_bits[task_type_id] = service_bits
             service_size_bytes[task_type_id] = service_bytes
+            source_program_size_bits[task_type_id] = max(
+                1,
+                int(round(service_bits * SOURCE_PROGRAM_TO_ENVIRONMENT_RATIO)),
+            )
 
         dependencies = defaultdict(list)
         children = defaultdict(list)
@@ -225,6 +240,17 @@ class MiniSystemContextBuilder:
         self.ctx["task_output_size_bits"] = task_output_size_bits
         self.ctx["service_size_bits"] = service_size_bits
         self.ctx["service_size_bytes"] = service_size_bytes
+        self.ctx["source_program_size_bits"] = source_program_size_bits
+        self.ctx["source_program_size_model"] = (
+            "dtosc-2022-ratio-0.1-context-derived"
+        )
+        self.ctx["source_program_size_ratio"] = (
+            SOURCE_PROGRAM_TO_ENVIRONMENT_RATIO
+        )
+        self.ctx["source_program_size_reference_doi"] = (
+            SOURCE_PROGRAM_SIZE_REFERENCE_DOI
+        )
+        self.ctx["source_program_size_article_exact"] = False
         self.ctx["dependencies"] = dict(dependencies)
         self.ctx["children"] = dict(children)
         self.ctx["task_dependencies"] = task_dependencies

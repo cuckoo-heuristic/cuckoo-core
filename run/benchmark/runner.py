@@ -32,6 +32,64 @@ from .models import (
 ALGORITHMS = JOINT_BENCHMARK_ALGORITHMS
 
 
+def _apply_paper_source_program_model(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate the centrally derived source-program sizes in a context.
+
+    Source-program size is created by ``MiniSystemContextBuilder``.  The
+    benchmark must consume that exact field rather than deriving a second,
+    benchmark-only value.
+    """
+
+    service_sizes = {
+        int(task_type_id): int(size_bits)
+        for task_type_id, size_bits in ctx.get("service_size_bits", {}).items()
+    }
+    explicit = ctx.get("source_program_size_bits")
+    if explicit is None:
+        raise ValueError(
+            "Context is missing source_program_size_bits. Rebuild the context "
+            "with MiniSystemContextBuilder so runtime and benchmark use the "
+            "same source-program sizes."
+        )
+
+    source_sizes = {
+        int(task_type_id): int(size_bits)
+        for task_type_id, size_bits in explicit.items()
+    }
+
+    missing = sorted(set(service_sizes) - set(source_sizes))
+    if missing:
+        raise ValueError(
+            "Context source-program sizes are missing task types: "
+            f"{missing}"
+        )
+
+    invalid = sorted(
+        task_type_id
+        for task_type_id in service_sizes
+        if source_sizes.get(task_type_id, 0) <= 0
+    )
+    if invalid:
+        raise ValueError(
+            "Context source-program sizes must be positive for task types: "
+            f"{invalid}"
+        )
+
+    ctx["source_program_size_bits"] = source_sizes
+    return ctx
+
+
+def _apply_joint_paper_source_program_model(
+    joint_ctx: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Validate one shared source-size definition in joint/per-app contexts."""
+
+    for app_ctx in joint_ctx.get("applications", {}).values():
+        _apply_paper_source_program_model(app_ctx)
+
+    _apply_paper_source_program_model(joint_ctx)
+    return joint_ctx
+
 def _unique_ints(values: Iterable[int]) -> List[int]:
     return list(dict.fromkeys(int(value) for value in values))
 
@@ -629,6 +687,7 @@ def run_benchmark(
         app_id: build_benchmark_context(app_id) for app_id in application_ids
     }
     for ctx in base_contexts.values():
+        _apply_paper_source_program_model(ctx)
         ctx["tmax"] = max(1, int(tmax))
 
     runs: List[AlgorithmResult] = []
@@ -673,6 +732,9 @@ def run_joint_context_benchmark(
     population_size: int | None = None,
     export_artifacts: bool = True,
 ) -> Dict[str, Any]:
+    # Work on an isolated copy. Worker/simulation execution is separate from
+    # this paper-benchmark runner and does not pass through this adaptation.
+    joint_ctx = _apply_joint_paper_source_program_model(copy.deepcopy(joint_ctx))
     application_ids = _unique_ints(joint_ctx.get("application_ids", []))
     algorithm_names = _unique_names(algorithms or PAPER_ALGORITHM_NAMES)
     seed_values = _unique_ints(seeds or [1])
@@ -731,11 +793,7 @@ def run_joint_context_benchmark(
             result["schedule"] = evaluation.schedule
             result["cache_state"] = _json_cache(evaluation.cache_state)
             result["algorithm_article_exact"] = bool(
-                getattr(
-                    algorithm,
-                    "article_exact",
-                    algorithm_name != "dtosc",
-                )
+                getattr(algorithm, "article_exact", False)
             )
             result["algorithm_complete"] = bool(
                 getattr(algorithm, "algorithm_complete", True)
@@ -752,6 +810,12 @@ def run_joint_context_benchmark(
                 result["dynamic_programming_complete"] = bool(
                     getattr(algorithm, "dynamic_programming_complete", False)
                 )
+                result["dynamic_programming_scope"] = str(
+                    getattr(algorithm, "dynamic_programming_scope", "")
+                )
+                result["exit_policy"] = str(
+                    getattr(algorithm, "exit_policy", "")
+                )
                 result["source_exact_verified"] = bool(
                     getattr(algorithm, "source_exact_verified", False)
                 )
@@ -761,6 +825,8 @@ def run_joint_context_benchmark(
             elif algorithm_name == "dcsga":
                 result["implementation"] = "article-aligned-dcsga"
                 result["reference_doi"] = "10.1109/TVT.2025.3540639"
+                result["rank_seed_aligned"] = True
+                result["rank_seed"] = int(seed)
             else:
                 result["implementation"] = "article-aligned-ablation"
                 result["reference_doi"] = "10.1109/TVT.2025.3540639"
@@ -787,17 +853,32 @@ def run_joint_context_benchmark(
             "article_exact_cpu_allocation": True,
             "article_exact_power_sender_model": False,
             "article_cache_update_persistence_timing": True,
+            "source_program_separated_from_cache_environment": True,
+            "source_program_size_article_exact": False,
+            "source_program_size_model": joint_ctx.get(
+                "source_program_size_model"
+            ),
+            "source_program_size_ratio": joint_ctx.get(
+                "source_program_size_ratio"
+            ),
+            "source_program_size_reference_doi": joint_ctx.get(
+                "source_program_size_reference_doi"
+            ),
             "article_vehicle_speed_parameterization": speed_density_exact,
             "article_application_arrival_rate": False,
-            "dtosc_dynamic_programming_complete": True,
+            "dtosc_provider_path_dynamic_programming": True,
+            "dtosc_cache_knapsack_dynamic_programming": True,
+            "dtosc_legacy_pre_repair_baseline": True,
+            "dtosc_2022_policy_adapted_to_2025_model": False,
             "dtosc_source_exact_verified": False,
             "article_exact_dtosc": False,
             "article_exact_system": False,
         },
         "warnings": [
-            "DTOSC now uses a complete semi-distributed stage-wise dynamic-programming reconstruction; the 2022 source pseudocode is not present in the project, so line-by-line source verification remains explicitly unclaimed.",
+            "DTOSC uses the legacy pre-repair stage-wise provider-path dynamic-programming reconstruction. It is retained for reproducibility/sensitivity and is not claimed to be source-exact DTOSC 2022.",
+            "The 2025 paper does not report a separate numerical source-program size. A single context-level source size is therefore derived as 0.1 * L_k from the DTOSC-2022 reported ranges and is shared by runtime and benchmark; cache capacity still uses L_k and compile/install work still uses W_k.",
             "The V2V channel and sender-side power model remain declared approximations.",
-            "The isolated benchmark models one simultaneous application snapshot and does not reproduce the runtime arrival process.",
+            "The 2025 paper reports 10 applications/s but does not specify how temporal arrivals are integrated into Figures 6-10; this static joint benchmark therefore does not invent an arrival process.",
         ],
         "context": joint_context_summary(joint_ctx),
         "scenario": scenario,

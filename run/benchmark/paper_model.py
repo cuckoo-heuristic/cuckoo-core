@@ -1,28 +1,20 @@
-"""Pure mathematical helpers for the paper's VEFC model.
+"""Active mathematical helpers used by the paper benchmark.
 
-This module is intentionally isolated from Django, workers, and the current
-benchmark runner.  It implements only equations that are explicitly stated in
-Shen et al., *Cuckoo Search-Enabled Task Scheduling and Cache Updating in
-Vehicular Edge-Fog Computing*.
-
-Implemented:
-- Table III application weights: alpha_n = 0.01 / T_ddl + 0.6, beta_n = 1-alpha_n
-- Equations (22)-(25): reference local time/energy and offloading efficiency
+This module is intentionally isolated from Django and contains only the paper
+model equations that are consumed by the benchmark execution path:
+- Table III application weights
+- Equations (22)-(25): local reference time/energy and offloading efficiency
 - Equation (30): CPU-frequency allocation for vehicle SPs; MEC uses f_max
-- Equations (32)-(34) and Algorithm 1: transmission-power bisection
-- Table III V2I pathloss expression and sender-side power limits
 
-Not implemented here:
-- WINNER+B1 V2V pathloss details (the article refers to an external source)
-- stochastic shadowing/Rayleigh samples
-- scheduling, cache updates, or any database mutation
+Transmission-power/channel calculations are owned by the algorithm/library
+execution path and are intentionally not duplicated here.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from math import isfinite, log, log10, log2
+from math import isfinite
 from typing import Iterable
 
 
@@ -48,11 +40,6 @@ class LocalReference:
     e_local_j: float
 
 
-@dataclass(frozen=True)
-class PowerSearchResult:
-    power_w: float
-    iterations: int
-    used_upper_bound: bool
 
 
 def _positive_finite(value: float, name: str) -> float:
@@ -62,16 +49,8 @@ def _positive_finite(value: float, name: str) -> float:
     return value
 
 
-def dbm_to_watts(dbm: float) -> float:
-    dbm = float(dbm)
-    if not isfinite(dbm):
-        raise PaperModelError("dbm must be finite")
-    return 10.0 ** ((dbm - 30.0) / 10.0)
 
 
-def watts_to_dbm(watts: float) -> float:
-    watts = _positive_finite(watts, "watts")
-    return 10.0 * log10(watts) + 30.0
 
 
 def article_weights(deadline_s: float) -> ApplicationWeights:
@@ -173,105 +152,9 @@ def allocated_cpu_frequency_hz(
     return float(min(f_star, fmax))
 
 
-def sender_power_limit_w(provider_kind: ProviderKind | str) -> float:
-    """Return Table III's sender-side maximum power: vehicle 23 dBm, RSU 30 dBm."""
-    try:
-        kind = ProviderKind(provider_kind)
-    except ValueError as exc:
-        raise PaperModelError(f"Unknown provider kind: {provider_kind!r}") from exc
-    return dbm_to_watts(23.0 if kind is ProviderKind.VEHICLE else 30.0)
 
 
-def v2i_pathloss_db(distance_m: float) -> float:
-    """Table III V2I pathloss: 128.1 + 37.6 log10(d), d in kilometres."""
-    distance_m = _positive_finite(distance_m, "distance_m")
-    distance_km = distance_m / 1000.0
-    return float(128.1 + 37.6 * log10(distance_km))
 
 
-def power_stationarity_y(
-    power_w: float,
-    *,
-    channel_gain: float,
-    noise_power_w: float,
-    reference: LocalReference,
-    weights: ApplicationWeights,
-    scheduled: float = 1.0,
-) -> float:
-    """Evaluate equation (32), whose zero is searched by Algorithm 1."""
-    p = float(power_w)
-    if not isfinite(p) or p < 0.0:
-        raise PaperModelError("power_w must be finite and non-negative")
-    h = _positive_finite(channel_gain, "channel_gain")
-    noise = _positive_finite(noise_power_w, "noise_power_w")
-    z = float(scheduled)
-    if not isfinite(z) or z < 0.0:
-        raise PaperModelError("scheduled must be finite and non-negative")
-
-    snr_term = 1.0 + p * h / noise
-    first = z * weights.beta / reference.e_local_j * log2(snr_term)
-    second = (
-        z
-        * (
-            weights.alpha / reference.t_ref_s
-            + weights.beta * p / reference.e_local_j
-        )
-        * h
-        / (log(2.0) * (noise + p * h))
-    )
-    return float(first - second)
 
 
-def optimal_transmit_power_w(
-    *,
-    channel_gain: float,
-    noise_power_w: float,
-    pmax_w: float,
-    reference: LocalReference,
-    weights: ApplicationWeights,
-    tolerance_w: float = 1e-9,
-    max_iterations: int = 256,
-) -> PowerSearchResult:
-    """Implement Algorithm 1's low-complexity bisection in watt units."""
-    pmax = _positive_finite(pmax_w, "pmax_w")
-    tolerance = _positive_finite(tolerance_w, "tolerance_w")
-    if max_iterations <= 0:
-        raise PaperModelError("max_iterations must be greater than zero")
-
-    if power_stationarity_y(
-        pmax,
-        channel_gain=channel_gain,
-        noise_power_w=noise_power_w,
-        reference=reference,
-        weights=weights,
-    ) <= 0.0:
-        return PowerSearchResult(
-            power_w=float(pmax),
-            iterations=0,
-            used_upper_bound=True,
-        )
-
-    lower = 0.0
-    upper = pmax
-    iterations = 0
-
-    while upper - lower > tolerance and iterations < max_iterations:
-        midpoint = (lower + upper) / 2.0
-        y_mid = power_stationarity_y(
-            midpoint,
-            channel_gain=channel_gain,
-            noise_power_w=noise_power_w,
-            reference=reference,
-            weights=weights,
-        )
-        if y_mid <= 0.0:
-            lower = midpoint
-        else:
-            upper = midpoint
-        iterations += 1
-
-    return PowerSearchResult(
-        power_w=float((lower + upper) / 2.0),
-        iterations=iterations,
-        used_upper_bound=False,
-    )
