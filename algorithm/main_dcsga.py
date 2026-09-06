@@ -105,7 +105,8 @@ def compute_local_ranks(ctx):
             if rate_value > 0.0:
                 average_link_rates.append(rate_value)
 
-    for task_id in reversed(all_tasks):
+    topo_tasks = _natural_topological_order(ctx)
+    for task_id in reversed(topo_tasks):
         successors = [int(value) for value in children[task_id]]
 
         if not successors:

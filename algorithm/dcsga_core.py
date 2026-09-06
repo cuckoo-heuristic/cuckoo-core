@@ -132,6 +132,7 @@ def run_population_search(
     evaluate_population: Callable[[Sequence[NestT]], List[ScoredNest]],
     on_iteration: Callable[[int, List[ScoredNest]], None] | None = None,
     cancel_check: Callable[[], None] | None = None,
+    evaluation_budget_exhausted: Callable[[], bool] | None = None,
 ) -> Tuple[List[NestT], NestT, List[ScoredNest]]:
     """Canonical generation loop from paper Algorithm 2."""
     size = int(population_size)
@@ -153,6 +154,7 @@ def run_population_search(
         if cancel_check is not None:
             cancel_check()
 
+        previous_evaluated = list(evaluated)
         new_population: List[NestT] = [best_nest]
         for index in range(1, size):
             if cancel_check is not None:
@@ -166,7 +168,24 @@ def run_population_search(
                 cancel_check()
             random_walk.append(generate_new_solution(random_cuckoo, None))
 
-        evaluated = evaluate_population(new_population + random_walk)
+        candidate_evaluated = list(
+            evaluate_population(new_population + random_walk)
+        )
+        if evaluation_budget_exhausted is not None and evaluation_budget_exhausted():
+            # At the exact NFE boundary the final batch may be partial. Keep
+            # every evaluated candidate and supplement it with already-scored
+            # parents so the returned population remains valid and elitist.
+            if len(candidate_evaluated) < size:
+                candidate_evaluated.extend(previous_evaluated)
+            candidate_evaluated.sort(key=lambda row: row[1], reverse=True)
+            evaluated = list(candidate_evaluated[:size])
+            population = [row[0] for row in evaluated]
+            best_nest = population[0]
+            if on_iteration is not None:
+                on_iteration(t, evaluated)
+            break
+
+        evaluated = candidate_evaluated
         discard_probability = min(1.0, (2.0 * discard_probability) / max(t, 1))
 
         if rng.random() <= discard_probability:
@@ -176,9 +195,21 @@ def run_population_search(
                 if cancel_check is not None:
                     cancel_check()
                 worst_walk.append(generate_new_solution(worst_nest, None))
-            evaluated = evaluate_population(
+            before_discard = list(evaluated)
+            discard_evaluated = list(evaluate_population(
                 [row[0] for row in evaluated[:-1]] + worst_walk
-            )
+            ))
+            if evaluation_budget_exhausted is not None and evaluation_budget_exhausted():
+                if len(discard_evaluated) < size:
+                    discard_evaluated.extend(before_discard)
+                discard_evaluated.sort(key=lambda row: row[1], reverse=True)
+                evaluated = list(discard_evaluated[:size])
+                population = [row[0] for row in evaluated]
+                best_nest = population[0]
+                if on_iteration is not None:
+                    on_iteration(t, evaluated)
+                break
+            evaluated = discard_evaluated
 
         evaluated = list(evaluated[:size])
         population = [row[0] for row in evaluated]

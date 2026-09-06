@@ -27,6 +27,9 @@ SCHEMES: Dict[str, JointScheme] = {
     "to_v2i": JointScheme("to_v2i", True, True, True, "rsu_only"),
     "to_wo_c": JointScheme("to_wo_c", True, False, False, "all"),
     "to_wo_r": JointScheme("to_wo_r", False, True, False, "all"),
+    "gwo_aco": JointScheme("gwo_aco", True, True, False, "all"),
+    "pso": JointScheme("pso", True, True, False, "all"),
+    "gpc": JointScheme("gpc", True, True, False, "all"),
 }
 
 

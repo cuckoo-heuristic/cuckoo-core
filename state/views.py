@@ -9,6 +9,7 @@ from django.utils.dateparse import parse_datetime
 from .models import  State
 from .serializer import ( StateSer
 )
+from system.reset_utils import restore_initial_snapshot
 
 
 def make_snapshot(obj):
@@ -93,18 +94,7 @@ class BaseResetOneAPI(APIView):
         if not snap:
             return Response({"error": "No initial snapshot saved for this object."}, status=400)
 
-        for field, value in snap.items():
-            model_field = obj._meta.get_field(field)
-            if isinstance(model_field, models.ForeignKey):
-                setattr(obj, model_field.attname, value)
-                continue
-
-            if isinstance(model_field, models.DateTimeField) and isinstance(value, str):
-                setattr(obj, field, parse_datetime(value))
-                continue
-            setattr(obj, field, value)
-
-        obj.save()
+        restore_initial_snapshot(obj, snap)
         return Response({"detail": "Reset to initial POST snapshot done."}, status=200)
 
 

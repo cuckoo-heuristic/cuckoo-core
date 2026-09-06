@@ -46,8 +46,9 @@ class DTOSC:
         seed: int,
         tmax: int,
         population_size: int | None = None,
+        max_function_evaluations: int | None = None,
     ):
-        # tmax and population_size are intentionally unused: DTOSC is a
+        # Population controls are intentionally unused: DTOSC is a
         # deterministic DP baseline, not a population metaheuristic.
         from run.benchmark.search import run_joint_dtosc
 

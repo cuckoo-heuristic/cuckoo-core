@@ -1,22 +1,40 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import random
 from datetime import datetime, timezone
 from pathlib import Path
-from statistics import mean, stdev
+from statistics import mean, median, stdev
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 from uuid import uuid4
 
 from django.conf import settings
 
-from dag.models import ApplicationType, Task
+from dag.models import ApplicationType, Task, TaskDependency
 from monarch_pylib.model import transmission
 from object.models import RSU, ServiceProvider, Vehicle
 from parameter.services import load_params_obj
 from resource.models import Resource
+
+from algorithm.gwo.predictive_cache import (
+    DEFAULT_DAG_AWARE,
+    DEFAULT_LOOKAHEAD,
+    DEFAULT_PREDICTIVE_WEIGHT,
+    DEFAULT_PROVIDER_GUIDANCE_WEIGHT,
+    DEFAULT_RANK_AWARE,
+    DEFAULT_REGIONAL_CACHE_ENABLED,
+    DEFAULT_REGIONAL_CACHE_SHARE,
+    DEFAULT_REGIONAL_ELITE_RATIO,
+)
+from run.benchmark.protocol import (
+    FAIR_OPTIMIZER_COMPARISON,
+    PAPER_REPRODUCTION,
+    POPULATION_ALGORITHMS,
+    resolve_experiment_mode,
+)
 
 from .context import BenchmarkSnapshot, build_synthetic_joint_context
 from .runner import run_joint_context_benchmark
@@ -35,6 +53,9 @@ ALGORITHM_LABELS = {
     "to_v2i": "TO-V2I",
     "to_wo_c": "TO-w.o.-C",
     "to_wo_r": "TO-w.o.-R",
+    "gwo_aco": "PC-ADGWO",
+    "pso": "MA-CDPSO",
+    "gpc": "SAM-ADGPC",
 }
 PAPER_FIGURE_ALGORITHMS = {
     "figure_6": ("dcsga",),
@@ -168,6 +189,126 @@ def _validate_paper_data(
                     f"Task type {task_type.id} service size is outside the Table III range"
                 )
 
+def _paper_reconstruction_audit(
+    application_types: Dict[int, ApplicationType],
+) -> Dict[str, Any]:
+    """Describe published-vs-reconstructed benchmark inputs without mutating data."""
+    type_ids = sorted({int(item.id) for item in application_types.values()})
+    tasks = list(
+        Task.objects.filter(application_type_id_id__in=type_ids)
+        .select_related("task_type_id")
+        .order_by("application_type_id_id", "id")
+    )
+    task_ids = [int(task.id) for task in tasks]
+    dependencies = list(
+        TaskDependency.objects.filter(
+            parent_task_id_id__in=task_ids,
+            child_task_id_id__in=task_ids,
+        )
+        .select_related("parent_task_id", "child_task_id")
+        .order_by("parent_task_id__application_type_id_id", "id")
+    )
+
+    edge_counts: Dict[int, int] = {type_id: 0 for type_id in type_ids}
+    explicit_edge_data = 0
+    topology_signatures: Dict[int, List[str]] = {type_id: [] for type_id in type_ids}
+    for dependency in dependencies:
+        parent = dependency.parent_task_id
+        child = dependency.child_task_id
+        if parent is None or child is None:
+            continue
+        type_id = int(parent.application_type_id_id)
+        edge_counts[type_id] = edge_counts.get(type_id, 0) + 1
+        snapshot = dependency.initial_snapshot or {}
+        if snapshot.get("communication_data_bits") is not None:
+            explicit_edge_data += 1
+        topology_signatures.setdefault(type_id, []).append(
+            f"{str(parent.index or parent.id)}->{str(child.index or child.id)}"
+        )
+
+    task_sequences: Dict[int, List[int]] = {type_id: [] for type_id in type_ids}
+    declared_compile_workloads = 0
+    for task in tasks:
+        type_id = int(task.application_type_id_id)
+        task_sequences.setdefault(type_id, []).append(int(task.workload_cycles))
+        task_type = task.task_type_id
+        snapshot = (task_type.initial_snapshot or {}) if task_type is not None else {}
+        if any(
+            key in snapshot
+            for key in (
+                "compile_workload_cycles",
+                "compile_cycles",
+                "w_k_cycles",
+                "W_k",
+                "Wk",
+            )
+        ):
+            declared_compile_workloads += 1
+
+    unique_topologies = {
+        tuple(sorted(values))
+        for values in topology_signatures.values()
+    }
+    unique_workload_sequences = {
+        tuple(values)
+        for values in task_sequences.values()
+    }
+    total_edges = len(dependencies)
+
+    return {
+        "classification": {
+            "ARTICLE_EXACT": [
+                "Table-III parameter ranges and constants validated by the benchmark",
+                "ten tasks per application type",
+                "deadline set 30..100 ms",
+            ],
+            "REFERENCE_OR_ARTICLE_COMPATIBLE_RECONSTRUCTION": [
+                "DAG realizations",
+                "per-task workload realization inside the published range",
+                "per-edge communication-data realization inside the published range",
+            ],
+            "DECLARED_ASSUMPTION": [
+                "total road-vehicle population for Figures 6/7/8/10",
+                "source-program size model when not numerically specified by the 2025 article",
+                "service compile workload W_k when not numerically specified",
+                "dynamic-arrival process omitted because its distribution/horizon is unpublished",
+            ],
+        },
+        "dag": {
+            "application_type_count": len(type_ids),
+            "edge_counts_by_application_type": {
+                str(key): int(value) for key, value in edge_counts.items()
+            },
+            "unique_topology_count": len(unique_topologies),
+            "source_exact": False,
+        },
+        "edge_communication_data": {
+            "dependency_count": int(total_edges),
+            "explicit_edge_snapshot_count": int(explicit_edge_data),
+            "parent_output_fallback_count": int(total_edges - explicit_edge_data),
+            "source_exact": bool(total_edges > 0 and explicit_edge_data == total_edges),
+        },
+        "task_workloads": {
+            "unique_workload_sequence_count": len(unique_workload_sequences),
+            "article_range_validated": True,
+            "source_exact_realization": False,
+        },
+        "compile_workload": {
+            "tasks_with_task_type_compile_workload_snapshot": int(
+                declared_compile_workloads
+            ),
+            "article_numeric_value_published": False,
+        },
+        "source_program_size": {
+            "service_program_transfer_energy_in_2025_article": True,
+            "article_equation": 27,
+            "article_numeric_size_published": False,
+            "current_size_model": "dtosc-2022-ratio-0.1-context-derived",
+            "classification": "DECLARED_ASSUMPTION_FOR_SIZE_ONLY",
+        },
+    }
+
+
 def _normalize_figure(value: str) -> str:
     compact = str(value).strip().lower().replace("-", "_").replace(" ", "_")
     aliases = {
@@ -193,15 +334,125 @@ def _normalize_figure(value: str) -> str:
 
 
 def _stats(values: Sequence[float]) -> Dict[str, float]:
-    numbers = [float(value) for value in values]
+    numbers = sorted(float(value) for value in values)
     if not numbers:
-        return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
+        return {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "median": 0.0,
+            "q1": 0.0,
+            "q3": 0.0,
+            "iqr": 0.0,
+            "ci95": 0.0,
+        }
+
+    def percentile(fraction: float) -> float:
+        if len(numbers) == 1:
+            return float(numbers[0])
+        position = max(0.0, min(1.0, float(fraction))) * (len(numbers) - 1)
+        lower = int(math.floor(position))
+        upper = int(math.ceil(position))
+        if lower == upper:
+            return float(numbers[lower])
+        weight = position - lower
+        return float(numbers[lower] * (1.0 - weight) + numbers[upper] * weight)
+
+    standard_deviation = float(stdev(numbers)) if len(numbers) > 1 else 0.0
+    q1 = percentile(0.25)
+    q3 = percentile(0.75)
     return {
         "mean": float(mean(numbers)),
-        "std": float(stdev(numbers)) if len(numbers) > 1 else 0.0,
+        "std": standard_deviation,
         "min": float(min(numbers)),
         "max": float(max(numbers)),
+        "median": float(median(numbers)),
+        "q1": q1,
+        "q3": q3,
+        "iqr": float(q3 - q1),
+        "ci95": float(1.96 * standard_deviation / math.sqrt(len(numbers))),
     }
+
+
+def _paired_algorithm_statistics(
+    rows: Sequence[Dict[str, Any]],
+    metric: str = "total_efficiency",
+) -> List[Dict[str, Any]]:
+    """All-pairs paired-seed inference with optional SciPy Wilcoxon p-values."""
+    by_algorithm: Dict[str, Dict[Tuple[str, int], float]] = {}
+    for row in rows:
+        if row.get(metric) is None:
+            continue
+        algorithm = str(row.get("algorithm", ""))
+        pair_key = (str(row.get("scenario_id", "")), int(row.get("seed", 0)))
+        by_algorithm.setdefault(algorithm, {})[pair_key] = float(row[metric])
+
+    comparisons = []
+    algorithms = sorted(by_algorithm)
+    for left_index, left in enumerate(algorithms):
+        for right in algorithms[left_index + 1 :]:
+            keys = sorted(set(by_algorithm[left]) & set(by_algorithm[right]))
+            differences = [by_algorithm[left][key] - by_algorithm[right][key] for key in keys]
+            nonzero = [value for value in differences if abs(value) > 1e-12]
+            ranks = []
+            ordered = sorted(enumerate(nonzero), key=lambda item: abs(item[1]))
+            position = 0
+            while position < len(ordered):
+                end = position + 1
+                while end < len(ordered) and abs(abs(ordered[end][1]) - abs(ordered[position][1])) <= 1e-12:
+                    end += 1
+                average_rank = 0.5 * ((position + 1) + end)
+                for source_index, value in ordered[position:end]:
+                    ranks.append((source_index, value, average_rank))
+                position = end
+            positive = sum(rank for _index, value, rank in ranks if value > 0.0)
+            negative = sum(rank for _index, value, rank in ranks if value < 0.0)
+            denominator = positive + negative
+            effect = 0.0 if denominator <= 0.0 else (positive - negative) / denominator
+            p_value = None
+            if nonzero:
+                try:
+                    from scipy.stats import wilcoxon
+
+                    p_value = float(
+                        wilcoxon(
+                            [by_algorithm[left][key] for key in keys],
+                            [by_algorithm[right][key] for key in keys],
+                            alternative="two-sided",
+                            zero_method="wilcox",
+                            method="auto",
+                        ).pvalue
+                    )
+                except Exception:
+                    p_value = None
+            comparisons.append({
+                "algorithm_a": left,
+                "algorithm_b": right,
+                "metric": metric,
+                "paired_sample_count": len(keys),
+                "mean_difference_a_minus_b": float(mean(differences)) if differences else 0.0,
+                "median_difference_a_minus_b": float(median(differences)) if differences else 0.0,
+                "wins_a": sum(value > 1e-12 for value in differences),
+                "ties": sum(abs(value) <= 1e-12 for value in differences),
+                "wins_b": sum(value < -1e-12 for value in differences),
+                "rank_biserial_a_minus_b": float(effect),
+                "wilcoxon_two_sided_p": p_value,
+                "holm_adjusted_p": None,
+            })
+
+    available = sorted(
+        ((index, row["wilcoxon_two_sided_p"]) for index, row in enumerate(comparisons)
+         if row["wilcoxon_two_sided_p"] is not None),
+        key=lambda item: item[1],
+    )
+    running = 0.0
+    count = len(available)
+    for rank, (index, p_value) in enumerate(available):
+        adjusted = min(1.0, float(p_value) * float(count - rank))
+        running = max(running, adjusted)
+        comparisons[index]["holm_adjusted_p"] = float(running)
+    return comparisons
 
 
 def _load_paper_environment() -> Tuple[List[Vehicle], List[RSU], Dict[int, ApplicationType]]:
@@ -438,6 +689,7 @@ def _road_state(
         rsu_vehicle_counts=rsu_vehicle_counts,
     )
     speed_values = list(speeds.values())
+    selected_ids = [int(vehicle.id) for vehicle in selected]
     metadata = {
         "road_vehicle_count": int(road_vehicle_count),
         "road_length_m": float(road_length_m),
@@ -447,8 +699,210 @@ def _road_state(
         "vehicle_speed_max_kmh": float(max(speed_values)),
         "spatial_process": "spatial_poisson_conditioned_on_lane_vehicle_counts",
         "lane_vehicle_counts": lane_counts,
+        "road_snapshot_signature": _snapshot_signature(
+            snapshot,
+            speeds,
+            selected_ids,
+        ),
     }
-    return snapshot, [int(vehicle.id) for vehicle in selected], speeds, metadata
+    return snapshot, selected_ids, speeds, metadata
+
+
+
+def _snapshot_signature(
+    snapshot: BenchmarkSnapshot,
+    speeds: Dict[int, float],
+    vehicle_ids: Sequence[int],
+) -> str:
+    """Stable signature for proving that a diagnostic keeps the base road state frozen."""
+    rows = []
+    for vehicle_id in sorted(int(value) for value in vehicle_ids):
+        position = snapshot.positions.get(vehicle_id)
+        rsu_id = snapshot.vehicle_rsu_ids.get(vehicle_id)
+        if position is None or rsu_id is None:
+            raise ValueError(
+                f"Vehicle {vehicle_id} is missing from the benchmark snapshot"
+            )
+        rows.append({
+            "vehicle_id": int(vehicle_id),
+            "x": round(float(position[0]), 12),
+            "y": round(float(position[1]), 12),
+            "speed_kmh": round(float(speeds[vehicle_id]), 12),
+            "rsu_id": int(rsu_id),
+        })
+    payload = json.dumps(rows, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _extend_road_state_preserving_baseline(
+    baseline: Tuple[
+        BenchmarkSnapshot,
+        List[int],
+        Dict[int, float],
+        Dict[str, Any],
+    ],
+    all_vehicles: Sequence[Vehicle],
+    rsus: Sequence[RSU],
+    seed: int,
+    target_road_vehicle_count: int,
+    speed_kmh: float | None,
+) -> Tuple[BenchmarkSnapshot, List[int], Dict[int, float], Dict[str, Any]]:
+    """Add cooperative-only vehicles without moving/reseeding the baseline road state.
+
+    This is diagnostic-only.  The positions, speeds and access-RSU association of
+    every baseline vehicle remain byte-for-byte deterministic with the ordinary
+    paper reconstruction.  Additional vehicles are drawn from the remaining DB
+    pool with an independent RNG stream and fill only the extra lane slots.
+    """
+    base_snapshot, base_ids, base_speeds, base_metadata = baseline
+    base_ids = [int(value) for value in base_ids]
+    base_count = len(base_ids)
+    target_count = int(target_road_vehicle_count)
+    if target_count < base_count:
+        raise ValueError(
+            "Controlled road extension cannot be smaller than the frozen baseline"
+        )
+    if target_count == base_count:
+        metadata = dict(base_metadata)
+        metadata.update({
+            "baseline_road_vehicle_count": int(base_count),
+            "additional_cooperative_vehicle_count": 0,
+            "mission_snapshot_frozen": True,
+            "baseline_snapshot_signature": _snapshot_signature(
+                base_snapshot,
+                base_speeds,
+                base_ids,
+            ),
+            "spatial_process": "frozen-baseline-road-state",
+        })
+        return base_snapshot, list(base_ids), dict(base_speeds), metadata
+
+    params = load_params_obj()
+    road_length_m, lane_x_values = _road_geometry(all_vehicles)
+    baseline_set = set(base_ids)
+    remaining = [
+        vehicle
+        for vehicle in all_vehicles
+        if int(vehicle.id) not in baseline_set
+    ]
+    extra_count = target_count - base_count
+    if extra_count > len(remaining):
+        raise ValueError(
+            f"Controlled road extension needs {extra_count} extra vehicles; "
+            f"only {len(remaining)} are available"
+        )
+
+    extension_rng = random.Random(int(seed) * 1000003 + 32452843)
+    extension_rng.shuffle(remaining)
+    extras = remaining[:extra_count]
+
+    positions = {
+        int(vehicle_id): (float(position[0]), float(position[1]))
+        for vehicle_id, position in base_snapshot.positions.items()
+    }
+    speeds = {int(key): float(value) for key, value in base_speeds.items()}
+
+    # Preserve every baseline point.  Allocate only the additional slots needed
+    # to reach the balanced target lane counts.
+    target_base, target_remainder = divmod(target_count, len(lane_x_values))
+    target_lane_counts = [
+        target_base + (1 if index < target_remainder else 0)
+        for index in range(len(lane_x_values))
+    ]
+    current_lane_counts = [
+        sum(
+            1
+            for vehicle_id in base_ids
+            if abs(float(positions[vehicle_id][0]) - float(lane_x)) <= 1e-9
+        )
+        for lane_x in lane_x_values
+    ]
+    lane_extra_counts = [
+        int(target - current)
+        for target, current in zip(target_lane_counts, current_lane_counts)
+    ]
+    if any(value < 0 for value in lane_extra_counts):
+        raise ValueError(
+            "Target diagnostic lane density is smaller than the frozen baseline"
+        )
+    if sum(lane_extra_counts) != extra_count:
+        raise ValueError("Controlled road extension lane accounting is inconsistent")
+
+    extra_index = 0
+    for lane_x, lane_extra_count in zip(lane_x_values, lane_extra_counts):
+        for _ in range(lane_extra_count):
+            vehicle = extras[extra_index]
+            extra_index += 1
+            vehicle_id = int(vehicle.id)
+            positions[vehicle_id] = (
+                float(lane_x),
+                float(extension_rng.uniform(0.0, road_length_m)),
+            )
+            speeds[vehicle_id] = (
+                float(speed_kmh)
+                if speed_kmh is not None
+                else float(extension_rng.uniform(60.0, 80.0))
+            )
+
+    vehicle_rsu_ids = {
+        vehicle_id: _nearest_rsu_id(
+            position,
+            rsus,
+            float(params.cell_radius_rsu),
+            float(params.h_vehicle),
+            float(params.h_rsu),
+        )
+        for vehicle_id, position in positions.items()
+    }
+    rsu_vehicle_counts: Dict[int, int] = {}
+    for rsu_id in vehicle_rsu_ids.values():
+        rsu_vehicle_counts[rsu_id] = rsu_vehicle_counts.get(rsu_id, 0) + 1
+
+    snapshot = BenchmarkSnapshot(
+        at=base_snapshot.at,
+        time_step_s=float(base_snapshot.time_step_s),
+        positions=positions,
+        vehicle_rsu_ids=vehicle_rsu_ids,
+        rsu_vehicle_counts=rsu_vehicle_counts,
+    )
+    road_vehicle_ids = list(base_ids) + [int(vehicle.id) for vehicle in extras]
+    speed_values = [float(speeds[vehicle_id]) for vehicle_id in road_vehicle_ids]
+    metadata = {
+        "road_vehicle_count": int(target_count),
+        "road_length_m": float(road_length_m),
+        "number_of_lanes": int(len(lane_x_values)),
+        "mean_vehicle_speed_kmh": float(mean(speed_values)),
+        "vehicle_speed_min_kmh": float(min(speed_values)),
+        "vehicle_speed_max_kmh": float(max(speed_values)),
+        "spatial_process": "frozen-baseline-plus-seeded-cooperative-extension",
+        "lane_vehicle_counts": target_lane_counts,
+        "baseline_road_vehicle_count": int(base_count),
+        "additional_cooperative_vehicle_count": int(extra_count),
+        "mission_snapshot_frozen": True,
+        "baseline_snapshot_signature": _snapshot_signature(
+            base_snapshot,
+            base_speeds,
+            base_ids,
+        ),
+        "extended_baseline_snapshot_signature": _snapshot_signature(
+            snapshot,
+            speeds,
+            base_ids,
+        ),
+        "baseline_snapshot_signature_match": (
+            _snapshot_signature(base_snapshot, base_speeds, base_ids)
+            == _snapshot_signature(snapshot, speeds, base_ids)
+        ),
+        "additional_cooperative_vehicle_ids": [
+            int(vehicle.id) for vehicle in extras
+        ],
+        "road_snapshot_signature": _snapshot_signature(
+            snapshot,
+            speeds,
+            road_vehicle_ids,
+        ),
+    }
+    return snapshot, road_vehicle_ids, speeds, metadata
 
 
 def _assignments(
@@ -459,14 +913,15 @@ def _assignments(
     *,
     assignment_pool_count: int | None = None,
 ) -> List[Dict[str, int]]:
-    """Build deterministic mission assignments for one seeded scenario.
+    """Build deterministic and balanced deadline/DAG assignments.
 
-    ``assignment_pool_count`` is used by Figure 7 to create one master
-    76-vehicle assignment and then take prefixes of length 52, 56, ..., 76.
-    Consequently, increasing the mission-vehicle count adds new applications
-    without changing the vehicles or deadlines already present at smaller
-    sweep points. Other figures keep their previous behavior by leaving this
-    argument as ``None``.
+    Deadline is a scenario attribute, while ``application_type_id`` selects
+    only the DAG/task template.  The two are deliberately decoupled so a
+    particular deadline is not permanently tied to one DAG topology.
+
+    Figure 7 still uses one master assignment pool and nested prefixes.  Over
+    each complete block of 64 assignments, every one of the eight deadlines
+    is paired exactly once with every one of the eight DAG templates.
     """
     if mission_vehicle_count > len(road_vehicle_ids):
         raise ValueError("Mission vehicle count exceeds road vehicle count")
@@ -483,32 +938,52 @@ def _assignments(
     if pool_count > len(road_vehicle_ids):
         raise ValueError("assignment_pool_count exceeds road vehicle count")
 
-    rng = random.Random(int(seed) * 1000033 + 104729)
+    dag_type_ids = list(dict.fromkeys(
+        int(application_type.id)
+        for application_type in app_types.values()
+    ))
+    if len(dag_type_ids) != len(DEADLINES_MS):
+        raise ValueError(
+            "Balanced paper scenarios require one distinct DAG template for "
+            "each configured paper deadline"
+        )
 
-    # One stable mission order per seed. Figure 7 reuses the same full order
-    # for every sweep point and only changes the prefix length.
+    mission_rng = random.Random(int(seed) * 1000033 + 104729)
+    pair_rng = random.Random(int(seed) * 1000033 + 130363)
+
     mission_order = list(road_vehicle_ids)
-    rng.shuffle(mission_order)
+    mission_rng.shuffle(mission_order)
     mission_order = mission_order[:pool_count]
 
-    # Deadlines are assigned once over the full pool. This fixes the old
-    # behavior where the same vehicle could receive a different deadline when
-    # the sweep changed from, for example, 52 to 56 mission vehicles.
-    deadline_sequence = [
-        DEADLINES_MS[index % len(DEADLINES_MS)]
-        for index in range(pool_count)
-    ]
-    rng.shuffle(deadline_sequence)
+    deadline_order = list(DEADLINES_MS)
+    dag_order = list(dag_type_ids)
+    pair_rng.shuffle(deadline_order)
+    pair_rng.shuffle(dag_order)
+
+    assignment_pairs: List[Tuple[int, int]] = []
+    round_index = 0
+    while len(assignment_pairs) < pool_count:
+        mapping_round = round_index % len(DEADLINES_MS)
+        round_pairs = [
+            (
+                int(deadline_order[index]),
+                int(dag_order[(index + mapping_round) % len(dag_order)]),
+            )
+            for index in range(len(DEADLINES_MS))
+        ]
+        pair_rng.shuffle(round_pairs)
+        assignment_pairs.extend(round_pairs)
+        round_index += 1
 
     rows: List[Dict[str, int]] = []
     for index in range(mission_vehicle_count):
-        vehicle_id = mission_order[index]
-        deadline_ms = deadline_sequence[index]
+        deadline_ms, dag_type_id = assignment_pairs[index]
         rows.append(
             {
                 "application_id": -(index + 1),
-                "vehicle_id": int(vehicle_id),
-                "application_type_id": int(app_types[deadline_ms].id),
+                "vehicle_id": int(mission_order[index]),
+                "application_type_id": int(dag_type_id),
+                "deadline_ms": int(deadline_ms),
             }
         )
     return rows
@@ -530,17 +1005,44 @@ def _build_scenario(
     ],
     *,
     assignment_pool_count: int | None = None,
+    mission_assignment_vehicle_ids: Sequence[int] | None = None,
+    road_state_override: Tuple[
+        BenchmarkSnapshot,
+        List[int],
+        Dict[int, float],
+        Dict[str, Any],
+    ] | None = None,
 ) -> Dict[str, Any]:
     vehicles, rsus, app_types = environment
-    snapshot, road_vehicle_ids, speeds, road_metadata = _road_state(
-        vehicles,
-        rsus,
-        seed,
-        road_vehicle_count,
-        speed_kmh,
+    if road_state_override is None:
+        snapshot, road_vehicle_ids, speeds, road_metadata = _road_state(
+            vehicles,
+            rsus,
+            seed,
+            road_vehicle_count,
+            speed_kmh,
+        )
+    else:
+        snapshot, road_vehicle_ids, speeds, road_metadata = road_state_override
+        if len(road_vehicle_ids) != int(road_vehicle_count):
+            raise ValueError(
+                "road_state_override vehicle count does not match road_vehicle_count"
+            )
+    assignment_vehicle_ids = (
+        list(road_vehicle_ids)
+        if mission_assignment_vehicle_ids is None
+        else [int(value) for value in mission_assignment_vehicle_ids]
     )
+    missing_assignment_vehicles = sorted(
+        set(assignment_vehicle_ids) - set(road_vehicle_ids)
+    )
+    if missing_assignment_vehicles:
+        raise ValueError(
+            "Mission assignment pool contains vehicles outside the road snapshot: "
+            f"{missing_assignment_vehicles}"
+        )
     assignments = _assignments(
-        road_vehicle_ids,
+        assignment_vehicle_ids,
         mission_vehicle_count,
         app_types,
         seed,
@@ -561,13 +1063,24 @@ def _build_scenario(
         "nested_mission_prefix": bool(assignment_pool_count is not None),
         "mean_mec_capacity_ghz": float(mec_capacity_ghz),
         "deadlines_s": [float(value) / 1000.0 for value in DEADLINES_MS],
+        "deadline_dag_assignment_model": "balanced-independent-seeded-pairing",
+        "deadline_dag_coupled": False,
         "article_speed_density_model": figure == "figure_9",
-        "mission_vehicle_count_article_exact": True,
+        "mission_vehicle_count_article_exact": figure != "figure_9",
         "total_road_vehicle_count_article_exact": False,
         "road_vehicle_count_model": (
-            "speed-derived-density-capped-by-database-pool"
-            if figure == "figure_9"
-            else "dynamic-database-pool-capped-at-table-iii-maximum-density"
+            "diagnostic-frozen-baseline-plus-cooperative-extension"
+            if bool(road_metadata.get("mission_snapshot_frozen"))
+            and int(road_metadata.get("additional_cooperative_vehicle_count", 0)) > 0
+            else (
+                "speed-derived-density-capped-by-database-pool"
+                if figure == "figure_9"
+                else (
+                    "mission-count-sweep-with-fixed-road-pool-reconstruction"
+                    if figure == "figure_7"
+                    else "article-stated-vehicle-count-used-as-complete-scenario"
+                )
+            )
         ),
         "vehicle_role_model": (
             "one active application per selected mission vehicle; all same-RSU "
@@ -600,6 +1113,7 @@ def _run_scenario(
     seed: int,
     tmax: int,
     population_size: int | None,
+    max_function_evaluations: int | None,
 ) -> Dict[str, Any]:
     return run_joint_context_benchmark(
         joint_ctx,
@@ -607,6 +1121,7 @@ def _run_scenario(
         seeds=[seed],
         tmax=tmax,
         population_size=population_size,
+        max_function_evaluations=max_function_evaluations,
         export_artifacts=False,
     )
 
@@ -634,6 +1149,19 @@ def _standard_rows(
             "avg_efficiency": float(run["metrics"]["avg_efficiency"]),
             "total_efficiency": float(run["metrics"]["total_efficiency"]),
             "completion_rate": float(run["metrics"]["completion_rate"]),
+            # Objective evaluation budget used by the run. This is recorded for
+            # figures 7-10 as a fairness diagnostic, not as a plotting axis.
+            "function_evaluations": int(
+                run.get("final_function_evaluations", 0)
+            ),
+            "max_function_evaluations": (
+                None
+                if run.get("evaluation_budget") is None
+                else int(run.get("evaluation_budget"))
+            ),
+            "evaluation_budget_exhausted": bool(
+                run.get("evaluation_budget_exhausted", False)
+            ),
         }
         run_rows.append(row)
         for application in run["applications"]:
@@ -674,6 +1202,10 @@ def _figure_8_rows(
     result: Dict[str, Any],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     run_rows, application_rows = _standard_rows("figure_8", result)
+    run_lookup = {
+        (str(row["algorithm"]), int(row["seed"])): row
+        for row in run_rows
+    }
     grouped: Dict[Tuple[str, int, float], List[Dict[str, Any]]] = {}
     for row in application_rows:
         key = (
@@ -684,9 +1216,11 @@ def _figure_8_rows(
         grouped.setdefault(key, []).append(row)
     deadline_rows: List[Dict[str, Any]] = []
     for (algorithm, seed, deadline_s), rows in sorted(grouped.items()):
+        run_row = run_lookup[(algorithm, seed)]
         deadline_rows.append(
             {
                 "figure": "figure_8",
+                "scenario_id": run_row["scenario_id"],
                 "seed": seed,
                 "algorithm": algorithm,
                 "deadline_s": deadline_s,
@@ -696,6 +1230,13 @@ def _figure_8_rows(
                     mean(1.0 if row["completed"] else 0.0 for row in rows)
                 ),
                 "application_count": len(rows),
+                "runtime_seconds": run_row["runtime_seconds"],
+                "executed_iterations": run_row["executed_iterations"],
+                "function_evaluations": run_row["function_evaluations"],
+                "max_function_evaluations": run_row["max_function_evaluations"],
+                "evaluation_budget_exhausted": run_row[
+                    "evaluation_budget_exhausted"
+                ],
             }
         )
     return deadline_rows, application_rows
@@ -719,6 +1260,11 @@ def _summary_rows(
             summary[f"{metric}_std"] = stats["std"]
             summary[f"{metric}_min"] = stats["min"]
             summary[f"{metric}_max"] = stats["max"]
+            summary[f"{metric}_median"] = stats["median"]
+            summary[f"{metric}_q1"] = stats["q1"]
+            summary[f"{metric}_q3"] = stats["q3"]
+            summary[f"{metric}_iqr"] = stats["iqr"]
+            summary[f"{metric}_ci95"] = stats["ci95"]
         summary["sample_count"] = len(selected)
         result.append(summary)
     return result
@@ -734,6 +1280,77 @@ def _figure_6_summary_rows(
     )
 
 
+def _figure_6_nfe_summary_rows(
+    rows: Sequence[Dict[str, Any]],
+    grid_points: int = 25,
+) -> List[Dict[str, Any]]:
+    """Create an anytime comparison on a common objective-evaluation axis.
+
+    Generation numbers are algorithm-specific because one generation can use
+    a different number of objective evaluations.  We therefore forward-fill
+    each seed's incumbent best on a shared NFE grid that ends at the smallest
+    completed budget among all algorithm/seed runs.
+    """
+    grouped: Dict[Tuple[str, int], List[Tuple[int, float]]] = {}
+    for row in rows:
+        if str(row.get("point_type", "")).lower() != "best":
+            continue
+        key = (str(row["algorithm"]), int(row["seed"]))
+        grouped.setdefault(key, []).append(
+            (int(row.get("function_evaluations", 0)), float(row["total_efficiency"]))
+        )
+    if not grouped:
+        return []
+    for values in grouped.values():
+        values.sort(key=lambda item: item[0])
+
+    common_start = max(values[0][0] for values in grouped.values())
+    common_end = min(values[-1][0] for values in grouped.values())
+    if common_end < common_start:
+        return []
+    count = max(2, int(grid_points))
+    if common_end == common_start:
+        grid = [common_end]
+    else:
+        grid = sorted({
+            int(round(common_start + (common_end - common_start) * index / (count - 1)))
+            for index in range(count)
+        })
+
+    sampled: Dict[Tuple[str, int], List[float]] = {}
+    for (algorithm, seed), values in grouped.items():
+        for nfe in grid:
+            incumbent = values[0][1]
+            for observed_nfe, score in values:
+                if observed_nfe > nfe:
+                    break
+                incumbent = max(float(incumbent), float(score))
+            sampled.setdefault((algorithm, nfe), []).append(float(incumbent))
+
+    result = []
+    for (algorithm, nfe), scores in sorted(sampled.items()):
+        stats = _stats(scores)
+        ci95 = (
+            1.96 * stats["std"] / math.sqrt(len(scores))
+            if len(scores) > 1
+            else 0.0
+        )
+        result.append({
+            "figure": "figure_6",
+            "algorithm": algorithm,
+            "function_evaluations": int(nfe),
+            "best_total_efficiency": stats["mean"],
+            "best_total_efficiency_std": stats["std"],
+            "best_total_efficiency_ci95": float(ci95),
+            "best_total_efficiency_min": stats["min"],
+            "best_total_efficiency_max": stats["max"],
+            "sample_count": len(scores),
+            "common_budget_start": int(common_start),
+            "common_budget_end": int(common_end),
+        })
+    return result
+
+
 def _execution_audit_rows(
     figure: str,
     result: Dict[str, Any],
@@ -746,6 +1363,10 @@ def _execution_audit_rows(
         mode_counts = {"local": 0, "v2v": 0, "v2i": 0}
         transfer_count = 0
         cache_update_count = 0
+        cache_hit_count = 0
+        cache_miss_count = 0
+        cache_insertion_count = 0
+        cache_eviction_count = 0
         for task in schedule:
             mode = str(task.get("provider_mode", ""))
             if mode in mode_counts:
@@ -753,6 +1374,12 @@ def _execution_audit_rows(
             transfer_count += len(task.get("transfers", []))
             if bool(task.get("cache_update_required", False)):
                 cache_update_count += 1
+            if task.get("cache_hit") is True:
+                cache_hit_count += 1
+            elif task.get("cache_miss") is True:
+                cache_miss_count += 1
+            cache_insertion_count += int(task.get("cache_inserted_count", 0) or 0)
+            cache_eviction_count += int(task.get("cache_evicted_count", 0) or 0)
         rows.append(
             {
                 "figure": figure,
@@ -770,41 +1397,66 @@ def _execution_audit_rows(
                 "avg_efficiency": float(run["metrics"]["avg_efficiency"]),
                 "total_efficiency": float(run["metrics"]["total_efficiency"]),
                 "completion_rate": float(run["metrics"]["completion_rate"]),
+                "runtime_seconds": float(run.get("runtime_seconds", 0.0)),
+                "executed_iterations": int(run.get("executed_iterations", 0)),
+                "function_evaluations": int(
+                    run.get("final_function_evaluations", 0)
+                ),
+                "max_function_evaluations": run.get("evaluation_budget"),
+                "evaluation_budget_exhausted": bool(
+                    run.get("evaluation_budget_exhausted", False)
+                ),
                 "scheduled_task_count": len(schedule),
                 "local_task_count": mode_counts["local"],
                 "v2v_task_count": mode_counts["v2v"],
                 "v2i_task_count": mode_counts["v2i"],
                 "transfer_count": transfer_count,
                 "cache_update_count": cache_update_count,
+                "cache_hit_count": cache_hit_count,
+                "cache_miss_count": cache_miss_count,
+                "cache_insertion_count": cache_insertion_count,
+                "cache_eviction_count": cache_eviction_count,
             }
         )
     return rows
 
 
 def _iteration_diagnostics(item: Dict[str, Any]) -> Dict[str, Any]:
-    keys = (
-        "accepted_candidates",
-        "accepted_guided_trials",
-        "accepted_cache_trials",
-        "generated_trials",
-        "unique_trial_count",
-        "duplicate_trial_count",
-        "mean_trial_hamming",
-        "population_unique_count",
-        "population_mean_hamming",
-        "best_improved",
-        "stagnation_generations",
-        "initial_greedy_target",
-        "initial_genetic_target",
-        "initial_random_target",
-        "initial_greedy_selected",
-        "initial_genetic_selected",
-        "initial_random_selected",
-        "ga_generations",
-        "genetic_candidate_pool_size",
-        "random_candidate_pool_size",
-    )
-    return {key: item.get(key) for key in keys}
+    aliases = {
+        "accepted_candidates": ("accepted_candidates", "accepted_moves"),
+        "accepted_guided_trials": ("accepted_guided_trials",),
+        "accepted_cache_trials": ("accepted_cache_trials",),
+        "generated_trials": ("generated_trials", "generated_replacements"),
+        "unique_trial_count": ("unique_trial_count",),
+        "duplicate_trial_count": ("duplicate_trial_count",),
+        "mean_trial_hamming": ("mean_trial_hamming", "mean_substituted_tasks"),
+        "population_unique_count": ("population_unique_count",),
+        "population_mean_hamming": (
+            "population_mean_hamming",
+            "population_diversity_mean",
+        ),
+        "best_improved": ("best_improved",),
+        "stagnation_generations": (
+            "stagnation_generations",
+            "stagnation_count",
+        ),
+        "initial_greedy_target": ("initial_greedy_target",),
+        "initial_genetic_target": ("initial_genetic_target",),
+        "initial_random_target": ("initial_random_target",),
+        "initial_greedy_selected": ("initial_greedy_selected",),
+        "initial_genetic_selected": ("initial_genetic_selected",),
+        "initial_random_selected": ("initial_random_selected",),
+        "ga_generations": ("ga_generations",),
+        "genetic_candidate_pool_size": ("genetic_candidate_pool_size",),
+        "random_candidate_pool_size": ("random_candidate_pool_size",),
+    }
+    result = {}
+    for output_key, input_keys in aliases.items():
+        result[output_key] = next(
+            (item[key] for key in input_keys if item.get(key) is not None),
+            None,
+        )
+    return result
 
 
 def _figure_6_rows(result: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -862,14 +1514,18 @@ def _convergence_diagnostics(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, A
         selected.sort(key=lambda row: int(row["iteration"]))
         initial = selected[0]
         final = selected[-1]
-        accepted = sum(
-            int(row.get("accepted_candidates") or 0)
-            for row in selected[1:]
-        )
-        generated = sum(
-            int(row.get("generated_trials") or 0)
-            for row in selected[1:]
-        )
+        def accumulated_or_sum(key: str) -> int:
+            values = [
+                int(row.get(key) or 0) for row in selected[1:]
+            ]
+            if not values:
+                return 0
+            if all(left <= right for left, right in zip(values, values[1:])):
+                return values[-1]
+            return sum(values)
+
+        accepted = accumulated_or_sum("accepted_candidates")
+        generated = accumulated_or_sum("generated_trials")
         unique_trials = sum(
             int(row.get("unique_trial_count") or 0)
             for row in selected[1:]
@@ -987,6 +1643,9 @@ def _plot_figure_6(rows: Sequence[Dict[str, Any]],output_base: Path,) -> None:
 
     styles = {
         "dcsga": {"color": "#0072B2", "marker": "o"},
+        "gwo_aco": {"color": "#7B2CBF", "marker": "s"},
+        "gpc": {"color": "#2A9D8F", "marker": "^"},
+        "pso": {"color": "#E76F51", "marker": "D"},
     }
 
     figure, axis = plt.subplots(figsize=(8.0, 5.2))
@@ -1112,6 +1771,65 @@ def _plot_figure_6(rows: Sequence[Dict[str, Any]],output_base: Path,) -> None:
     figure.savefig(output_base.with_suffix(".pdf"))
     plt.close(figure)
 
+
+def _plot_figure_6_nfe(
+    rows: Sequence[Dict[str, Any]],
+    output_base: Path,
+) -> None:
+    """Plot incumbent quality against the fair cross-algorithm NFE axis."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if not rows:
+        raise ValueError("Figure 6 has no common NFE interval")
+    styles = {
+        "dcsga": {"color": "#0072B2", "marker": "o"},
+        "gwo_aco": {"color": "#7B2CBF", "marker": "s"},
+        "gpc": {"color": "#2A9D8F", "marker": "^"},
+        "pso": {"color": "#E76F51", "marker": "D"},
+    }
+    figure, axis = plt.subplots(figsize=(8.0, 5.2))
+    for algorithm in _algorithms_from_rows(rows):
+        selected = sorted(
+            (row for row in rows if row["algorithm"] == algorithm),
+            key=lambda row: int(row["function_evaluations"]),
+        )
+        if not selected:
+            continue
+        x = [int(row["function_evaluations"]) for row in selected]
+        y = [float(row["best_total_efficiency"]) for row in selected]
+        ci = [float(row["best_total_efficiency_ci95"]) for row in selected]
+        style = styles.get(algorithm, {"color": None, "marker": "o"})
+        axis.plot(
+            x,
+            y,
+            color=style["color"],
+            marker=style["marker"],
+            markevery=max(1, len(x) // 8),
+            linewidth=2.2,
+            markersize=4.5,
+            label=ALGORITHM_LABELS.get(algorithm, algorithm),
+        )
+        if any(value > 0.0 for value in ci):
+            axis.fill_between(
+                x,
+                [value - width for value, width in zip(y, ci)],
+                [value + width for value, width in zip(y, ci)],
+                color=style["color"],
+                alpha=0.14,
+                linewidth=0,
+            )
+    axis.set_xlabel("Number of objective function evaluations (NFE)")
+    axis.set_ylabel("Best-so-far total offloading efficiency")
+    axis.grid(alpha=0.25, linestyle=":")
+    axis.legend(frameon=False)
+    figure.tight_layout()
+    figure.savefig(output_base.with_suffix(".png"), dpi=300)
+    figure.savefig(output_base.with_suffix(".pdf"))
+    plt.close(figure)
+
 def _line_panel(axis, rows: Sequence[Dict[str, Any]], metric: str, x_key: str, x_label: str, y_label: str,
 ) -> None:
     """Draw one Figure 7/8 panel from aggregated summary rows.
@@ -1149,6 +1867,11 @@ def _line_panel(axis, rows: Sequence[Dict[str, Any]], metric: str, x_key: str, x
             "color": "#E69F00",
             "marker": "P",
             "linestyle": (0, (1, 1)),
+        },
+        "gwo_aco": {
+            "color": "#7B2CBF",
+            "marker": "s",
+            "linestyle": "--",
         },
     }
 
@@ -1308,12 +2031,21 @@ def _plot_figure_9(rows: Sequence[Dict[str, Any]],output_base: Path,) -> None:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    speeds = list(VEHICLE_SPEEDS_KMH)
+    speeds = sorted({
+        int(round(float(row["speed_kmh"])))
+        for row in rows
+        if row.get("speed_kmh") is not None
+    })
     algorithms = _algorithms_from_rows(rows)
     width = 0.8 / max(1, len(algorithms))
     x_values = list(range(len(speeds)))
 
     figure, axis = plt.subplots()
+    colors = {
+        "dcsga": "#0072B2",
+        "dtosc": "#009E73",
+        "gwo_aco": "#7B2CBF",
+    }
 
     for algorithm_index, algorithm in enumerate(algorithms):
         values_by_speed = {
@@ -1334,6 +2066,7 @@ def _plot_figure_9(rows: Sequence[Dict[str, Any]],output_base: Path,) -> None:
                 for speed in speeds
             ],
             width=width,
+            color=colors.get(algorithm),
             label=ALGORITHM_LABELS.get(algorithm, algorithm),
         )
 
@@ -1398,6 +2131,7 @@ def _plot_figure_10(
     styles = {
         "dcsga": {"color": "#0072B2", "marker": "o"},
         "dtosc": {"color": "#009E73", "marker": "^"},
+        "gwo_aco": {"color": "#7B2CBF", "marker": "s"},
     }
 
     for algorithm in _algorithms_from_rows(rows):
@@ -1605,14 +2339,42 @@ def _export_experiment(
     summary_path = output_dir / "summary_results.csv"
     application_path = output_dir / "application_results.csv"
     metadata_path = output_dir / "metadata.json"
+    nfe_summary_path = output_dir / "nfe_summary_results.csv"
+    # All comparison figures keep NFE diagnostics. Figure 6 additionally uses
+    # NFE as convergence axis; figures 7-10 use it only to verify equal budget.
+    nfe_diagnostic_path = output_dir / "nfe_diagnostic_results.csv"
     _write_csv(raw_path, raw_rows)
     _write_csv(summary_path, summary_rows)
     _write_csv(application_path, application_rows)
+    _write_csv(
+        nfe_diagnostic_path,
+        [
+            {
+                "figure": row.get("figure"),
+                "scenario_id": row.get("scenario_id"),
+                "seed": row.get("seed"),
+                "algorithm": row.get("algorithm"),
+                "function_evaluations": row.get("function_evaluations", 0),
+                "max_function_evaluations": row.get("max_function_evaluations"),
+                "evaluation_budget_exhausted": row.get(
+                    "evaluation_budget_exhausted", False
+                ),
+                "executed_iterations": row.get("executed_iterations", 0),
+                "runtime_seconds": row.get("runtime_seconds", 0.0),
+            }
+            for row in metadata.get("execution_audit", [])
+        ],
+    )
     with metadata_path.open("w", encoding="utf-8") as stream:
         json.dump(metadata, stream, ensure_ascii=False, indent=2, default=str)
     figure_base = output_dir / figure
+    nfe_figure_base = output_dir / "figure_6_nfe"
+    nfe_summary_rows: List[Dict[str, Any]] = []
     if figure == "figure_6":
         _plot_figure_6(raw_rows, figure_base)
+        nfe_summary_rows = _figure_6_nfe_summary_rows(raw_rows)
+        _write_csv(nfe_summary_path, nfe_summary_rows)
+        _plot_figure_6_nfe(nfe_summary_rows, nfe_figure_base)
     elif figure == "figure_7":
         _plot_figure_7(summary_rows, figure_base)
     elif figure == "figure_8":
@@ -1628,8 +2390,22 @@ def _export_experiment(
         "summary_csv": _relative_path(summary_path),
         "application_csv": _relative_path(application_path),
         "metadata_json": _relative_path(metadata_path),
+        "nfe_diagnostic_csv": _relative_path(nfe_diagnostic_path),
+        "nfe_summary_csv": (
+            _relative_path(nfe_summary_path) if figure == "figure_6" else None
+        ),
         "figure_png": _relative_path(figure_base.with_suffix(".png")),
         "figure_pdf": _relative_path(figure_base.with_suffix(".pdf")),
+        "nfe_figure_png": (
+            _relative_path(nfe_figure_base.with_suffix(".png"))
+            if figure == "figure_6"
+            else None
+        ),
+        "nfe_figure_pdf": (
+            _relative_path(nfe_figure_base.with_suffix(".pdf"))
+            if figure == "figure_6"
+            else None
+        ),
     }
 
 
@@ -1639,12 +2415,32 @@ def run_paper_experiment(
     seed_start: int = 1,
     tmax: int = 15,
     population_size: int | None = None,
+    max_function_evaluations: int | None = None,
+    experiment_mode: str | None = None,
     algorithms: Iterable[str] | None = None,
     diagnostic_vehicle_count: int | None = None,
+    diagnostic_road_vehicle_count: int | None = None,
+    diagnostic_sweep_values: Iterable[float] | None = None,
     export_artifacts: bool = True,
 ) -> Dict[str, Any]:
     figure = _normalize_figure(figure)
+    if figure == "all" and (
+        diagnostic_vehicle_count is not None
+        or diagnostic_road_vehicle_count is not None
+        or diagnostic_sweep_values is not None
+    ):
+        raise ValueError(
+            "Diagnostic vehicle overrides must target one figure, not figure='all'"
+        )
     if figure == "all":
+        resolved_all_mode = str(
+            experiment_mode or PAPER_REPRODUCTION
+        ).strip().lower()
+        if resolved_all_mode != PAPER_REPRODUCTION:
+            raise ValueError(
+                "figure='all' is reserved for paper_reproduction. Run fair "
+                "optimizer comparisons one figure at a time."
+            )
         figures = list(FIGURE_ALGORITHMS)
         return {
             "figure": "all",
@@ -1654,6 +2450,12 @@ def run_paper_experiment(
             "population_size": (
                 None if population_size is None else int(population_size)
             ),
+            "max_function_evaluations": (
+                None
+                if max_function_evaluations is None
+                else int(max_function_evaluations)
+            ),
+            "experiment_mode": resolved_all_mode,
             "results": {
                 item: run_paper_experiment(
                     figure=item,
@@ -1661,8 +2463,12 @@ def run_paper_experiment(
                     seed_start=seed_start,
                     tmax=tmax,
                     population_size=population_size,
+                    max_function_evaluations=max_function_evaluations,
+                    experiment_mode=resolved_all_mode,
                     algorithms=algorithms,
                     diagnostic_vehicle_count=None,
+                    diagnostic_road_vehicle_count=None,
+                    diagnostic_sweep_values=None,
                     export_artifacts=export_artifacts,
                 )
                 for item in figures
@@ -1678,6 +2484,16 @@ def run_paper_experiment(
         raise ValueError("tmax must be positive")
     if population_size is not None and int(population_size) < 2:
         raise ValueError("population_size must be at least 2")
+    actual_population_size = int(
+        population_size if population_size is not None else load_params_obj().S
+    )
+    if (
+        max_function_evaluations is not None
+        and int(max_function_evaluations) < actual_population_size
+    ):
+        raise ValueError(
+            "max_function_evaluations must be at least population_size"
+        )
     if diagnostic_vehicle_count is not None:
         diagnostic_vehicle_count = int(diagnostic_vehicle_count)
         if figure not in {"figure_6", "figure_7"}:
@@ -1688,6 +2504,39 @@ def run_paper_experiment(
             raise ValueError(
                 "diagnostic_vehicle_count must be between 2 and 76"
             )
+    if diagnostic_road_vehicle_count is not None:
+        diagnostic_road_vehicle_count = int(diagnostic_road_vehicle_count)
+        if figure == "figure_9":
+            raise ValueError(
+                "diagnostic_road_vehicle_count is not supported for figure_9; "
+                "Figure 9 derives road density from speed"
+            )
+        if diagnostic_road_vehicle_count < 2:
+            raise ValueError("diagnostic_road_vehicle_count must be at least 2")
+
+    sweep_values = None
+    if diagnostic_sweep_values is not None:
+        if figure not in {"figure_9", "figure_10"}:
+            raise ValueError(
+                "diagnostic_sweep_values is supported only for figure_9 or figure_10"
+            )
+        sweep_values = tuple(
+            dict.fromkeys(float(value) for value in diagnostic_sweep_values)
+        )
+        if not sweep_values:
+            raise ValueError("diagnostic_sweep_values cannot be empty")
+        allowed = (
+            {float(value) for value in VEHICLE_SPEEDS_KMH}
+            if figure == "figure_9"
+            else {float(value) for value in MEC_CAPACITIES_GHZ}
+        )
+        unsupported = sorted(set(sweep_values) - allowed)
+        if unsupported:
+            raise ValueError(
+                f"Unsupported diagnostic sweep values for {figure}: {unsupported}; "
+                f"allowed: {sorted(allowed)}"
+            )
+
     seeds = [int(seed_start) + index for index in range(repetitions)]
     default_algorithms = FIGURE_ALGORITHMS[figure]
     paper_algorithms = PAPER_FIGURE_ALGORITHMS[figure]
@@ -1704,13 +2553,47 @@ def run_paper_experiment(
     ]
     if unknown_algorithms:
         raise ValueError(f"Unsupported comparison algorithms: {unknown_algorithms}")
+    if (
+        population_size is not None
+        and "gwo_aco" in selected_algorithms
+        and int(population_size) < 3
+    ):
+        raise ValueError(
+            "gwo_aco requires population_size >= 3 for alpha, beta, and delta leaders"
+        )
     if figure == "figure_6" and "dtosc" in selected_algorithms:
         raise ValueError("DTOSC has no population convergence history for Figure 6")
     algorithms = selected_algorithms
-    comparison_mode = tuple(algorithms) != tuple(paper_algorithms)
+    experiment_mode = resolve_experiment_mode(
+        experiment_mode,
+        figure=figure,
+        selected_algorithms=algorithms,
+        paper_algorithms=paper_algorithms,
+        max_function_evaluations=max_function_evaluations,
+    )
+    comparison_mode = experiment_mode == FAIR_OPTIMIZER_COMPARISON
     environment = _load_paper_environment()
     available_vehicle_count = len(environment[0])
     fixed_road_vehicle_count = _fixed_road_vehicle_count(environment[0])
+    canonical_road_vehicle_count = {
+        "figure_6": 76,
+        "figure_7": 76,
+        "figure_8": 68,
+        "figure_10": 68,
+    }.get(figure)
+    diagnostic_road_changed = bool(
+        diagnostic_road_vehicle_count is not None
+        and canonical_road_vehicle_count is not None
+        and int(diagnostic_road_vehicle_count) != int(canonical_road_vehicle_count)
+    )
+    if (
+        diagnostic_road_vehicle_count is not None
+        and diagnostic_road_vehicle_count > fixed_road_vehicle_count
+    ):
+        raise ValueError(
+            "diagnostic_road_vehicle_count exceeds the available paper-compatible "
+            f"road pool ({fixed_road_vehicle_count})"
+        )
     raw_rows: List[Dict[str, Any]] = []
     application_rows: List[Dict[str, Any]] = []
     execution_audit: List[Dict[str, Any]] = []
@@ -1718,17 +2601,66 @@ def run_paper_experiment(
 
     if figure == "figure_6":
         figure_6_vehicle_count = int(diagnostic_vehicle_count or 76)
+        figure_6_road_vehicle_count = int(
+            diagnostic_road_vehicle_count or figure_6_vehicle_count
+        )
+        if figure_6_road_vehicle_count < figure_6_vehicle_count:
+            raise ValueError(
+                "Figure 6 diagnostic road vehicle count cannot be smaller than "
+                "the mission vehicle count"
+            )
+
+        # The canonical Figure 6 baseline is always generated from the same
+        # first-N vehicle pool.  A diagnostic road extension must add peers
+        # without relocating/reseeding those mission vehicles.
+        figure_6_vehicles = list(environment[0][:figure_6_vehicle_count])
+        if len(figure_6_vehicles) != figure_6_vehicle_count:
+            raise ValueError(
+                f"Figure 6 requires {figure_6_vehicle_count} vehicles; "
+                f"found {len(figure_6_vehicles)}"
+            )
+        figure_6_baseline_environment = (
+            figure_6_vehicles,
+            environment[1],
+            environment[2],
+        )
+
         for seed in seeds:
+            road_state_override = None
+            mission_assignment_vehicle_ids = None
+            scenario_environment = figure_6_baseline_environment
+
+            if diagnostic_road_vehicle_count is not None:
+                baseline_state = _road_state(
+                    figure_6_vehicles,
+                    environment[1],
+                    seed,
+                    figure_6_vehicle_count,
+                    None,
+                )
+                road_state_override = _extend_road_state_preserving_baseline(
+                    baseline_state,
+                    environment[0],
+                    environment[1],
+                    seed,
+                    figure_6_road_vehicle_count,
+                    None,
+                )
+                mission_assignment_vehicle_ids = list(baseline_state[1])
+                scenario_environment = environment
+
             joint_ctx = _build_scenario(
                 figure,
                 seed,
                 mission_vehicle_count=figure_6_vehicle_count,
-                road_vehicle_count=fixed_road_vehicle_count,
+                road_vehicle_count=figure_6_road_vehicle_count,
                 speed_kmh=None,
                 mec_capacity_ghz=50.0,
                 sweep_parameter="iteration",
                 sweep_value=float(tmax - 1),
-                environment=environment,
+                environment=scenario_environment,
+                mission_assignment_vehicle_ids=mission_assignment_vehicle_ids,
+                road_state_override=road_state_override,
             )
             result = _run_scenario(
                 joint_ctx,
@@ -1736,6 +2668,7 @@ def run_paper_experiment(
                 seed,
                 tmax,
                 population_size,
+                max_function_evaluations,
             )
             raw_rows.extend(_figure_6_rows(result))
             _, apps = _standard_rows(figure, result)
@@ -1749,19 +2682,80 @@ def run_paper_experiment(
             if diagnostic_vehicle_count is not None
             else VEHICLE_COUNTS
         )
+
+        # Fig. 7 varies the number of *mission* vehicles. The paper does not
+        # publish a separate larger total-road population for this figure.
+        # Use the minimal 76-vehicle road scenario implied by the sweep maximum
+        # and let _road_state() choose that 76-vehicle subset deterministically
+        # from the full eligible database pool for each seed. Therefore:
+        #   - the same seed uses exactly the same 76 road vehicles at 52..76;
+        #   - a different seed can select a different 76-of-N road subset;
+        #   - extra database vehicles are not forced into every Fig. 7 run.
+        figure_7_road_vehicle_count = int(
+            diagnostic_road_vehicle_count or max(VEHICLE_COUNTS)
+        )
+        figure_7_assignment_pool_count = (
+            max(figure_7_vehicle_counts)
+            if diagnostic_vehicle_count is not None
+            else max(VEHICLE_COUNTS)
+        )
+        if figure_7_road_vehicle_count < figure_7_assignment_pool_count:
+            raise ValueError(
+                "Figure 7 road vehicle count cannot be smaller than the "
+                "mission assignment pool"
+            )
+
+        figure_7_diagnostic_states: Dict[
+            int,
+            Tuple[
+                Tuple[BenchmarkSnapshot, List[int], Dict[int, float], Dict[str, Any]],
+                List[int],
+            ],
+        ] = {}
+        if diagnostic_road_vehicle_count is not None:
+            for seed in seeds:
+                baseline_state = _road_state(
+                    environment[0],
+                    environment[1],
+                    seed,
+                    max(VEHICLE_COUNTS),
+                    None,
+                )
+                extended_state = _extend_road_state_preserving_baseline(
+                    baseline_state,
+                    environment[0],
+                    environment[1],
+                    seed,
+                    figure_7_road_vehicle_count,
+                    None,
+                )
+                figure_7_diagnostic_states[int(seed)] = (
+                    extended_state,
+                    list(baseline_state[1]),
+                )
+
         for vehicle_count in figure_7_vehicle_counts:
             for seed in seeds:
+                road_state_override = None
+                mission_assignment_vehicle_ids = None
+                if diagnostic_road_vehicle_count is not None:
+                    road_state_override, mission_assignment_vehicle_ids = (
+                        figure_7_diagnostic_states[int(seed)]
+                    )
+
                 joint_ctx = _build_scenario(
                     figure,
                     seed,
                     mission_vehicle_count=vehicle_count,
-                    road_vehicle_count=fixed_road_vehicle_count,
+                    road_vehicle_count=figure_7_road_vehicle_count,
                     speed_kmh=None,
                     mec_capacity_ghz=50.0,
                     sweep_parameter="mission_vehicle_count",
                     sweep_value=float(vehicle_count),
                     environment=environment,
-                    assignment_pool_count=max(VEHICLE_COUNTS),
+                    assignment_pool_count=figure_7_assignment_pool_count,
+                    mission_assignment_vehicle_ids=mission_assignment_vehicle_ids,
+                    road_state_override=road_state_override,
                 )
                 result = _run_scenario(
                     joint_ctx,
@@ -1769,6 +2763,7 @@ def run_paper_experiment(
                     seed,
                     tmax,
                     population_size,
+                    max_function_evaluations,
                 )
                 run_rows, apps = _standard_rows(figure, result)
                 raw_rows.extend(run_rows)
@@ -1783,17 +2778,65 @@ def run_paper_experiment(
             ("avg_delay", "avg_efficiency", "total_efficiency", "completion_rate"),
         )
     elif figure == "figure_8":
+        # Fig. 8 explicitly states that the number of vehicles is 68.
+        # No separate larger road population is published for this figure.
+        # Use exactly the same canonical 68-vehicle scenario regardless of
+        # whether the database later contains 76, 96, or more vehicles.
+        figure_8_vehicle_count = 68
+        figure_8_road_vehicle_count = int(
+            diagnostic_road_vehicle_count or figure_8_vehicle_count
+        )
+        if figure_8_road_vehicle_count < figure_8_vehicle_count:
+            raise ValueError(
+                "Figure 8 road vehicle count cannot be smaller than 68 mission vehicles"
+            )
+        figure_8_vehicles = list(environment[0][:figure_8_vehicle_count])
+        if len(figure_8_vehicles) != figure_8_vehicle_count:
+            raise ValueError(
+                f"Figure 8 requires {figure_8_vehicle_count} vehicles; "
+                f"found {len(figure_8_vehicles)}"
+            )
+        figure_8_baseline_environment = (
+            figure_8_vehicles,
+            environment[1],
+            environment[2],
+        )
+
         for seed in seeds:
+            road_state_override = None
+            mission_assignment_vehicle_ids = None
+            scenario_environment = figure_8_baseline_environment
+            if diagnostic_road_vehicle_count is not None:
+                baseline_state = _road_state(
+                    figure_8_vehicles,
+                    environment[1],
+                    seed,
+                    figure_8_vehicle_count,
+                    None,
+                )
+                road_state_override = _extend_road_state_preserving_baseline(
+                    baseline_state,
+                    environment[0],
+                    environment[1],
+                    seed,
+                    figure_8_road_vehicle_count,
+                    None,
+                )
+                mission_assignment_vehicle_ids = list(baseline_state[1])
+                scenario_environment = environment
+
             joint_ctx = _build_scenario(
                 figure,
                 seed,
-                mission_vehicle_count=68,
-                road_vehicle_count=fixed_road_vehicle_count,
+                mission_vehicle_count=figure_8_vehicle_count,
+                road_vehicle_count=figure_8_road_vehicle_count,
                 speed_kmh=None,
                 mec_capacity_ghz=50.0,
                 sweep_parameter="deadline_s",
                 sweep_value=0.0,
-                environment=environment,
+                environment=scenario_environment,
+                mission_assignment_vehicle_ids=mission_assignment_vehicle_ids,
+                road_state_override=road_state_override,
             )
             result = _run_scenario(
                 joint_ctx,
@@ -1801,6 +2844,7 @@ def run_paper_experiment(
                 seed,
                 tmax,
                 population_size,
+                max_function_evaluations,
             )
             deadline_rows, apps = _figure_8_rows(result)
             raw_rows.extend(deadline_rows)
@@ -1816,11 +2860,35 @@ def run_paper_experiment(
         )
     elif figure == "figure_9":
         road_length_m, _ = _road_geometry(environment[0])
-        for speed_kmh in VEHICLE_SPEEDS_KMH:
-            vehicle_count = _vehicle_count_for_speed(
-                speed_kmh,
+
+        # The paper explicitly makes road density a function of speed in
+        # Fig. 9.  Compute the required counts from that rule first, then use
+        # only the canonical prefix needed by the densest point.  Consequently
+        # extra database rows above that requirement cannot perturb any Fig. 9
+        # realization.  If the database is smaller, the existing transparent
+        # finite-pool cap still applies instead of inventing vehicle records.
+        figure_9_required_counts = {
+            float(speed): _vehicle_count_for_speed(
+                float(speed),
                 road_length_m,
-                available_vehicle_count=available_vehicle_count,
+                available_vehicle_count=None,
+            )
+            for speed in VEHICLE_SPEEDS_KMH
+        }
+        figure_9_pool_count = min(
+            max(figure_9_required_counts.values()),
+            available_vehicle_count,
+        )
+        figure_9_environment = (
+            list(environment[0][:figure_9_pool_count]),
+            environment[1],
+            environment[2],
+        )
+
+        for speed_kmh in (sweep_values or VEHICLE_SPEEDS_KMH):
+            vehicle_count = min(
+                int(figure_9_required_counts[float(speed_kmh)]),
+                figure_9_pool_count,
             )
             for seed in seeds:
                 joint_ctx = _build_scenario(
@@ -1832,7 +2900,7 @@ def run_paper_experiment(
                     mec_capacity_ghz=50.0,
                     sweep_parameter="speed_kmh",
                     sweep_value=float(speed_kmh),
-                    environment=environment,
+                    environment=figure_9_environment,
                 )
                 result = _run_scenario(
                     joint_ctx,
@@ -1840,6 +2908,7 @@ def run_paper_experiment(
                     seed,
                     tmax,
                     population_size,
+                    max_function_evaluations,
                 )
                 run_rows, apps = _standard_rows(figure, result)
                 for row in run_rows:
@@ -1856,18 +2925,80 @@ def run_paper_experiment(
             ("total_efficiency",),
         )
     else:
-        for capacity_ghz in MEC_CAPACITIES_GHZ:
+        # Fig. 10 states that the number of vehicles is 68.  Hold that
+        # complete vehicle scenario fixed while only MEC capacity changes.
+        figure_10_vehicle_count = 68
+        figure_10_road_vehicle_count = int(
+            diagnostic_road_vehicle_count or figure_10_vehicle_count
+        )
+        if figure_10_road_vehicle_count < figure_10_vehicle_count:
+            raise ValueError(
+                "Figure 10 road vehicle count cannot be smaller than 68 mission vehicles"
+            )
+        figure_10_vehicles = list(environment[0][:figure_10_vehicle_count])
+        if len(figure_10_vehicles) != figure_10_vehicle_count:
+            raise ValueError(
+                f"Figure 10 requires {figure_10_vehicle_count} vehicles; "
+                f"found {len(figure_10_vehicles)}"
+            )
+        figure_10_baseline_environment = (
+            figure_10_vehicles,
+            environment[1],
+            environment[2],
+        )
+
+        figure_10_diagnostic_states: Dict[
+            int,
+            Tuple[
+                Tuple[BenchmarkSnapshot, List[int], Dict[int, float], Dict[str, Any]],
+                List[int],
+            ],
+        ] = {}
+        if diagnostic_road_vehicle_count is not None:
             for seed in seeds:
+                baseline_state = _road_state(
+                    figure_10_vehicles,
+                    environment[1],
+                    seed,
+                    figure_10_vehicle_count,
+                    None,
+                )
+                extended_state = _extend_road_state_preserving_baseline(
+                    baseline_state,
+                    environment[0],
+                    environment[1],
+                    seed,
+                    figure_10_road_vehicle_count,
+                    None,
+                )
+                figure_10_diagnostic_states[int(seed)] = (
+                    extended_state,
+                    list(baseline_state[1]),
+                )
+
+        for capacity_ghz in (sweep_values or MEC_CAPACITIES_GHZ):
+            for seed in seeds:
+                road_state_override = None
+                mission_assignment_vehicle_ids = None
+                scenario_environment = figure_10_baseline_environment
+                if diagnostic_road_vehicle_count is not None:
+                    road_state_override, mission_assignment_vehicle_ids = (
+                        figure_10_diagnostic_states[int(seed)]
+                    )
+                    scenario_environment = environment
+
                 joint_ctx = _build_scenario(
                     figure,
                     seed,
-                    mission_vehicle_count=68,
-                    road_vehicle_count=fixed_road_vehicle_count,
+                    mission_vehicle_count=figure_10_vehicle_count,
+                    road_vehicle_count=figure_10_road_vehicle_count,
                     speed_kmh=None,
                     mec_capacity_ghz=float(capacity_ghz),
                     sweep_parameter="mec_capacity_ghz",
                     sweep_value=float(capacity_ghz),
-                    environment=environment,
+                    environment=scenario_environment,
+                    mission_assignment_vehicle_ids=mission_assignment_vehicle_ids,
+                    road_state_override=road_state_override,
                 )
                 result = _run_scenario(
                     joint_ctx,
@@ -1875,6 +3006,7 @@ def run_paper_experiment(
                     seed,
                     tmax,
                     population_size,
+                    max_function_evaluations,
                 )
                 run_rows, apps = _standard_rows(figure, result)
                 for row in run_rows:
@@ -1891,6 +3023,24 @@ def run_paper_experiment(
             ("avg_efficiency", "completion_rate"),
         )
 
+    budget_incomplete_rows = [
+        row
+        for row in execution_audit
+        if str(row.get("algorithm", "")).lower() in POPULATION_ALGORITHMS
+        if row.get("max_function_evaluations") is not None
+        and not bool(row.get("evaluation_budget_exhausted", False))
+    ]
+    if experiment_mode == FAIR_OPTIMIZER_COMPARISON and budget_incomplete_rows:
+        details = ", ".join(
+            f"{row.get('algorithm')}@{row.get('scenario_id')}:"
+            f"{row.get('function_evaluations')}/{row.get('max_function_evaluations')}"
+            for row in budget_incomplete_rows[:8]
+        )
+        raise ValueError(
+            "The common NFE budget was not consumed by every population "
+            f"optimizer ({details}). Increase tmax; do not publish this run."
+        )
+
     metadata = {
         "figure": figure,
         "article_doi": ARTICLE_DOI,
@@ -1903,21 +3053,132 @@ def run_paper_experiment(
         "population_size_matches_paper": int(
             population_size if population_size is not None else load_params_obj().S
         ) == 50,
+        "max_function_evaluations": (
+            None
+            if max_function_evaluations is None
+            else int(max_function_evaluations)
+        ),
+        "experiment_mode": experiment_mode,
+        "stopping_rule": (
+            "paper-native-generation-limit"
+            if experiment_mode == PAPER_REPRODUCTION
+            else "exact-common-objective-evaluation-budget"
+        ),
+        "paper_optimizer_settings_match": bool(
+            experiment_mode == PAPER_REPRODUCTION
+            and int(tmax) == 15
+            and int(actual_population_size) == 50
+        ),
+        "comparison_budget_mode": (
+            "equal-objective-evaluation-budget"
+            if max_function_evaluations is not None
+            else "generation-limited"
+        ),
+        "evaluation_budget_fully_consumed": not bool(budget_incomplete_rows),
+        "budget_incomplete_runs": [
+            {
+                "scenario_id": row.get("scenario_id"),
+                "seed": row.get("seed"),
+                "algorithm": row.get("algorithm"),
+                "function_evaluations": row.get("function_evaluations"),
+                "max_function_evaluations": row.get("max_function_evaluations"),
+            }
+            for row in budget_incomplete_rows
+        ],
         "dcsga_rank_seed_aligned": True,
         "dcsga_rank_recomputed_per_run": True,
+        "proposed_algorithm_cache": {
+            "fitness_policy": "paper (identical to DCSGA)",
+            "search_guidance_only": True,
+            "lookahead": int(DEFAULT_LOOKAHEAD),
+            "predictive_weight": float(DEFAULT_PREDICTIVE_WEIGHT),
+            "rank_aware": bool(DEFAULT_RANK_AWARE),
+            "dag_aware": bool(DEFAULT_DAG_AWARE),
+            "rank_weight_model": "0.5+0.5*normalized_seed_aligned_global_rank",
+            "dag_weight_model": "1+1/shortest_descendant_distance",
+            "provider_selection_guidance": True,
+            "provider_guidance_weight": float(DEFAULT_PROVIDER_GUIDANCE_WEIGHT),
+            "provider_guidance_model": (
+                "same-provider future reuse of the current service type, "
+                "weighted by the existing rank/DAG factors and normalized "
+                "only across the current provider candidates"
+            ),
+            "escape_move_guided": False,
+            "regional_rsu_cache_memory": False,
+            "regional_elite_ratio": float(DEFAULT_REGIONAL_ELITE_RATIO),
+            "regional_cache_share": float(DEFAULT_REGIONAL_CACHE_SHARE),
+            "regional_observation": (
+                "per-RSU prevalence of service types in vehicle-provider final caches "
+                "from the elite fraction of the previous generation, gated by the "
+                "service types those elite wolves actually assign to that RSU/MEC"
+            ),
+            "regional_priority_model": (
+                "running_mean(vehicle_cache_prevalence) * "
+                "running_mean(normalized_elite_rsu_assignment_demand)"
+            ),
+            "regional_history_model": "running mean across completed generations",
+            "regional_cache_state_collection": "disabled for fair comparison",
+            "regional_prefetching": False,
+            "regional_capacity_model": (
+                "up to the configured RSU-cache share protects regionally popular "
+                "services only after they become ordinary legal cache candidates; "
+                "unused reserved capacity returns to predictive cache"
+            ),
+            "prefetching": False,
+            "final_fitness_bonus": False,
+        },
         "algorithms": list(algorithms),
         "comparison_mode": comparison_mode,
+        "statistical_protocol": {
+            "independent_seed_count": int(repetitions),
+            "minimum_recommended_independent_seeds": 30,
+            "paper_ready": bool(repetitions >= 30),
+            "paired_seed_design": True,
+            "primary_report": "median and IQR plus mean and 95% confidence interval",
+            "pairwise_test": "two-sided Wilcoxon signed-rank with Holm correction (p-values require SciPy; effect sizes are always computed)",
+            "effect_size": "paired rank-biserial correlation",
+            "pairing_unit": "same scenario_id and seed",
+            "results_key": "pairwise_statistics",
+        },
+        "pairwise_statistics": _paired_algorithm_statistics(
+            execution_audit,
+            metric="total_efficiency",
+        ),
+        "cross_algorithm_convergence_axis": (
+            "objective_function_evaluations"
+            if figure == "figure_6" and comparison_mode
+            else "paper_native"
+        ),
+        "generation_axis_warning": (
+            "Generation counts are algorithm-specific and must not be used as "
+            "the primary cross-algorithm compute budget. Use the exported NFE "
+            "curve and, for final comparisons, set max_function_evaluations."
+            if figure == "figure_6" and comparison_mode
+            else None
+        ),
         "diagnostic_mode": bool(
-            diagnostic_vehicle_count is not None
-            and (
-                figure == "figure_7"
-                or int(diagnostic_vehicle_count) != 76
+            diagnostic_road_changed
+            or sweep_values is not None
+            or (
+                diagnostic_vehicle_count is not None
+                and (
+                    figure == "figure_7"
+                    or int(diagnostic_vehicle_count) != 76
+                )
             )
         ),
         "diagnostic_vehicle_count": (
             None
             if diagnostic_vehicle_count is None
             else int(diagnostic_vehicle_count)
+        ),
+        "diagnostic_road_vehicle_count": (
+            None
+            if diagnostic_road_vehicle_count is None
+            else int(diagnostic_road_vehicle_count)
+        ),
+        "diagnostic_sweep_values": (
+            None if sweep_values is None else list(sweep_values)
         ),
         "default_paper_algorithms": list(paper_algorithms),
         "default_run_algorithms": list(default_algorithms),
@@ -1948,9 +3209,37 @@ def run_paper_experiment(
                 )
             ),
             "selection_rule": (
-                "mission count follows each paper figure; remaining selected "
-                "road vehicles are cooperative V2V candidates"
+                "figure-specific vehicle policies; diagnostic road extensions "
+                "freeze the baseline mission snapshot and add cooperative-only peers "
+                "without mutating the database"
             ),
+            "figure_7_road_vehicle_count": int(
+                diagnostic_road_vehicle_count or max(VEHICLE_COUNTS)
+            ),
+            "figure_7_seeded_subset_selection": True,
+            "figure_vehicle_policy": {
+                "figure_6": (
+                    "default: 76 mission/road vehicles; diagnostic override freezes "
+                    "that 76-vehicle snapshot and adds cooperative-only peers"
+                ),
+                "figure_7": (
+                    "default: 52..76 mission vehicles inside a seeded 76-vehicle "
+                    "road pool; diagnostic override freezes that 76-road snapshot "
+                    "and adds cooperative-only peers"
+                ),
+                "figure_8": (
+                    "default: 68 mission/road vehicles; diagnostic override freezes "
+                    "that 68-vehicle snapshot and adds cooperative-only peers"
+                ),
+                "figure_9": (
+                    "speed-derived road population from the article density "
+                    "rule, capped only by a finite database pool"
+                ),
+                "figure_10": (
+                    "default: 68 mission/road vehicles; diagnostic override freezes "
+                    "that 68-vehicle snapshot and adds cooperative-only peers"
+                ),
+            },
         },
         "article_parameters": {
             "vehicle_counts": list(VEHICLE_COUNTS),
@@ -1963,17 +3252,88 @@ def run_paper_experiment(
             "population_size": 50,
             "speed_density_rule": "mean inter-vehicle distance equals 2.5 times mean speed in m/s",
         },
+        "optimizer_parameters": {
+            "dcsga": {
+                "population_size": int(actual_population_size),
+                "levy_lambda": float(load_params_obj().levy_lambda),
+                "initial_discard_probability": float(
+                    load_params_obj().p_discard_init
+                ),
+                "discard_schedule": "min(1, 2*p0/max(iteration,1))",
+                "initialization": "paper greedy plus one second-best task mutation per nest",
+            },
+            "gpc": {
+                "name": "SAM-ADGPC",
+                "population_size": int(actual_population_size),
+                "greedy_ratio": 0.70,
+                "diverse_dlhs_ratio": 0.30,
+                "sparse_near_greedy_fallback": True,
+                "gravity": 9.8,
+                "ramp_angle_degrees": 14.0,
+                "friction_min": 1.0,
+                "friction_max": 10.0,
+                "substitution_probability": 0.50,
+                "stagnation_escape_after": 5,
+                "restart_fraction": 0.15,
+                "elite_ratio": 0.20,
+                "service_affinity_memory_weight": 0.65,
+                "service_affinity_memory_evaporation": 0.08,
+                "domain_guidance": "rank-aware mutation plus accepted-move service-affinity memory and service-reuse cache locality",
+                "categorical_move": "dimension-normalised sparse physical GPC projection",
+            },
+            "gwo_aco": {
+                "name": "PC-ADGWO",
+                "population_size": int(actual_population_size),
+                "greedy_ratio": 0.90,
+                "diverse_dlhs_ratio": 0.10,
+                "sparse_near_greedy_fallback": True,
+                "a_schedule": "nonlinear 2-to-0 with bounded diversity/stagnation correction",
+                "stagnation_escape_after": 5,
+                "escape_fraction": 0.15,
+                "pheromone_elite_ratio": 0.20,
+                "pheromone_evaporation": 0.10,
+                "provider_guidance_weight": float(
+                    DEFAULT_PROVIDER_GUIDANCE_WEIGHT
+                ),
+                "alpha_neighborhood": "one-coordinate leader/pheromone/reuse-guided with phase-dependent exploration floor",
+                "categorical_move": "alpha-beta-delta encircling inside an O(sqrt(D)) trust region",
+            },
+            "pso": {
+                "name": "MA-CDPSO",
+                "population_size": int(actual_population_size),
+                "greedy_ratio": 0.70,
+                "diverse_dlhs_ratio": 0.30,
+                "sparse_near_greedy_fallback": True,
+                "inertia_start": 0.90,
+                "inertia_end": 0.40,
+                "cognitive_start": 2.50,
+                "cognitive_end": 0.50,
+                "social_start": 0.50,
+                "social_end": 2.50,
+                "temperature_start": 1.20,
+                "temperature_end": 0.25,
+                "velocity_limit": 4.0,
+                "stagnation_restart_after": 5,
+                "restart_fraction": 0.15,
+                "local_refinement_fraction": 0.15,
+                "particle_survival": "elitist current-vs-candidate",
+                "local_refinement": "pbest-frequency plus service-type back-off around gbest",
+                "categorical_move": "one-hot velocity with an O(sqrt(D)) projection trust region",
+                "position_acceptance": "standard PSO movement; pbest/gbest retain elitism",
+            },
+        },
         "declared_limitations": [
             "DTOSC uses the legacy pre-repair stage-wise provider-path dynamic-programming reconstruction with the common benchmark evaluator. This compatibility baseline is intentionally retained for reproducibility/sensitivity and is not claimed to be source-exact DTOSC 2022.",
             "The channel and sender-side power models remain declared approximations.",
             "Figures 6-10 evaluate one joint scheduling epoch. The article reports 10 applications per second but does not define a reproducible arrival distribution, observation horizon, or whether that rate is per vehicle or system-wide; no unverified arrival process is imposed on the paper figures.",
-            "For Figures 6, 7, 8, and 10, the mission count remains exactly paper-specified, while the total road pool is selected dynamically as min(valid database vehicles, the Table-III maximum-density count); the paper does not publish a separate total road count for these figures.",
+            "By default, Figures 6, 8, and 10 use the article-stated vehicle count as the complete scenario count because no separate larger road population is published. Figure 7 defaults to 52..76 mission vehicles inside a seeded 76-vehicle road pool. The optional diagnostic_road_vehicle_count separates mission and total road populations only for sensitivity analysis and is never labeled article-exact. Figure 9 alone changes road density with speed according to the article's 2.5-second spacing rule.",
             "Mission and cooperative roles are not forced to be disjoint: a mission vehicle may also provide V2V service to a same-RSU peer, consistent with the paper's alliance domain V_n excluding n; the paper does not publish a separate cooperative-only vehicle count.",
             "Each mission vehicle uses exactly one wireless access RSU. A selected remote MEC is reached through that access RSU and the inter-RSU broadband path adds zero modeled delay/energy because the paper does not publish backhaul parameters.",
             "Figure 9 uses the article speed-density equation and caps only when the finite database pool is smaller than the derived road population.",
             "The service compile workload Wk is not reported in Table III and is set equal to the corresponding task workload as a declared deterministic assumption.",
-            "The available application types use the same seeded ten-task DAG structure with different deadlines, so the DAG diversity of reference [48] is not reproduced.",
+            "The database contains multiple distinct ten-task DAG templates, but the exact DAG realizations and generator parameters used from reference [48] are not published; the stored DAGs are therefore reference-compatible reconstructions rather than source-exact graphs.",
         ],
+        "reconstruction_audit": _paper_reconstruction_audit(environment[2]),
         "scenario_records": scenario_records,
         "execution_audit": execution_audit,
     }

@@ -202,6 +202,9 @@ def benchmark(request):
                     "population_size"
                 )
             ),
+            max_function_evaluations=(
+                ser.validated_data.get("max_function_evaluations")
+            ),
             export_artifacts=(
                 ser.validated_data.get(
                     "export_artifacts",
@@ -271,9 +274,19 @@ def paper_benchmark(request):
             seed_start=ser.validated_data.get("seed_start", 1),
             tmax=ser.validated_data.get("tmax", 15),
             population_size=ser.validated_data.get("population_size"),
+            max_function_evaluations=ser.validated_data.get(
+                "max_function_evaluations"
+            ),
+            experiment_mode=ser.validated_data.get("experiment_mode"),
             algorithms=ser.validated_data.get("algorithms"),
             diagnostic_vehicle_count=ser.validated_data.get(
                 "diagnostic_vehicle_count"
+            ),
+            diagnostic_road_vehicle_count=ser.validated_data.get(
+                "diagnostic_road_vehicle_count"
+            ),
+            diagnostic_sweep_values=ser.validated_data.get(
+                "diagnostic_sweep_values"
             ),
             export_artifacts=ser.validated_data.get("export_artifacts", True),
         )
@@ -292,11 +305,19 @@ def paper_benchmark(request):
                 "seeds",
                 "tmax",
                 "population_size",
+                "max_function_evaluations",
+                "experiment_mode",
+                "stopping_rule",
                 "algorithms",
                 "comparison_mode",
                 "diagnostic_mode",
                 "diagnostic_vehicle_count",
+                "diagnostic_road_vehicle_count",
+                "diagnostic_sweep_values",
+                "reconstruction_audit",
                 "convergence_diagnostics",
+                "statistical_protocol",
+                "pairwise_statistics",
                 "summary",
                 "artifacts",
             )

@@ -237,6 +237,25 @@ class VehicleWorker(threading.Thread):
         return speed_kmh
 
     def run(self):
+        """Run the motion loop with bounded recovery from transient DB errors."""
+        retry_limit = max(1, int(getattr(self.cfg, "vehicle_worker_retry_limit", 3) or 3))
+        failures = 0
+        while not self._stop_flag.is_set():
+            try:
+                self._run_loop()
+                return
+            except Exception:
+                failures += 1
+                self.cfg.runtime_last_error = traceback.format_exc()
+                traceback.print_exc()
+                close_old_connections()
+                if failures >= retry_limit:
+                    self.cfg.runtime_failed_vehicle_id = int(self.vehicle_id)
+                    return
+                if self._stop_flag.wait(min(2.0, 0.25 * (2 ** (failures - 1)))):
+                    return
+
+    def _run_loop(self):
         close_old_connections()
         rsus = list(RSU.objects.all())
         total_time = float(self.cfg.total_time)
@@ -576,6 +595,11 @@ class ApplicationGeneratorWorker(threading.Thread):
         next_batch_time = 0
         get_sim_time = getattr(self.cfg, "get_sim_time_s", None)
         scheduler_busy = getattr(self.cfg, "runtime_scheduler_busy", None)
+        retry_limit = max(
+            1,
+            int(getattr(self.cfg, "runtime_batch_retry_limit", 5) or 5),
+        )
+        consecutive_failures = 0
 
         while not self._stop_flag.is_set():
             close_old_connections()
@@ -604,13 +628,24 @@ class ApplicationGeneratorWorker(threading.Thread):
                 try:
                     created = self._create_batch(next_batch_time)
                 except Exception:
+                    consecutive_failures += 1
                     self.cfg.runtime_last_error = traceback.format_exc()
+                    self.cfg.runtime_batch_consecutive_failures = int(
+                        consecutive_failures
+                    )
                     traceback.print_exc()
                     if scheduler_busy is not None:
                         scheduler_busy.clear()
+                    if consecutive_failures >= retry_limit:
+                        self.cfg.runtime_generator_failed = True
+                        close_old_connections()
+                        return
                     if self._stop_flag.wait(0.5):
                         break
                     continue
+
+                consecutive_failures = 0
+                self.cfg.runtime_batch_consecutive_failures = 0
 
                 if created <= 0 and scheduler_busy is not None:
                     scheduler_busy.clear()
@@ -624,4 +659,3 @@ class ApplicationGeneratorWorker(threading.Thread):
                 break
 
         close_old_connections()
-

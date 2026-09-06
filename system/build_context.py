@@ -8,13 +8,9 @@ from cache.models import cache as CacheModel
 from resource.models import Resource
 from parameter.services import load_params_for_lib, load_params_obj
 from monarch_pylib.model.transmission import distance_3d
+from monarch_pylib.model import task_ranking
+from algorithm.greedy_nests import t_comp, link_rate, _providers
 
-
-# The 2025 paper does not publish a separate numerical source-program size.
-# Keep L_k (cached service-environment size) untouched and derive the source
-# program size once, centrally, from the DTOSC-2022 reported ranges
-# (50..100 Mb source versus 500..1000 Mb cached environment).  Every runtime
-# and benchmark consumer must read ``source_program_size_bits`` from context.
 SOURCE_PROGRAM_TO_ENVIRONMENT_RATIO = 0.1
 SOURCE_PROGRAM_SIZE_REFERENCE_DOI = "10.1109/TVT.2022.3196544"
 
@@ -31,6 +27,7 @@ class MiniSystemContextBuilder:
         self._build_network_state()
         self._build_cache_state()
         self._build_assignment_state()
+        self._build_task_ranking_context()
         self._build_auxiliary_fields()
         return self.ctx
 
@@ -51,7 +48,7 @@ class MiniSystemContextBuilder:
         deadline_ms = float(app_type.deadline)
         deadline_s = deadline_ms / 1000.0
 
-        alpha_n = 0.01 / deadline_ms + 0.6
+        alpha_n = 0.01 / deadline_s + 0.6
         beta_n = 1.0 - alpha_n
 
         if not 0.0 <= alpha_n <= 1.0 or not 0.0 <= beta_n <= 1.0:
@@ -465,6 +462,115 @@ class MiniSystemContextBuilder:
                 for tid in self.ctx["task_ids"]
             },
         }
+
+    def _build_task_ranking_context(self):
+        task_ids = [int(task_id) for task_id in self.ctx["tasks"]["all"]]
+        providers = [int(sp_id) for sp_id in _providers(self.ctx)]
+
+        if not providers:
+            raise ValueError("Task ranking requires at least one provider")
+
+        average_compute_time = {}
+
+        for task_id in task_ids:
+            values = [
+                float(t_comp(self.ctx, sp_id, task_id))
+                for sp_id in providers
+            ]
+            average_compute_time[task_id] = sum(values) / len(values)
+
+        average_link_rates = []
+
+        for src_sp in providers:
+            for dst_sp in providers:
+                if src_sp == dst_sp:
+                    continue
+                value = float(link_rate(self.ctx, src_sp, dst_sp))
+                if value > 0:
+                    average_link_rates.append(value)
+
+        local_ranks = {}
+
+        for task_id in reversed(self.ctx["topological_order"]):
+            successors = [
+                int(value)
+                for value in self.ctx["children"].get(task_id, [])
+            ]
+
+            if not successors:
+                local_ranks[task_id] = average_compute_time[task_id]
+                continue
+
+            comm_times = []
+            successor_ranks = []
+
+            for successor_id in successors:
+                data_bits = (
+                    self.ctx["edge_data_bits"]
+                    .get(task_id, {})
+                    .get(
+                        successor_id,
+                        self.ctx["task_output_size_bits"].get(task_id, 0),
+                    )
+                )
+
+                transfer_times = [
+                    float(data_bits) / rate_value
+                    for rate_value in average_link_rates
+                    if rate_value > 0
+                ]
+
+                comm_times.append(
+                    sum(transfer_times) / len(transfer_times)
+                    if transfer_times
+                    else 0.0
+                )
+                successor_ranks.append(local_ranks[successor_id])
+
+            local_ranks[task_id] = task_ranking.heft_task_local_rank(
+                task_time_s=average_compute_time[task_id],
+                succ_comm_times_s=comm_times,
+                succ_ranks_s=successor_ranks,
+            )
+
+        global_ranks = {
+            task_id: task_ranking.heft_task_global_rank(
+                local_rank_s=float(rank),
+                max_deadline_s=float(self.ctx["deadline_max_s"]),
+                app_deadline_s=float(self.ctx["deadline_s"]),
+            )
+            for task_id, rank in local_ranks.items()
+        }
+
+        task_order = [
+            int(task_id)
+            for task_id, _ in sorted(
+                global_ranks.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+        ]
+
+        entry_task_id = int(self.ctx["entry_task_id"])
+
+        task_order = [
+            task_id
+            for task_id in task_order
+            if task_id != entry_task_id
+        ]
+
+        self.ctx["local_ranks"] = {
+            int(k): float(v)
+            for k, v in local_ranks.items()
+        }
+
+        self.ctx["global_ranks"] = {
+            int(k): float(v)
+            for k, v in global_ranks.items()
+        }
+
+        self.ctx["task_order"] = list(task_order)
+        self.ctx["ranked_task_ids"] = list(task_order)
 
     def _build_auxiliary_fields(self):
         self.ctx["idle_time"] = 0.0

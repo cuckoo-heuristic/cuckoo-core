@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from math import log10
 from random import Random
-from typing import Any
+from typing import Any, Tuple
 
 from parameter.services import load_params_for_lib, load_params_obj
 from monarch_pylib.model import block_coordinate_descent, offloading_efficiency
@@ -26,9 +26,41 @@ def _provider_height(ctx, sp_id: int) -> float:
     return float(params.h_rsu if ctx.get("sp_types", {}).get(sp_id) == "rsu" else params.h_vehicle)
 
 
-def link_distance(ctx, src_sp_id: int, dst_sp_id: int) -> float:
+def radio_endpoint_provider_id(ctx, sp_id: int) -> int:
+    """Resolve a compute provider to its physical wireless endpoint."""
+    sp_id = int(sp_id)
+    endpoint_id = int(ctx.get("sp_radio_endpoint_ids", {}).get(sp_id, sp_id))
+    if endpoint_id not in ctx.get("sp_types", {}):
+        raise ValueError(
+            f"Radio endpoint provider {endpoint_id} for compute provider {sp_id} is missing"
+        )
+    return endpoint_id
+
+
+def radio_link_key(ctx, src_sp_id: int, dst_sp_id: int) -> Tuple[int, int] | None:
+    """Return physical wireless link, or None for local/backhaul-only traffic."""
     src_sp_id = int(src_sp_id)
     dst_sp_id = int(dst_sp_id)
+
+    if src_sp_id == dst_sp_id:
+        return None
+
+    src_compute_type = ctx.get("sp_types", {}).get(src_sp_id)
+    dst_compute_type = ctx.get("sp_types", {}).get(dst_sp_id)
+    if src_compute_type == "rsu" and dst_compute_type == "rsu":
+        return None
+
+    src_radio_id = radio_endpoint_provider_id(ctx, src_sp_id)
+    dst_radio_id = radio_endpoint_provider_id(ctx, dst_sp_id)
+    if src_radio_id == dst_radio_id:
+        return None
+
+    return src_radio_id, dst_radio_id
+
+
+def link_distance(ctx, src_sp_id: int, dst_sp_id: int) -> float:
+    src_sp_id = radio_endpoint_provider_id(ctx, int(src_sp_id))
+    dst_sp_id = radio_endpoint_provider_id(ctx, int(dst_sp_id))
 
     if src_sp_id == dst_sp_id:
         return 0.0
@@ -102,29 +134,25 @@ def _winner_b1_los_pathloss_db(distance_m: float) -> float:
 
 def channel_gain(ctx, sp_id: int, dst_sp_id: int | None = None) -> float:
     if dst_sp_id is None:
-        src_sp_id = ctx.get("local_sp_id")
-        dst_sp_id = sp_id
+        src_compute_id = ctx.get("local_sp_id")
+        dst_compute_id = sp_id
     else:
-        src_sp_id = sp_id
+        src_compute_id = sp_id
+        dst_compute_id = dst_sp_id
 
-    if src_sp_id is None:
+    if src_compute_id is None:
         raise ValueError("Local service provider is not available")
 
-    src_sp_id = int(src_sp_id)
-    dst_sp_id = int(dst_sp_id)
-
-    if src_sp_id == dst_sp_id:
+    physical_key = radio_link_key(ctx, int(src_compute_id), int(dst_compute_id))
+    if physical_key is None:
         return 0.0
 
+    src_sp_id, dst_sp_id = physical_key
     src_type = ctx.get("sp_types", {}).get(src_sp_id)
     dst_type = ctx.get("sp_types", {}).get(dst_sp_id)
 
-    if src_type == "rsu" and dst_type == "rsu":
-        return 0.0
-
     gain_cache = ctx.setdefault("_channel_gain_cache", {})
     cache_key = (src_sp_id, dst_sp_id)
-
     if cache_key in gain_cache:
         return float(gain_cache[cache_key])
 
@@ -185,23 +213,20 @@ def compute_reference_time(ctx) -> float:
 
 def y_function(ctx, sp_id: int, p: float, z_selected: float = 1.0, dst_sp_id: int | None = None) -> float:
     if dst_sp_id is None:
-        src_sp_id = ctx.get("local_sp_id")
-        dst_sp_id = sp_id
+        src_compute_id = ctx.get("local_sp_id")
+        dst_compute_id = sp_id
     else:
-        src_sp_id = sp_id
+        src_compute_id = sp_id
+        dst_compute_id = dst_sp_id
 
-    if src_sp_id is None:
+    if src_compute_id is None:
         raise ValueError("Local service provider is not available")
 
-    src_sp_id = int(src_sp_id)
-    dst_sp_id = int(dst_sp_id)
-
-    if src_sp_id == dst_sp_id:
+    physical_key = radio_link_key(ctx, int(src_compute_id), int(dst_compute_id))
+    if physical_key is None:
         return 0.0
 
-    if ctx.get("sp_types", {}).get(src_sp_id) == "rsu" and ctx.get("sp_types", {}).get(dst_sp_id) == "rsu":
-        return 0.0
-
+    src_sp_id, dst_sp_id = physical_key
     alpha_n, beta_n = _weights(ctx)
 
     return block_coordinate_descent.tx_power_aux_function(
@@ -218,26 +243,22 @@ def y_function(ctx, sp_id: int, p: float, z_selected: float = 1.0, dst_sp_id: in
 
 def run(ctx, sp_id: int, pmax: float | None = None, z_selected: float = 1.0, dst_sp_id: int | None = None) -> float:
     if dst_sp_id is None:
-        src_sp_id = ctx.get("local_sp_id")
-        dst_sp_id = sp_id
+        src_compute_id = ctx.get("local_sp_id")
+        dst_compute_id = sp_id
     else:
-        src_sp_id = sp_id
+        src_compute_id = sp_id
+        dst_compute_id = dst_sp_id
 
-    if src_sp_id is None:
+    if src_compute_id is None:
         raise ValueError("Local service provider is not available")
 
-    src_sp_id = int(src_sp_id)
-    dst_sp_id = int(dst_sp_id)
-
-    if src_sp_id == dst_sp_id:
+    physical_key = radio_link_key(ctx, int(src_compute_id), int(dst_compute_id))
+    if physical_key is None:
         return 0.0
 
-    if ctx.get("sp_types", {}).get(src_sp_id) == "rsu" and ctx.get("sp_types", {}).get(dst_sp_id) == "rsu":
-        return 0.0
-
+    src_sp_id, dst_sp_id = physical_key
     power_cache = ctx.setdefault("_tx_power_cache", {})
     cache_key = (src_sp_id, dst_sp_id, float(z_selected), None if pmax is None else float(pmax))
-
     if cache_key in power_cache:
         return float(power_cache[cache_key])
 
@@ -258,7 +279,6 @@ def run(ctx, sp_id: int, pmax: float | None = None, z_selected: float = 1.0, dst
 
     while p_u - p_l > eps:
         p_mid = 0.5 * (p_l + p_u)
-
         if y_function(ctx, src_sp_id, p_mid, z_selected=z_selected, dst_sp_id=dst_sp_id) <= 0.0:
             p_l = p_mid
         else:

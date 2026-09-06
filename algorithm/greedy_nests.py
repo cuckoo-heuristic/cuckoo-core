@@ -8,7 +8,11 @@ from parameter.services import load_params_for_lib, load_params_obj
 from monarch_pylib.model import communication, offloading_efficiency, policy, scheduling, transmission
 from monarch_pylib.model.transmission import v2i_uplink_rate
 
-from .low_complexity import run as optimize_tx_power, channel_gain
+from .low_complexity import (
+    run as optimize_tx_power,
+    channel_gain,
+    radio_link_key,
+)
 
 params = load_params_obj()
 params_lib = load_params_for_lib()
@@ -178,17 +182,13 @@ def link_rate(ctx, src_sp_id: int, dst_sp_id: int) -> float:
     src_sp_id = int(src_sp_id)
     dst_sp_id = int(dst_sp_id)
 
-    if src_sp_id == dst_sp_id:
+    physical_key = radio_link_key(ctx, src_sp_id, dst_sp_id)
+    if physical_key is None:
         return 0.0
 
-    src_type = ctx.get("sp_types", {}).get(src_sp_id)
-    dst_type = ctx.get("sp_types", {}).get(dst_sp_id)
-
-    if src_type == "rsu" and dst_type == "rsu":
-        return 0.0
-
+    radio_src_id, radio_dst_id = physical_key
     rate_cache = ctx.setdefault("_link_rate_cache", {})
-    cache_key = (src_sp_id, dst_sp_id)
+    cache_key = (radio_src_id, radio_dst_id)
     if cache_key in rate_cache:
         return float(rate_cache[cache_key])
 
@@ -198,11 +198,7 @@ def link_rate(ctx, src_sp_id: int, dst_sp_id: int) -> float:
     value = float(
         v2i_uplink_rate(
             B_hz=float(params_lib.B_hz),
-            V_m=_link_bandwidth_divisor(
-                ctx,
-                src_sp_id,
-                dst_sp_id,
-            ),
+            V_m=_link_bandwidth_divisor(ctx, radio_src_id, radio_dst_id),
             tx_power_pn=p_opt,
             channel_gain_gnm=gain,
             noise_power_delta2=float(params_lib.delta2_w),
@@ -226,26 +222,27 @@ def _tx_time_energy(ctx, src_sp_id: int, dst_sp_id: int, data_bits: float) -> Tu
     dst_sp_id = int(dst_sp_id)
     data_bits = float(data_bits)
 
-    if src_sp_id == dst_sp_id or data_bits <= 0.0:
+    if data_bits <= 0.0:
         return 0.0, 0.0
 
-    if ctx.get("sp_types", {}).get(src_sp_id) == "rsu" and ctx.get("sp_types", {}).get(dst_sp_id) == "rsu":
+    physical_key = radio_link_key(ctx, src_sp_id, dst_sp_id)
+    if physical_key is None:
         return 0.0, 0.0
 
+    radio_src_id, radio_dst_id = physical_key
     tx_cache = ctx.setdefault("_tx_time_energy_cache", {})
-    cache_key = (src_sp_id, dst_sp_id, data_bits)
+    cache_key = (radio_src_id, radio_dst_id, data_bits)
     if cache_key in tx_cache:
         item = tx_cache[cache_key]
         return float(item[0]), float(item[1])
 
     r = link_rate(ctx, src_sp_id, dst_sp_id)
-
     if r <= 0.0:
         raise ValueError(f"Link {src_sp_id}->{dst_sp_id} has no positive transmission rate")
 
     tx_time = transmission.intermediate_data_tx_time(data_bits=data_bits, link_rate_bps=r)
     p_opt = optimize_tx_power(ctx, sp_id=src_sp_id, dst_sp_id=dst_sp_id)
-    if ctx.get("sp_types", {}).get(src_sp_id) == "vehicle":
+    if ctx.get("sp_types", {}).get(radio_src_id) == "vehicle":
         tx_energy = transmission.intermediate_data_tx_energy(tx_power_w=p_opt, tx_time_s=tx_time)
     else:
         tx_energy = 0.0
@@ -349,11 +346,15 @@ def _candidate_dependency_ready_and_energy(ctx, state, sp_id: int, task_id: int)
             data_bits = fallback_output.get(pred, 0.0)
 
         tx_time, tx_energy = _tx_time_energy(ctx, src_sp, int(sp_id), float(data_bits))
-        link_key = (src_sp, int(sp_id))
-        idle_time = float(link_finish.get(link_key, ctx.get("idle_time", 0.0)))
-        transfer_start = max(finish_src, idle_time)
-        arrival_time = transfer_start + tx_time
-        link_finish[link_key] = arrival_time
+        link_key = radio_link_key(ctx, src_sp, int(sp_id))
+        if link_key is None:
+            transfer_start = finish_src
+            arrival_time = finish_src + tx_time
+        else:
+            idle_time = float(link_finish.get(link_key, ctx.get("idle_time", 0.0)))
+            transfer_start = max(finish_src, idle_time)
+            arrival_time = transfer_start + tx_time
+            link_finish[link_key] = arrival_time
 
         recv_times.append(arrival_time)
         tx_energy_total += tx_energy

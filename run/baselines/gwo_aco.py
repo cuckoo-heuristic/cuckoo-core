@@ -1,30 +1,43 @@
+
 from __future__ import annotations
 
 import copy
 from typing import Any, Dict, Optional
 
-from algorithm.main_dcsga import dcsga_run
+from parameter.services import load_params_obj
 
 
-class DCSGA:
-    name = "DCSGA"
-    key = "dcsga"
+
+class GWO_ACO:
+    name = "PC-ADGWO"
+    key = "gwo_aco"
+    article_exact = False
+    implementation = "predictive-cache-guided-adaptive-discrete-gwo-aco"
+    reference_doi = "10.1016/j.advengsoft.2013.12.007"
 
     def run(
         self,
         base_ctx: Dict[str, Any],
         seed: Optional[int] = None,
     ):
-        if not isinstance(base_ctx, dict):
-            raise TypeError("base_ctx must be a dictionary")
+        from algorithm.gwo.core import run_gwo_aco
 
         ctx = copy.deepcopy(base_ctx)
-        ctx["seed"] = seed
+        if seed is not None:
+            ctx["seed"] = int(seed)
         ctx["scheme"] = self.key
         ctx["use_ranking"] = True
         ctx["use_caching"] = True
         ctx["v2i_only"] = False
-        return dcsga_run(ctx)
+
+        params = load_params_obj()
+        tmax = max(1, int(ctx.get("tmax", 10)))
+        return run_gwo_aco(
+            ctx,
+            population_size=int(params.S),
+            iterations=tmax - 1,
+            initial_discard_probability=float(params.p_discard_init),
+        )
 
     def run_joint(
         self,
@@ -35,9 +48,8 @@ class DCSGA:
         population_size: int | None = None,
         max_function_evaluations: int | None = None,
     ):
-        from run.benchmark.search import run_joint_dcsga
-
-        return run_joint_dcsga(
+        from run.benchmark.search import run_joint_gwo_aco
+        return run_joint_gwo_aco(
             joint_ctx,
             algorithm=self.key,
             seed=seed,

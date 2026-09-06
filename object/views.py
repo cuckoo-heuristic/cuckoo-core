@@ -8,7 +8,9 @@ from django.db import models
 from django.utils.dateparse import parse_datetime
 from .models import Vehicle, RSU, RSUVehicle, ServiceProvider
 from .serializer import VehicleSer,RSUSer, RSUVehicleSer, ServiceProviderSer
+from system.reset_utils import restore_initial_snapshot
 from state.models import State
+from run.simulation.runtime_status import vehicle_is_mission
 
 def make_snapshot(obj):
     data = model_to_dict(obj)
@@ -93,18 +95,7 @@ class BaseResetOneAPI(APIView):
                 status=400
             )
 
-        for field, value in snap.items():
-            model_field = obj._meta.get_field(field)
-            if isinstance(model_field, models.ForeignKey):
-                setattr(obj, model_field.attname, value)
-                continue
-            if isinstance(model_field, models.DateTimeField) and isinstance(value, str):
-                setattr(obj, field, parse_datetime(value))
-                continue
-
-            setattr(obj, field, value)
-
-        obj.save()
+        restore_initial_snapshot(obj, snap)
         return Response(
             {"detail": "Reset to initial POST snapshot done."},
             status=200
@@ -119,18 +110,7 @@ def post(self, request, pk):
     if not snap:
         return Response({"error": "No initial snapshot saved for this object."}, status=400)
 
-    for field, value in snap.items():
-        model_field = obj._meta.get_field(field)
-        if isinstance(model_field, models.ForeignKey):
-            setattr(obj, model_field.attname, value)
-            continue
-        if isinstance(model_field, models.DateTimeField) and isinstance(value, str):
-            setattr(obj, field, parse_datetime(value))
-            continue
-
-        setattr(obj, field, value)
-
-    obj.save()
+    restore_initial_snapshot(obj, snap)
     return Response({"detail": "Reset to initial POST snapshot done."}, status=200)
 
 
@@ -268,12 +248,7 @@ class VehicleMissionAPI(APIView):
         )
     )
     def get(self, request, pk):
-        mission = State.objects.filter(
-            from_vehicle_id=pk,
-            task_execution_id__end_time__isnull=True
-        ).exists()
-
-        return Response({"vehicle_id": pk, "is_mission": mission})
+        return Response({"vehicle_id": pk, "is_mission": vehicle_is_mission(pk)})
 
 class RSUActiveAPI(APIView):
     @extend_schema(

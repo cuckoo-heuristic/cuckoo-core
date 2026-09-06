@@ -49,6 +49,12 @@ class Command(BaseCommand):
             help="Optional smoke-test override. Omit it to use Parameter.S.",
         )
         parser.add_argument(
+            "--max-function-evaluations",
+            type=int,
+            default=None,
+            help="Optional exact objective-evaluation budget for population algorithms.",
+        )
+        parser.add_argument(
             "--context-only",
             action="store_true",
             help="Build and validate the joint context without running algorithms.",
@@ -101,6 +107,9 @@ class Command(BaseCommand):
                     seeds=options.get("seeds"),
                     tmax=options.get("tmax", 10),
                     population_size=options.get("population_size"),
+                    max_function_evaluations=options.get(
+                        "max_function_evaluations"
+                    ),
                 )
         except (ValueError, KeyError, TypeError) as exc:
             raise CommandError(str(exc)) from exc

@@ -33,11 +33,14 @@ ALGORITHMS = JOINT_BENCHMARK_ALGORITHMS
 
 
 def _apply_paper_source_program_model(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """Validate the centrally derived source-program sizes in a context.
+    """Validate the source-program model used by the paper benchmark.
 
-    Source-program size is created by ``MiniSystemContextBuilder``.  The
-    benchmark must consume that exact field rather than deriving a second,
-    benchmark-only value.
+    The 2025 article explicitly includes the energy of transmitting service
+    programs in Eq. (27).  What the article does *not* publish numerically is
+    the source-program data size used by that energy term.  The project derives
+    that size once in ``MiniSystemContextBuilder`` and the benchmark consumes
+    the same stored value; it must not silently remove the Eq. (27) term or
+    substitute the cache-environment size ``L_k``.
     """
 
     service_sizes = {
@@ -76,6 +79,14 @@ def _apply_paper_source_program_model(ctx: Dict[str, Any]) -> Dict[str, Any]:
         )
 
     ctx["source_program_size_bits"] = source_sizes
+
+    # Scientific provenance: Eq. (27) of the 2025 article contains a separate
+    # service-program transmission-energy term.  Its mathematical presence is
+    # article-aligned; only the numerical source-program size is reconstructed.
+    # These flags are metadata only and do not alter runtime behaviour.
+    ctx["service_program_transfer_energy_enabled"] = True
+    ctx["service_program_transfer_energy_article_equation"] = 27
+    ctx["service_program_transfer_energy_structure_article_exact"] = True
     return ctx
 
 
@@ -730,6 +741,7 @@ def run_joint_context_benchmark(
     seeds: Iterable[int] | None = None,
     tmax: int = 10,
     population_size: int | None = None,
+    max_function_evaluations: int | None = None,
     export_artifacts: bool = True,
 ) -> Dict[str, Any]:
     # Work on an isolated copy. Worker/simulation execution is separate from
@@ -752,6 +764,13 @@ def run_joint_context_benchmark(
     )
     if actual_population_size <= 0:
         raise ValueError("Population size must be positive")
+    if (
+        max_function_evaluations is not None
+        and int(max_function_evaluations) < actual_population_size
+    ):
+        raise ValueError(
+            "max_function_evaluations must be at least population_size"
+        )
     runs: List[Dict[str, Any]] = []
 
     for seed in seed_values:
@@ -763,6 +782,12 @@ def run_joint_context_benchmark(
                 seed=int(seed),
                 tmax=max(1, int(tmax)),
                 population_size=population_size,
+                max_function_evaluations=(
+                    int(max_function_evaluations)
+                    if max_function_evaluations is not None
+                    and algorithm_name != "dtosc"
+                    else None
+                ),
             )
             runtime_seconds = perf_counter() - started_at
             uses_population = algorithm_name != "dtosc"
@@ -781,6 +806,18 @@ def run_joint_context_benchmark(
             result["convergence"] = _run_convergence(history)
             result["final_function_evaluations"] = int(
                 result["convergence"]["function_evaluations"]
+            )
+            result["executed_iterations"] = max(0, len(history) - 1)
+            result["evaluation_budget"] = (
+                None
+                if max_function_evaluations is None or not uses_population
+                else int(max_function_evaluations)
+            )
+            result["evaluation_budget_exhausted"] = bool(
+                uses_population
+                and max_function_evaluations is not None
+                and result["final_function_evaluations"]
+                >= int(max_function_evaluations)
             )
             result["best_nest"] = [
                 {
@@ -828,11 +865,21 @@ def run_joint_context_benchmark(
                 result["rank_seed_aligned"] = True
                 result["rank_seed"] = int(seed)
             else:
-                result["implementation"] = "article-aligned-ablation"
-                result["reference_doi"] = "10.1109/TVT.2025.3540639"
+                result["implementation"] = str(
+                    getattr(algorithm, "implementation", algorithm_name)
+                )
+                result["reference_doi"] = str(
+                    getattr(algorithm, "reference_doi", "")
+                )
             runs.append(result)
 
     scenario = _scenario_metadata(joint_ctx)
+    budget_incomplete = [
+        run["algorithm"]
+        for run in runs
+        if run.get("evaluation_budget") is not None
+        and not bool(run.get("evaluation_budget_exhausted", False))
+    ]
     speed_density_exact = bool(
         scenario.get("article_speed_density_model", False)
     )
@@ -854,6 +901,18 @@ def run_joint_context_benchmark(
             "article_exact_power_sender_model": False,
             "article_cache_update_persistence_timing": True,
             "source_program_separated_from_cache_environment": True,
+            "service_program_transfer_energy_enabled": bool(
+                joint_ctx.get("service_program_transfer_energy_enabled", True)
+            ),
+            "service_program_transfer_energy_article_equation": int(
+                joint_ctx.get("service_program_transfer_energy_article_equation", 27)
+            ),
+            "service_program_transfer_energy_structure_article_exact": bool(
+                joint_ctx.get(
+                    "service_program_transfer_energy_structure_article_exact",
+                    True,
+                )
+            ),
             "source_program_size_article_exact": False,
             "source_program_size_model": joint_ctx.get(
                 "source_program_size_model"
@@ -876,10 +935,18 @@ def run_joint_context_benchmark(
         },
         "warnings": [
             "DTOSC uses the legacy pre-repair stage-wise provider-path dynamic-programming reconstruction. It is retained for reproducibility/sensitivity and is not claimed to be source-exact DTOSC 2022.",
-            "The 2025 paper does not report a separate numerical source-program size. A single context-level source size is therefore derived as 0.1 * L_k from the DTOSC-2022 reported ranges and is shared by runtime and benchmark; cache capacity still uses L_k and compile/install work still uses W_k.",
+            "Equation (27) of the 2025 paper explicitly includes energy for transmitting service programs. The paper does not publish the numerical source-program data size, so the current 0.1 * L_k source-size value remains a declared DTOSC-2022-derived reconstruction. The benchmark keeps the Eq. (27) energy term enabled; cache capacity still uses L_k and compile/install work still uses W_k.",
             "The V2V channel and sender-side power model remain declared approximations.",
             "The 2025 paper reports 10 applications/s but does not specify how temporal arrivals are integrated into Figures 6-10; this static joint benchmark therefore does not invent an arrival process.",
-        ],
+        ] + (
+            [
+                "The requested objective-evaluation budget was not exhausted by: "
+                + ", ".join(budget_incomplete)
+                + ". Increase tmax; final algorithm comparisons are not budget-matched until every population algorithm reaches the same NFE cap."
+            ]
+            if budget_incomplete
+            else []
+        ),
         "context": joint_context_summary(joint_ctx),
         "scenario": scenario,
         "application_ids": application_ids,
@@ -888,6 +955,12 @@ def run_joint_context_benchmark(
         "tmax": max(1, int(tmax)),
         "population_size": actual_population_size,
         "population_size_override": population_size,
+        "max_function_evaluations": (
+            None
+            if max_function_evaluations is None
+            else int(max_function_evaluations)
+        ),
+        "evaluation_budget_fully_consumed": not bool(budget_incomplete),
         "runs": runs,
         "summary": _joint_summary(runs),
     }
@@ -906,6 +979,7 @@ def run_joint_benchmark(
     seeds: Iterable[int] | None = None,
     tmax: int = 10,
     population_size: int | None = None,
+    max_function_evaluations: int | None = None,
     export_artifacts: bool = True,
 ) -> Dict[str, Any]:
     application_ids = _unique_ints(application_ids)
@@ -918,5 +992,6 @@ def run_joint_benchmark(
         seeds=seeds,
         tmax=tmax,
         population_size=population_size,
+        max_function_evaluations=max_function_evaluations,
         export_artifacts=export_artifacts,
     )

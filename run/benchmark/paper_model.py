@@ -56,9 +56,7 @@ def _positive_finite(value: float, name: str) -> float:
 def article_weights(deadline_s: float) -> ApplicationWeights:
     deadline_s = _positive_finite(deadline_s, "deadline_s")
 
-    deadline_ms = deadline_s * 1000.0
-
-    alpha = 0.01 / deadline_ms + 0.6
+    alpha = 0.01 / deadline_s + 0.6
     beta = 1.0 - alpha
     if not (0.0 <= alpha <= 1.0 and 0.0 <= beta <= 1.0):
         raise PaperModelError("The article weights must be between zero and one")

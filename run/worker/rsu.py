@@ -270,9 +270,6 @@ class RSUWorker(threading.Thread):
             return False
 
         scheduler_busy = getattr(self.cfg, "runtime_scheduler_busy", None)
-        if scheduler_busy is not None:
-            scheduler_busy.set()
-
         scheduler_locked = False
         completed = False
 
@@ -280,6 +277,11 @@ class RSUWorker(threading.Thread):
             scheduler_locked = _try_lock_runtime_scheduler()
             if not scheduler_locked:
                 return False
+            # Only the process that owns the advisory lock may freeze the
+            # logical scheduler clock. A losing worker must not leave the
+            # shared busy flag set forever.
+            if scheduler_busy is not None:
+                scheduler_busy.set()
 
             # Re-read after acquiring the process-wide scheduler lock.
             applications = self._next_pending_batch()

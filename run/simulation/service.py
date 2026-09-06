@@ -230,6 +230,20 @@ def _get_sim_time_s() -> float:
         return float(_sim_time_s)
 
 
+def get_logical_now():
+    """Return current logical simulation datetime, or None when stopped."""
+    with _registry_lock:
+        cfg = _cfg
+        active = bool(_running or _stopping)
+        sim_time_s = float(_sim_time_s)
+        base_time = getattr(cfg, "base_time", None) if cfg is not None else None
+
+    if not active or base_time is None:
+        return None
+
+    return _sim_now_dt(base_time, sim_time_s)
+
+
 def _set_sim_time_s(v: float) -> None:
     global _sim_time_s
     with _registry_lock:

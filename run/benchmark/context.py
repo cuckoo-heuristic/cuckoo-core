@@ -165,6 +165,10 @@ def _apply_snapshot_context(
     rsu_height = float(params.h_rsu)
     compute_sp_positions = copy.deepcopy(ctx.get("sp_position", {}))
     sp_positions = copy.deepcopy(compute_sp_positions)
+    radio_endpoint_provider_ids = {
+        int(sp_id): int(sp_id)
+        for sp_id in ctx.get("provider_ids", [])
+    }
     access_rsu_id = snapshot.vehicle_rsu_ids.get(vehicle_id)
     access_rsu_provider_id = None
     access_rsu_position = None
@@ -207,6 +211,7 @@ def _apply_snapshot_context(
             # endpoint of the mission vehicle's access RSU; the MEC provider ID
             # remains unchanged for CPU, queue and cache accounting.
             sp_positions[sp_id] = access_rsu_position
+            radio_endpoint_provider_ids[sp_id] = int(access_rsu_provider_id)
 
     distances: Dict[int, float] = {}
     connected_counts: Dict[int, float] = {}
@@ -246,6 +251,7 @@ def _apply_snapshot_context(
         else:
             connected_counts[sp_id] = alliance_count
     ctx["sp_position"] = sp_positions
+    ctx["sp_radio_endpoint_ids"] = radio_endpoint_provider_ids
     ctx["distance"] = distances
     ctx["v_m"] = connected_counts
     if route_remote_mec_via_access_rsu:
@@ -321,15 +327,19 @@ def build_synthetic_benchmark_context(
     vehicle: Vehicle,
     application_type: ApplicationType,
     snapshot: BenchmarkSnapshot,
+    *,
+    deadline_ms: float | None = None,
 ) -> Dict[str, Any]:
-    deadline_ms = float(application_type.deadline)
+    deadline_ms = float(
+        application_type.deadline if deadline_ms is None else deadline_ms
+    )
     deadline_s = deadline_ms / 1000.0
 
-    alpha_n = 0.01 / deadline_ms + 0.6
+    alpha_n = 0.01 / deadline_s + 0.6
     beta_n = 1.0 - alpha_n
     if not 0.0 <= alpha_n <= 1.0 or not 0.0 <= beta_n <= 1.0:
         raise ValueError(
-            f"Application type {application_type.id} produces invalid paper weights"
+            f"Synthetic deadline {deadline_ms} ms produces invalid paper weights"
         )
     builder = MiniSystemContextBuilder(application_id=int(application_id))
     builder.ctx = {
@@ -341,6 +351,8 @@ def build_synthetic_benchmark_context(
         },
         "application_initial_snapshot": {
             "synthetic_paper_scenario": True,
+            "scenario_deadline_ms": float(deadline_ms),
+            "dag_template_application_type_id": int(application_type.id),
         },
         "application_type_initial_snapshot": application_type.initial_snapshot or {},
         "application_start_at": snapshot.at,
@@ -890,6 +902,11 @@ def build_synthetic_joint_context(
             "application_id": int(row["application_id"]),
             "vehicle_id": int(row["vehicle_id"]),
             "application_type_id": int(row["application_type_id"]),
+            "deadline_ms": (
+                None
+                if row.get("deadline_ms") is None
+                else float(row["deadline_ms"])
+            ),
         }
         for row in assignments
     ]
@@ -920,6 +937,7 @@ def build_synthetic_joint_context(
             vehicles[row["vehicle_id"]],
             application_types[row["application_type_id"]],
             snapshot,
+            deadline_ms=row["deadline_ms"],
         )
     _apply_mec_capacity_override(application_contexts, mec_capacity_ghz)
     for app_ctx in application_contexts.values():

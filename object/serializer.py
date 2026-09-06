@@ -1,8 +1,6 @@
 from rest_framework import serializers
 from .models import Vehicle, RSU, RSUVehicle, ServiceProvider
-from state.models import State
-from execution.models import TaskExecution
-from rest_framework import serializers
+from run.simulation.runtime_status import vehicle_is_mission
 
 class RSUSer(serializers.ModelSerializer):
     is_active = serializers.BooleanField(read_only=True)
@@ -65,9 +63,5 @@ class VehicleSer(serializers.ModelSerializer):
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
-        mission_running = State.objects.filter(
-            from_vehicle_id=instance.id,
-            task_execution_id__in=TaskExecution.objects.filter(end_time__isnull=True).values("id"),
-        ).exists()
-        data["is_mission"] = mission_running
+        data["is_mission"] = vehicle_is_mission(instance.id)
         return data
