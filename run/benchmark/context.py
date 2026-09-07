@@ -498,6 +498,24 @@ def _natural_topological_order(app_ctx: Dict[str, Any]) -> List[int]:
     return order
 
 
+def _round_robin_orders(orders: Iterable[Iterable[int]]) -> List[int]:
+    """Interleave per-application task orders without breaking either DAG.
+
+    The paper defines TO-w.o.-R as selecting tasks from the top to the bottom
+    *in turn* across application DAGs.  Concatenating complete DAGs makes the
+    result depend on application-list position and can starve every later
+    application.  A round-robin merge preserves each application's natural
+    topological order while implementing the stated inter-application turn.
+    """
+    pending = [list(order) for order in orders]
+    merged: List[int] = []
+    while any(pending):
+        for order in pending:
+            if order:
+                merged.append(int(order.pop(0)))
+    return merged
+
+
 def _apply_article_cpu_model(app_ctx: Dict[str, Any]) -> None:
 
 
@@ -659,7 +677,7 @@ def _assemble_joint_context(
     entry_task_ids: Dict[int, int] = {}
     optimized_task_ids: List[int] = []
     ranked_rows: List[Tuple[int, float]] = []
-    unranked_task_ids: List[int] = []
+    unranked_orders: List[List[int]] = []
     task_domains: Dict[int, List[int]] = {}
     next_joint_task_id = 1
 
@@ -701,9 +719,11 @@ def _assemble_joint_context(
                     (joint_task_id, float(local_ranks[original_task_id]) + urgency)
                 )
 
-        for original_task_id in natural_order:
-            if original_task_id != entry_original_id:
-                unranked_task_ids.append(original_to_joint[original_task_id])
+        unranked_orders.append([
+            original_to_joint[original_task_id]
+            for original_task_id in natural_order
+            if original_task_id != entry_original_id
+        ])
 
         app_ctx["entry_task_id"] = int(entry_original_id)
         app_ctx["optimized_task_ids"] = [
@@ -712,6 +732,7 @@ def _assemble_joint_context(
             if int(task_id) != entry_original_id
         ]
 
+    unranked_task_ids = _round_robin_orders(unranked_orders)
     ranked_task_ids = [
         joint_task_id
         for joint_task_id, _ in sorted(
@@ -778,6 +799,9 @@ def _assemble_joint_context(
         "optimized_task_ids": optimized_task_ids,
         "ranked_task_ids": ranked_task_ids,
         "unranked_task_ids": unranked_task_ids,
+        "unranked_task_order_model": (
+            "round-robin natural-topological order across application DAGs"
+        ),
         "task_domains": task_domains,
         "provider_ids": provider_ids,
         "initial_cache": _merge_initial_cache(application_contexts),
@@ -967,6 +991,9 @@ def joint_context_summary(joint_ctx: Dict[str, Any]) -> Dict[str, Any]:
         "optimized_task_count": len(joint_ctx["optimized_task_ids"]),
         "ranked_task_ids": list(joint_ctx["ranked_task_ids"]),
         "unranked_task_ids": list(joint_ctx["unranked_task_ids"]),
+        "unranked_task_order_model": joint_ctx.get(
+            "unranked_task_order_model"
+        ),
         "entry_tasks": {
             str(app_id): joint_ctx["task_refs"][joint_task_id].to_dict()
             for app_id, joint_task_id in joint_ctx["entry_task_ids"].items()

@@ -413,8 +413,9 @@ def _paired_algorithm_statistics(
             p_value = None
             if nonzero:
                 try:
-                    from scipy.stats import wilcoxon
+                    from importlib import import_module
 
+                    wilcoxon = import_module("scipy.stats").wilcoxon
                     p_value = float(
                         wilcoxon(
                             [by_algorithm[left][key] for key in keys],
@@ -1162,6 +1163,11 @@ def _standard_rows(
             "evaluation_budget_exhausted": bool(
                 run.get("evaluation_budget_exhausted", False)
             ),
+            # Runtime diagnostics are required by Figure 8 and are also useful
+            # for the NFE/fairness audit of Figures 7-10. Keep safe defaults so
+            # legacy/non-population baselines cannot trigger a KeyError.
+            "runtime_seconds": float(run.get("runtime_seconds", 0.0) or 0.0),
+            "executed_iterations": int(run.get("executed_iterations", 0) or 0),
         }
         run_rows.append(row)
         for application in run["applications"]:
