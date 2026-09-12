@@ -56,6 +56,7 @@ ALGORITHM_LABELS = {
     "gwo_aco": "PC-ADGWO",
     "pso": "MA-CDPSO",
     "gpc": "SAM-ADGPC",
+    "cpo": "CA-DCPO",
 }
 PAPER_FIGURE_ALGORITHMS = {
     "figure_6": ("dcsga",),
@@ -1441,6 +1442,8 @@ def _iteration_diagnostics(item: Dict[str, Any]) -> Dict[str, Any]:
             "population_mean_hamming",
             "population_diversity_mean",
         ),
+        "active_population_size": ("active_population_size",),
+        "search_progress": ("search_progress",),
         "best_improved": ("best_improved",),
         "stagnation_generations": (
             "stagnation_generations",
@@ -1462,6 +1465,9 @@ def _iteration_diagnostics(item: Dict[str, Any]) -> Dict[str, Any]:
             (item[key] for key in input_keys if item.get(key) is not None),
             None,
         )
+    defenses = item.get("defense_trials", {}) or {}
+    for name in ("sight", "sound", "odor", "physical_attack", "restart"):
+        result[f"cpo_{name}_trials"] = int(defenses.get(name, 0) or 0)
     return result
 
 
@@ -1652,6 +1658,7 @@ def _plot_figure_6(rows: Sequence[Dict[str, Any]],output_base: Path,) -> None:
         "gwo_aco": {"color": "#7B2CBF", "marker": "s"},
         "gpc": {"color": "#2A9D8F", "marker": "^"},
         "pso": {"color": "#E76F51", "marker": "D"},
+        "cpo": {"color": "#D81B60", "marker": "P"},
     }
 
     figure, axis = plt.subplots(figsize=(8.0, 5.2))
@@ -1795,6 +1802,7 @@ def _plot_figure_6_nfe(
         "gwo_aco": {"color": "#7B2CBF", "marker": "s"},
         "gpc": {"color": "#2A9D8F", "marker": "^"},
         "pso": {"color": "#E76F51", "marker": "D"},
+        "cpo": {"color": "#D81B60", "marker": "P"},
     }
     figure, axis = plt.subplots(figsize=(8.0, 5.2))
     for algorithm in _algorithms_from_rows(rows):
@@ -1877,6 +1885,11 @@ def _line_panel(axis, rows: Sequence[Dict[str, Any]], metric: str, x_key: str, x
         "gwo_aco": {
             "color": "#7B2CBF",
             "marker": "s",
+            "linestyle": "--",
+        },
+        "cpo": {
+            "color": "#D81B60",
+            "marker": "X",
             "linestyle": "--",
         },
     }
@@ -2051,6 +2064,7 @@ def _plot_figure_9(rows: Sequence[Dict[str, Any]],output_base: Path,) -> None:
         "dcsga": "#0072B2",
         "dtosc": "#009E73",
         "gwo_aco": "#7B2CBF",
+        "cpo": "#D81B60",
     }
 
     for algorithm_index, algorithm in enumerate(algorithms):
@@ -2138,6 +2152,7 @@ def _plot_figure_10(
         "dcsga": {"color": "#0072B2", "marker": "o"},
         "dtosc": {"color": "#009E73", "marker": "^"},
         "gwo_aco": {"color": "#7B2CBF", "marker": "s"},
+        "cpo": {"color": "#D81B60", "marker": "X"},
     }
 
     for algorithm in _algorithms_from_rows(rows):
@@ -3326,6 +3341,40 @@ def run_paper_experiment(
                 "local_refinement": "pbest-frequency plus service-type back-off around gbest",
                 "categorical_move": "one-hot velocity with an O(sqrt(D)) projection trust region",
                 "position_acceptance": "standard PSO movement; pbest/gbest retain elitism",
+            },
+            "cpo": {
+                "name": "CA-DCPO",
+                "revision": "nfe-aware-elite-service-v2",
+                "reference_doi": "10.1016/j.knosys.2023.111257",
+                "population_size": int(actual_population_size),
+                "greedy_ratio": 0.75,
+                "diverse_dlhs_ratio": 0.25,
+                "four_defenses": ["sight", "sound", "odor", "physical_attack"],
+                "exploration_defenses": ["sight", "sound"],
+                "exploitation_defenses": ["odor", "physical_attack"],
+                "cpr_cycles": 2,
+                "cpr_minimum_ratio": 0.80,
+                "stagnation_restart_after": 3,
+                "restart_fraction": 0.15,
+                "success_memory_evaporation": 0.10,
+                "provider_memory_weight": 0.65,
+                "adaptation_clock": "consumed search NFE when max_function_evaluations is set; generation fraction otherwise",
+                "minimum_defense_shares": {
+                    "sight": 0.10,
+                    "sound": 0.10,
+                    "odor": 0.16,
+                    "physical_attack": 0.28,
+                },
+                "elite_profile_size": 8,
+                "physical_archive_probability": 0.88,
+                "exploration_radius": "ceil(2 + (ceil(log2(D+1))-2)*(1-progress))",
+                "exploitation_radius": "ceil(1 + 3*(1-progress)); physical attack changes one coordinate",
+                "criticality_guidance": "seed-aligned DCSGA task rank used only for neighborhood selection",
+                "elite_disagreement_guidance": "rank-weighted top-8 provider disagreement guides physical attacks",
+                "service_affinity_guidance": "bounded same-service odor blocks and accepted task/service-provider moves guide proposals without changing fitness",
+                "categorical_move": "domain-valid logarithmic global and 1-to-4-coordinate local neighborhoods; provider IDs are never treated as continuous coordinates",
+                "survival": "elitist parent/archive pool with exact objective-evaluation accounting",
+                "article_exact": False,
             },
         },
         "declared_limitations": [

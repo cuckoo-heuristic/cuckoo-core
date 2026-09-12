@@ -30,6 +30,7 @@ SCHEMES: Dict[str, JointScheme] = {
     "gwo_aco": JointScheme("gwo_aco", True, True, False, "all"),
     "pso": JointScheme("pso", True, True, False, "all"),
     "gpc": JointScheme("gpc", True, True, False, "all"),
+    "cpo": JointScheme("cpo", True, True, False, "all"),
 }
 
 

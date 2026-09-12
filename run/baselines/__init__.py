@@ -6,6 +6,7 @@ from .to_wo_r import TO_WO_R
 from .gwo_aco import GWO_ACO
 from .pso import PSO
 from .gpc import GPC
+from .cpo import CPO
 
 
 ALL_ALGORITHMS = {
@@ -17,6 +18,7 @@ ALL_ALGORITHMS = {
     "gwo_aco": GWO_ACO(),
     "pso": PSO(),
     "gpc": GPC(),
+    "cpo": CPO(),
 }
 
 PAPER_ALGORITHM_NAMES = (

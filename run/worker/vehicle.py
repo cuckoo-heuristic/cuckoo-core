@@ -478,6 +478,20 @@ class ApplicationGeneratorWorker(threading.Thread):
         self.cfg.runtime_created_applications = int(self._created_applications)
         self.cfg.runtime_skipped_applications = int(self._skipped_applications)
 
+        # Keep the database flag synchronized with the runtime mission set.
+        # The scheduler itself uses runtime_mission_vehicle_ids, but storing the
+        # same information in Vehicle makes database inspection/debugging clear.
+        try:
+            Vehicle.objects.update(is_mission=False)
+            if self._mission_vehicle_ids:
+                Vehicle.objects.filter(
+                    id__in=[int(v) for v in self._mission_vehicle_ids]
+                ).update(is_mission=True)
+        except Exception:
+            # Database synchronization must not stop the simulation workers.
+            # Runtime mission selection remains the source of truth.
+            pass
+
     def _connected_vehicle_ids(self) -> List[int]:
         return [
             int(vehicle_id)

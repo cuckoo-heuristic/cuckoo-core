@@ -1430,3 +1430,100 @@ def run_joint_gpc(
         v2i_only=scheme.v2i_only,
     )
     return best_solution, evaluation, history
+
+
+def run_joint_cpo(
+    joint_ctx: Dict[str, Any],
+    *,
+    algorithm: str,
+    seed: int,
+    tmax: int,
+    population_size: int | None = None,
+    max_function_evaluations: int | None = None,
+):
+    """Run discrete CPO through the exact common joint evaluator."""
+    from algorithm.cpo.core import run_cpo
+
+    _prepare_joint_context_seed(joint_ctx, seed)
+    scheme = get_joint_scheme(algorithm)
+    ranked_task_ids, task_rank = _seed_aligned_dcsga_rank_data(joint_ctx)
+    joint_ctx["ranked_task_ids"] = list(ranked_task_ids)
+    joint_ctx["task_rank"] = dict(task_rank)
+    initial_evaluation_counter = {"count": 0}
+
+    class ContextAdapter(dict):
+        def evaluate_solution(self, solution):
+            return evaluate_joint_nest_total(
+                joint_ctx,
+                solution,
+                joint_ctx["ranked_task_ids"],
+                use_caching=scheme.use_caching,
+                v2i_only=scheme.v2i_only,
+            )
+
+        def valid_provider(self, task):
+            return list(joint_ctx.get("task_domains", {}).get(int(task), []) or [])
+
+        @property
+        def task_order(self):
+            return joint_ctx.get("ranked_task_ids", [])
+
+        def greedy_population(self, count):
+            provider_memo = {}
+            population = greedy_initial_population(
+                joint_ctx,
+                scheme=scheme,
+                population_size=count,
+                rng=random.Random(seed),
+                search_cache=_build_search_static_cache(joint_ctx),
+                evaluation_memo=provider_memo,
+                evaluation_counter=initial_evaluation_counter,
+            )
+            optimizer_memo = self.setdefault("initial_evaluation_memo", {})
+            for solution in population:
+                provider_map = {
+                    int(gene[0]): int(gene[1])
+                    for gene in solution
+                }
+                provider_signature = tuple(
+                    provider_map[int(task_id)]
+                    for task_id in ranked_task_ids
+                )
+                score = provider_memo.get(provider_signature)
+                if score is not None:
+                    optimizer_memo[
+                        tuple((int(gene[0]), int(gene[1])) for gene in solution)
+                    ] = float(score)
+            return population
+
+        @property
+        def initial_function_evaluations(self):
+            return int(initial_evaluation_counter["count"])
+
+    cpo_context = ContextAdapter(
+        seed=int(seed),
+        task_rank=dict(task_rank),
+        global_ranks=dict(task_rank),
+        task_order=list(ranked_task_ids),
+        task_type_ids=dict(joint_ctx.get("task_type_ids", {})),
+        initial_evaluation_memo={},
+    )
+    best_solution, _best_score, history = run_cpo(
+        cpo_context,
+        population_size=(
+            int(population_size)
+            if population_size is not None
+            else int(load_params_obj().S)
+        ),
+        iterations=max(0, int(tmax) - 1),
+        seed=int(seed),
+        max_function_evaluations=max_function_evaluations,
+    )
+    evaluation = evaluate_joint_nest(
+        joint_ctx,
+        best_solution,
+        joint_ctx["ranked_task_ids"],
+        use_caching=scheme.use_caching,
+        v2i_only=scheme.v2i_only,
+    )
+    return best_solution, evaluation, history

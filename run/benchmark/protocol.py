@@ -10,9 +10,9 @@ EXPERIMENT_MODES = (PAPER_REPRODUCTION, FAIR_OPTIMIZER_COMPARISON)
 # DTOSC is deterministic here. The remaining schemes execute a population
 # search (DCSGA itself, a DCSGA ablation, or an added optimizer).
 POPULATION_ALGORITHMS = frozenset(
-    {"dcsga", "to_v2i", "to_wo_c", "to_wo_r", "gpc", "gwo_aco", "pso"}
+    {"dcsga", "to_v2i", "to_wo_c", "to_wo_r", "gpc", "gwo_aco", "pso", "cpo"}
 )
-ADDED_OPTIMIZERS = frozenset({"gpc", "gwo_aco", "pso"})
+ADDED_OPTIMIZERS = frozenset({"gpc", "gwo_aco", "pso", "cpo"})
 
 
 def resolve_experiment_mode(
@@ -57,7 +57,7 @@ def resolve_experiment_mode(
             raise ValueError(
                 "paper_reproduction accepts only algorithms printed in the "
                 f"selected source figure; unsupported: {unsupported}. Use "
-                "experiment_mode='fair_optimizer_comparison' for GPC/GWO/PSO."
+                "experiment_mode='fair_optimizer_comparison' for GPC/GWO/PSO/CPO."
             )
         if max_function_evaluations is not None:
             raise ValueError(
@@ -75,7 +75,7 @@ def resolve_experiment_mode(
     if not (set(selected) & ADDED_OPTIMIZERS):
         raise ValueError(
             "fair_optimizer_comparison must include at least one of gpc, "
-            "gwo_aco, or pso."
+            "gwo_aco, pso, or cpo."
         )
     if set(selected) & POPULATION_ALGORITHMS and max_function_evaluations is None:
         raise ValueError(

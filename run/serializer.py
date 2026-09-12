@@ -86,6 +86,7 @@ class BenchmarkRequestSerializer(StrictFieldsSerializer):
                 "gwo_aco",
                 "pso",
                 "gpc",
+                "cpo",
             ]
         ),
         required=False,
@@ -168,6 +169,7 @@ class PaperExperimentRequestSerializer(StrictFieldsSerializer):
                 "gwo_aco",
                 "pso",
                 "gpc",
+                "cpo",
             ]
         ),
         required=False,
@@ -289,11 +291,11 @@ class PaperExperimentRequestSerializer(StrictFieldsSerializer):
                 ]
             })
 
-        added_optimizers = {"gpc", "gwo_aco", "pso"}
+        added_optimizers = {"gpc", "gwo_aco", "pso", "cpo"}
         if experiment_mode == "paper_reproduction" and set(algorithms) & added_optimizers:
             raise serializers.ValidationError({
                 "experiment_mode": [
-                    "GPC/GWO/PSO are extensions, not algorithms printed in the original figure. Use fair_optimizer_comparison."
+                    "GPC/GWO/PSO/CPO are extensions, not algorithms printed in the original figure. Use fair_optimizer_comparison."
                 ]
             })
         if (
