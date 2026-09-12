@@ -1,0 +1,29 @@
+from __future__ import annotations
+
+from typing import Any, Dict, Optional
+from parameter.services import load_params_obj
+
+
+class GPC:
+    name = "SAM-ADGPC"
+    key = "gpc"
+    article_exact = False
+    implementation = "service-affinity-memory-adaptive-discrete-gpc"
+    reference_doi = "10.1007/s12065-020-00451-3"
+
+    def run(self, base_ctx: Dict[str, Any], seed: Optional[int] = None):
+        from algorithm.gpc.core import run_gpc
+        ctx = dict(base_ctx)
+        if seed is not None:
+            ctx["seed"] = int(seed)
+        params = load_params_obj()
+        return run_gpc(
+            ctx,
+            population_size=int(params.S),
+            iterations=max(0, int(ctx.get("tmax", 10)) - 1),
+            seed=seed,
+        )
+
+    def run_joint(self, joint_ctx: Dict[str, Any], *, seed: int, tmax: int, population_size: int | None = None, max_function_evaluations: int | None = None):
+        from run.benchmark.search import run_joint_gpc
+        return run_joint_gpc(joint_ctx, algorithm=self.key, seed=seed, tmax=tmax, population_size=population_size, max_function_evaluations=max_function_evaluations)
