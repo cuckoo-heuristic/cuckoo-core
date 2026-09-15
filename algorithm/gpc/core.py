@@ -5,7 +5,7 @@ import math
 import random
 
 from .initial_population import create_initial_population, create_random_solution
-from .memory import ServiceAffinityMemory, repair_solution
+from .memory import ServiceAffinityMemory
 from .operators import (
     DEFAULT_FRICTION_MAX,
     DEFAULT_FRICTION_MIN,
@@ -29,61 +29,12 @@ class _EvaluationBudgetReached(RuntimeError):
     """Internal control-flow signal; never escapes a successful optimizer run."""
 
 
-def _context_value(context, key, default=None):
-    if isinstance(context, dict) and key in context:
-        return context.get(key, default)
-    return getattr(context, key, default)
-
-
-def _prepare_task_order(context):
-    for key in ("task_order", "ranked_task_ids"):
-        order = _context_value(context, key, None)
-        if order:
-            normalized = [int(value) for value in order]
-            if isinstance(context, dict):
-                context["task_order"] = normalized
-            return normalized
-
-    if isinstance(context, dict):
-        from algorithm.main_dcsga import dcsga_compute_ranks_and_order
-
-        normalized = [int(value) for value in dcsga_compute_ranks_and_order(context)]
-        if normalized:
-            context["task_order"] = normalized
-            return normalized
-
-    raise RuntimeError("GPC requires a non-empty ranked task order")
-
-
 def _solution_key(solution):
     return tuple(
         (int(gene[0]), int(gene[1]))
         for gene in solution
         if isinstance(gene, (tuple, list)) and len(gene) >= 2
     )
-
-
-def _evaluate_with_existing_pipeline(context, solution):
-    for name in ("evaluate_solution", "evaluate"):
-        evaluate = getattr(context, name, None)
-        if callable(evaluate):
-            return float(evaluate(solution))
-        if isinstance(context, dict):
-            evaluate = context.get(name)
-            if callable(evaluate):
-                return float(evaluate(solution))
-
-    if isinstance(context, dict):
-        from algorithm.main_dcsga import evaluate_solution_quality
-
-        result = evaluate_solution_quality(
-            context,
-            solution,
-            _prepare_task_order(context),
-        )
-        return float(result[0] if isinstance(result, tuple) else result)
-
-    raise AttributeError("GPC context must provide evaluate_solution(solution)")
 
 
 def _population_diversity_metrics(population):
@@ -127,20 +78,17 @@ def _local_pharaoh_candidate(pharaoh, context, rng, memory=None):
     result = [tuple(int(value) for value in gene[:3]) for gene in pharaoh]
     learned = success_memory_mutation(result, context, rng, memory, probability=1.0, exploration_floor=0.10)
     if _solution_key(learned) != _solution_key(result):
-        return repair_solution(learned, context)
+        return context.repair_solution(learned)
     guided = cache_aware_mutation(result, context, rng, probability=1.0)
     if _solution_key(guided) != _solution_key(result):
-        return repair_solution(guided, context)
+        return context.repair_solution(guided)
     mutable = []
     for index, (task, provider, _position) in enumerate(result):
-        validator = getattr(context, "valid_provider", None)
-        values = validator(int(task)) if callable(validator) else []
-        if not values and isinstance(context, dict):
-            domains = context.get("task_domains", context.get("providers", {}))
-            values = domains.get(int(task), []) if isinstance(domains, dict) else []
-            if isinstance(values, dict):
-                values = values.keys()
-        alternatives = [int(value) for value in (values or []) if int(value) != int(provider)]
+        alternatives = [
+            int(value)
+            for value in context.valid_provider(int(task))
+            if int(value) != int(provider)
+        ]
         if alternatives:
             mutable.append((index, alternatives))
     if not mutable:
@@ -148,7 +96,7 @@ def _local_pharaoh_candidate(pharaoh, context, rng, memory=None):
     index, alternatives = rng.choice(mutable)
     task, _provider, position = result[index]
     result[index] = (int(task), int(rng.choice(alternatives)), int(position))
-    return repair_solution(result, context)
+    return context.repair_solution(result)
 
 
 def _restart_from_pharaoh(pharaoh, context, rng, stagnation_counter, memory=None):
@@ -167,7 +115,7 @@ def _restart_from_pharaoh(pharaoh, context, rng, stagnation_counter, memory=None
         mutation_probability=1.0,
     )
     candidate = success_memory_mutation(candidate, context, rng, memory, probability=0.65, exploration_floor=0.35)
-    candidate = repair_solution(candidate, context)
+    candidate = context.repair_solution(candidate)
     if _solution_key(candidate) == _solution_key(pharaoh):
         candidate = _local_pharaoh_candidate(pharaoh, context, rng, memory)
     return candidate
@@ -199,12 +147,13 @@ def run_gpc(
     """
     context = copy.deepcopy(context)
     if seed is None:
-        seed = _context_value(context, "seed", None)
-    if isinstance(context, dict) and seed is not None:
+        seed = context.get("seed")
+    if seed is not None:
         context["seed"] = int(seed)
     rng = random.Random(seed)
 
-    _prepare_task_order(context)
+    if not context.task_order:
+        raise RuntimeError("GPC requires a non-empty ranked task order")
     size = max(2, int(population_size))
     generations = max(0, int(iterations))
     evaluation_budget = (
@@ -224,7 +173,7 @@ def run_gpc(
     population = []
     seen = set()
     for raw in raw_population:
-        solution = repair_solution(raw, context)
+        solution = context.repair_solution(raw)
         key = _solution_key(solution)
         if key and key not in seen:
             seen.add(key)
@@ -244,7 +193,7 @@ def run_gpc(
             f"Initial GPC population has {len(population)} unique solutions; expected {size}"
         )
 
-    initial_memo = _context_value(context, "initial_evaluation_memo", {}) or {}
+    initial_memo = context.get("initial_evaluation_memo", {}) or {}
     evaluation_cache = {
         key: float(score)
         for key, score in initial_memo.items()
@@ -253,12 +202,12 @@ def run_gpc(
     # greedy constructor, so they are part of the real search budget.
     function_evaluations_total = max(
         len(evaluation_cache),
-        int(_context_value(context, "initial_function_evaluations", 0) or 0),
+        int(context.initial_function_evaluations or 0),
     )
 
     def evaluate(solution):
         nonlocal function_evaluations_total
-        repaired = repair_solution(solution, context)
+        repaired = context.repair_solution(solution)
         key = _solution_key(repaired)
         if key not in evaluation_cache:
             if (
@@ -267,7 +216,7 @@ def run_gpc(
             ):
                 raise _EvaluationBudgetReached
             evaluation_cache[key] = float(
-                _evaluate_with_existing_pipeline(context, repaired)
+                context.evaluate_solution(repaired)
             )
             function_evaluations_total += 1
         return repaired, float(evaluation_cache[key])
@@ -505,4 +454,4 @@ def run_gpc(
         if budget_exhausted:
             break
 
-    return repair_solution(global_pharaoh, context), float(global_score), history
+    return context.repair_solution(global_pharaoh), float(global_score), history

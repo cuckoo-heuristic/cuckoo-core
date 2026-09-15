@@ -4,7 +4,7 @@ import copy
 import random
 
 from .initial_population import create_initial_population
-from .memory import initialize_pheromone, repair_solution, update_pheromone
+from .memory import initialize_pheromone, update_pheromone
 from .operators import (
     generate_alpha_neighborhood_children,
     generate_adaptive_children,
@@ -23,42 +23,6 @@ def _solution_key(solution):
         for gene in solution
         if isinstance(gene, (tuple, list)) and len(gene) >= 2
     )
-
-
-def _task_order(context, solution=None):
-    order = getattr(context, "task_order", None)
-    if order:
-        return [int(x) for x in order]
-    if isinstance(context, dict) and context.get("task_order"):
-        return [int(x) for x in context["task_order"]]
-    return [
-        int(gene[0])
-        for gene in (solution or [])
-        if isinstance(gene, (tuple, list)) and len(gene) >= 2
-    ]
-
-
-def _valid_providers(context, task: int) -> list[int]:
-    validator = getattr(context, "valid_provider", None)
-    if callable(validator):
-        return list(dict.fromkeys(int(p) for p in (validator(int(task)) or [])))
-    if isinstance(context, dict):
-        domains = context.get("task_domains", context.get("providers", {}))
-        if isinstance(domains, dict):
-            values = domains.get(int(task), [])
-            if isinstance(values, dict):
-                values = values.keys()
-            return list(dict.fromkeys(int(p) for p in (values or [])))
-    return []
-
-
-def _build_task_domains(context, task_order):
-    result = {}
-    for task in task_order:
-        providers = _valid_providers(context, int(task))
-        if providers:
-            result[int(task)] = providers
-    return result
 
 
 def _sort_unique(rows):
@@ -101,31 +65,11 @@ def _adaptive_a(iteration: int, iterations: int, rows, stagnation_count: int) ->
     )
 
 
-def _evaluate(context, solution) -> float:
-    evaluator = getattr(context, "evaluate", None)
-    if callable(evaluator):
-        return float(evaluator(solution))
-    if isinstance(context, dict):
-        from algorithm.main_dcsga import evaluate_solution_quality
-
-        result = evaluate_solution_quality(context, solution, _task_order(context, solution))
-        return float(result[0] if isinstance(result, tuple) else result)
-    raise TypeError("GWO context must expose evaluate(solution)")
-
-
-def _repair(context, solution):
-    repair = getattr(context, "repair_solution", None)
-    if callable(repair):
-        return repair(solution)
-    return repair_solution(solution, context)
-
-
 def run_gwo_aco(
     context,
     population_size=20,
     iterations=50,
     initial_population=None,
-    initial_discard_probability=0.0,
     *,
     stagnation_escape_after=STAGNATION_ESCAPE_AFTER,
     escape_fraction=ESCAPE_FRACTION,
@@ -146,10 +90,8 @@ def run_gwo_aco(
     memoization/deduplication.  The benchmark evaluator remains the sole source
     of the final Q fitness.
     """
-    del initial_discard_probability  # compatibility with the old public API
-
     context = copy.deepcopy(context)
-    seed = context.get("seed") if isinstance(context, dict) else getattr(context, "seed", None)
+    seed = context.get("seed")
     rng = random.Random(seed)
 
     size = max(3, int(population_size))
@@ -165,34 +107,26 @@ def run_gwo_aco(
             "initial population can be evaluated"
         )
     population = initial_population or create_initial_population(context, size, rng=rng)
-    population = [_repair(context, solution) for solution in population]
+    population = [context.repair_solution(solution) for solution in population]
     population = [solution for solution in population if solution][:size]
     if len(population) < size:
         raise RuntimeError(f"Initial population is {len(population)}, expected {size}")
 
-    initial_memo = (
-        context.get("initial_evaluation_memo", {})
-        if isinstance(context, dict)
-        else getattr(context, "initial_evaluation_memo", {})
-    ) or {}
+    initial_memo = context.get("initial_evaluation_memo", {}) or {}
     evaluation_cache = {
         key: float(score)
         for key, score in initial_memo.items()
     }
     function_evaluations_total = max(
         len(evaluation_cache),
-        int(
-            context.get("initial_function_evaluations", 0)
-            if isinstance(context, dict)
-            else getattr(context, "initial_function_evaluations", 0)
-        ),
+        int(context.get("initial_function_evaluations", 0)),
     )
 
     def evaluate_batch(batch):
         nonlocal function_evaluations_total
         rows = []
         for raw in batch:
-            solution = _repair(context, raw)
+            solution = context.repair_solution(raw)
             if not solution:
                 continue
             key = _solution_key(solution)
@@ -202,7 +136,7 @@ def run_gwo_aco(
                     and function_evaluations_total >= evaluation_budget
                 ):
                     break
-                evaluation_cache[key] = float(_evaluate(context, solution))
+                evaluation_cache[key] = float(context.evaluate(solution))
                 function_evaluations_total += 1
             rows.append((solution, float(evaluation_cache[key])))
         return _sort_unique(rows)
@@ -214,9 +148,12 @@ def run_gwo_aco(
         )
     evaluated = evaluated[:size]
 
-    task_order = _task_order(context, evaluated[0][0])
+    task_order = [int(task) for task in context.task_order]
     pheromone: dict[tuple[int, int], float] = {}
-    initialize_pheromone(pheromone, _build_task_domains(context, task_order))
+    initialize_pheromone(
+        pheromone,
+        {task: context.valid_provider(task) for task in task_order},
+    )
     update_pheromone(
         pheromone,
         evaluated,
@@ -345,4 +282,4 @@ def run_gwo_aco(
         ):
             break
 
-    return _repair(context, best_solution), float(best_score), history
+    return context.repair_solution(best_solution), float(best_score), history

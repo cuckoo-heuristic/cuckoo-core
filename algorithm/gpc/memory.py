@@ -4,45 +4,13 @@ from __future__ import annotations
 from collections import defaultdict
 import math
 
-"""
-GPC memory / repair boundary.
-
-This file must use the canonical repair logic already used by the benchmark
-pipeline. The benchmark context already exposes repair through the same
-mechanism used by GWO/PSO, therefore GPC should not import a non-existing
-function from dcsga_core.
-"""
-
-
-def repair_solution(solution, context):
-    if hasattr(context, "repair_solution") and callable(context.repair_solution):
-        repaired = context.repair_solution(solution)
-    else:
-        # Fallback to the existing validated repair implementation.
-        from algorithm.gwo.memory import repair_solution as gwo_repair
-        repaired = gwo_repair(solution, context)
-
-    if repaired is None:
-        raise RuntimeError(
-            "GPC repair_solution returned None"
-        )
-
-    return repaired
-
-
-def _context_value(context, key, default=None):
-    if isinstance(context, dict):
-        return context.get(key, default)
-    return getattr(context, key, default)
-
-
 class ServiceAffinityMemory:
     """Bounded accepted-move memory; guidance only, never a fitness bonus."""
 
     def __init__(self, context, *, weight=0.65, evaporation=0.08):
         self.weight = max(0.0, min(1.0, float(weight)))
         self.evaporation = max(0.0, min(0.95, float(evaporation)))
-        self.task_types = _context_value(context, "task_type_ids", {}) or {}
+        self.task_types = context.get("task_type_ids", {}) or {}
         self.task_provider = defaultdict(float)
         self.service_provider = defaultdict(float)
         self.successful_updates = 0

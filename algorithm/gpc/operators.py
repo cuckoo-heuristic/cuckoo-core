@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import math
-import random
 
 
 DEFAULT_GRAVITY = 9.8
@@ -12,42 +11,17 @@ DEFAULT_FRICTION_MAX = 10.0
 DEFAULT_SUBSTITUTION_PROBABILITY = 0.50
 
 
-def hamming_distance(a, b):
-    amap = {int(x[0]): int(x[1]) for x in a}
-    bmap = {int(x[0]): int(x[1]) for x in b}
-    tasks = set(amap) | set(bmap)
-    return sum(1 for task in tasks if amap.get(task) != bmap.get(task))
-
-
 def _copy_gene(gene):
     return (int(gene[0]), int(gene[1]), int(gene[2]))
 
 
-def _context_value(context, key, default=None):
-    if isinstance(context, dict) and key in context:
-        return context.get(key, default)
-    return getattr(context, key, default)
-
-
 def _valid_providers(context, task):
-    validator = getattr(context, "valid_provider", None)
-    if callable(validator):
-        return list(dict.fromkeys(int(x) for x in (validator(int(task)) or [])))
-
-    domains = _context_value(context, "task_domains", None)
-    if domains is None:
-        domains = _context_value(context, "providers", {})
-    if isinstance(domains, dict):
-        values = domains.get(int(task), [])
-        if isinstance(values, dict):
-            values = values.keys()
-        return list(dict.fromkeys(int(x) for x in (values or [])))
-    return []
+    return list(dict.fromkeys(int(value) for value in context.valid_provider(int(task))))
 
 
 def _rank_map(context):
     for key in ("task_rank", "global_ranks"):
-        values = _context_value(context, key, None)
+        values = context.get(key)
         if isinstance(values, dict) and values:
             return {int(k): float(v) for k, v in values.items()}
     return {}
@@ -168,78 +142,6 @@ def physical_gpc_move(
         "worker_distance": float(worker_distance),
         "substituted_tasks": int(changed),
     }
-
-
-def move_worker_toward_pharaoh(
-    worker,
-    pharaoh,
-    rng,
-    movement_factor=0.5,
-):
-    """
-    Phase 1: improved discrete GPC worker movement.
-
-    The chromosome representation is unchanged:
-        (task, provider, position)
-
-    The operator does not create new genes or change the fitness model.
-    It only controls how a worker moves toward the Pharaoh.
-
-    Improvements over the previous version:
-      1. Uses discrete Hamming distance.
-      2. Changes only part of the mismatching assignments.
-      3. Keeps exploration by not copying the full Pharaoh.
-    """
-
-    result = [_copy_gene(g) for g in worker]
-
-    worker_map = {int(x[0]): int(x[1]) for x in worker}
-    pharaoh_map = {int(x[0]): int(x[1]) for x in pharaoh}
-
-    different_tasks = [
-        task for task in worker_map
-        if task in pharaoh_map and worker_map[task] != pharaoh_map[task]
-    ]
-
-    if not different_tasks:
-        return result
-
-    # Number of blocks moved toward Pharaoh.
-    # Never move all blocks by force; preserve exploration.
-    move_count = max(
-        1,
-        int(round(len(different_tasks) * max(0.0, min(1.0, movement_factor))))
-    )
-
-    selected_tasks = list(different_tasks)
-    rng.shuffle(selected_tasks)
-    selected_tasks = selected_tasks[:move_count]
-
-    for index, gene in enumerate(result):
-        task = int(gene[0])
-        if task in selected_tasks:
-            result[index] = (
-                task,
-                pharaoh_map[task],
-                int(gene[2]),
-            )
-
-    return result
-
-
-def random_discrete_exploration(solution, context, rng, probability=0.1):
-    """
-    Small exploration helper reserved for later phases.
-
-    Not used in Phase 1 core.
-    Kept isolated so chromosome and evaluator remain untouched.
-    """
-    result = [_copy_gene(g) for g in solution]
-
-    if rng.random() > probability:
-        return result
-
-    return result
 
 
 def rank_guided_discrete_mutation(
@@ -364,8 +266,8 @@ def cache_aware_mutation(solution, context, rng, probability=0.1):
         return [_copy_gene(g) for g in solution]
 
     result = [_copy_gene(g) for g in solution]
-    cache_hint = _context_value(context, "cache_guidance", {}) or {}
-    task_types = _context_value(context, "task_type_ids", {}) or {}
+    cache_hint = context.get("cache_guidance", {}) or {}
+    task_types = context.get("task_type_ids", {}) or {}
     ranks = _rank_map(context)
     # Build the service-reuse profile from the candidate schedule itself. This
     # is guidance only: the unchanged evaluator still decides whether the move

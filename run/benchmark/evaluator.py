@@ -18,7 +18,6 @@ from algorithm.greedy_nests import (
     t_ref_s,
 )
 from algorithm.update_service_cache import update_cache
-from algorithm.gwo.predictive_cache import update_predictive_cache
 
 from .models import ApplicationResult, JointApplicationResult
 from .paper_model import (
@@ -407,24 +406,11 @@ class JointScheduleState:
         use_caching: bool,
         v2i_only: bool,
         record_schedule: bool = True,
-        cache_policy: str = "paper",
-        provider_plan: Dict[int, int] | None = None,
-        predictive_lookahead: int = 5,
-        predictive_weight: float = 1.0,
     ):
         self.joint_ctx = joint_ctx
         self.use_caching = bool(use_caching)
         self.v2i_only = bool(v2i_only)
         self.record_schedule = bool(record_schedule)
-        self.cache_policy = str(cache_policy or "paper").strip().lower()
-        if self.cache_policy not in {"paper", "provider_predictive"}:
-            raise ValueError(f"Unsupported cache policy: {cache_policy}")
-        self.provider_plan = {
-            int(task_id): int(provider_id)
-            for task_id, provider_id in (provider_plan or {}).items()
-        }
-        self.predictive_lookahead = max(0, int(predictive_lookahead))
-        self.predictive_weight = max(0.0, float(predictive_weight))
         shared_cache_keys = (
             "_link_fading",
             "_channel_gain_cache",
@@ -495,38 +481,6 @@ class JointScheduleState:
             "service_size_bits": dict(self.joint_ctx["service_size_bits"]),
             "compile_workloads": dict(self.joint_ctx["compile_workloads"]),
             "sp_cache_capacity": dict(self.joint_ctx["sp_cache_capacity"]),
-            # Search computes these structural maps once.  Cache policy only
-            # consumes them and never reconstructs the ranking or DAG.
-            "predictive_rank_weight": dict(
-                self.joint_ctx.get("predictive_rank_weight", {})
-            ),
-            "predictive_dag_distance": dict(
-                self.joint_ctx.get("predictive_dag_distance", {})
-            ),
-            "predictive_cache_rank_aware": bool(
-                self.joint_ctx.get("predictive_cache_rank_aware", True)
-            ),
-            "predictive_cache_dag_aware": bool(
-                self.joint_ctx.get("predictive_cache_dag_aware", True)
-            ),
-            # Proposed-algorithm-only regional RSU cache memory.  Benchmark
-            # provides physical provider/RSU association; the cache policy
-            # consumes the generation profile without changing DCSGA.
-            "regional_cache_enabled": bool(
-                self.joint_ctx.get("regional_cache_enabled", False)
-            ),
-            "regional_cache_share": float(
-                self.joint_ctx.get("regional_cache_share", 0.0)
-            ),
-            "regional_rsu_service_popularity": copy.deepcopy(
-                self.joint_ctx.get("regional_rsu_service_popularity", {})
-            ),
-            "provider_rsu_ids": dict(
-                self.joint_ctx.get("regional_provider_rsu_ids", {})
-            ),
-            "provider_types": dict(
-                self.joint_ctx.get("regional_provider_types", {})
-            ),
         }
 
     def clone(self) -> "JointScheduleState":
@@ -552,10 +506,6 @@ class JointScheduleState:
         cloned.use_caching = self.use_caching
         cloned.v2i_only = self.v2i_only
         cloned.record_schedule = self.record_schedule
-        cloned.cache_policy = self.cache_policy
-        cloned.provider_plan = dict(self.provider_plan)
-        cloned.predictive_lookahead = self.predictive_lookahead
-        cloned.predictive_weight = self.predictive_weight
         cloned.shared_cache = {
             int(sp_id): set(values)
             for sp_id, values in self.shared_cache.items()
@@ -801,23 +751,12 @@ class JointScheduleState:
 
         mode = app_ctx.get("sp_modes", {}).get(provider_id)
         if self.use_caching and mode != "local":
-            if self.cache_policy == "provider_predictive":
-                update_predictive_cache(
-                    self.joint_cache_ctx,
-                    provider_id,
-                    joint_task_id,
-                    remaining_task_ids=remaining_task_ids,
-                    provider_map=self.provider_plan,
-                    lookahead=self.predictive_lookahead,
-                    predictive_weight=self.predictive_weight,
-                )
-            else:
-                update_cache(
-                    self.joint_cache_ctx,
-                    provider_id,
-                    joint_task_id,
-                    remaining_task_ids=remaining_task_ids,
-                )
+            update_cache(
+                self.joint_cache_ctx,
+                provider_id,
+                joint_task_id,
+                remaining_task_ids=remaining_task_ids,
+            )
 
         cache_after = set(self.shared_cache.get(provider_id, set()))
         self._record_assignment(
@@ -982,9 +921,6 @@ def evaluate_joint_nest(
     *,
     use_caching: bool,
     v2i_only: bool,
-    cache_policy: str = "paper",
-    predictive_lookahead: int = 5,
-    predictive_weight: float = 1.0,
 ) -> JointEvaluation:
     expected = [int(task_id) for task_id in joint_ctx["optimized_task_ids"]]
     task_order = [int(task_id) for task_id in task_order]
@@ -1001,10 +937,6 @@ def evaluate_joint_nest(
         joint_ctx,
         use_caching=use_caching,
         v2i_only=v2i_only,
-        cache_policy=cache_policy,
-        provider_plan=provider_map,
-        predictive_lookahead=predictive_lookahead,
-        predictive_weight=predictive_weight,
     )
     state.assign_entry_tasks()
 
@@ -1025,15 +957,12 @@ def _evaluate_joint_nest_state(
     *,
     use_caching: bool,
     v2i_only: bool,
-    cache_policy: str = "paper",
-    predictive_lookahead: int = 5,
-    predictive_weight: float = 1.0,
 ) -> JointScheduleState:
     """Schedule one intermediate nest once and return its mutable state.
 
     This is the shared kernel for objective-only and cache-state inspection.
-    Keeping the validation and assignment loop in one place prevents the
-    regional-memory diagnostics from maintaining a second scheduling path.
+    Keeping the validation and assignment loop in one place ensures every
+    optimizer uses exactly the same paper scheduling path.
     """
     expected = [int(task_id) for task_id in joint_ctx["optimized_task_ids"]]
     normalized_order = [int(task_id) for task_id in task_order]
@@ -1052,10 +981,6 @@ def _evaluate_joint_nest_state(
         use_caching=use_caching,
         v2i_only=v2i_only,
         record_schedule=False,
-        cache_policy=cache_policy,
-        provider_plan=provider_map,
-        predictive_lookahead=predictive_lookahead,
-        predictive_weight=predictive_weight,
     )
     state.assign_entry_tasks()
     for index, joint_task_id in enumerate(normalized_order):
@@ -1067,63 +992,6 @@ def _evaluate_joint_nest_state(
     return state
 
 
-def _copy_cache_state(state: JointScheduleState) -> Dict[int, set[int]]:
-    return {
-        int(provider_id): set(task_type_ids)
-        for provider_id, task_type_ids in state.shared_cache.items()
-    }
-
-
-def evaluate_joint_nest_cache_state(
-    joint_ctx: Dict[str, Any],
-    nest: Sequence[NestItem],
-    task_order: Sequence[int],
-    *,
-    use_caching: bool,
-    v2i_only: bool,
-    cache_policy: str = "paper",
-    predictive_lookahead: int = 5,
-    predictive_weight: float = 1.0,
-) -> Dict[int, set[int]]:
-    """Materialize only the final cache state of one nest."""
-    state = _evaluate_joint_nest_state(
-        joint_ctx,
-        nest,
-        task_order,
-        use_caching=use_caching,
-        v2i_only=v2i_only,
-        cache_policy=cache_policy,
-        predictive_lookahead=predictive_lookahead,
-        predictive_weight=predictive_weight,
-    )
-    return _copy_cache_state(state)
-
-
-def evaluate_joint_nest_total_and_cache(
-    joint_ctx: Dict[str, Any],
-    nest: Sequence[NestItem],
-    task_order: Sequence[int],
-    *,
-    use_caching: bool,
-    v2i_only: bool,
-    cache_policy: str = "paper",
-    predictive_lookahead: int = 5,
-    predictive_weight: float = 1.0,
-) -> Tuple[float, Dict[int, set[int]]]:
-    """Return exact Q and final cache state from the same schedule pass."""
-    state = _evaluate_joint_nest_state(
-        joint_ctx,
-        nest,
-        task_order,
-        use_caching=use_caching,
-        v2i_only=v2i_only,
-        cache_policy=cache_policy,
-        predictive_lookahead=predictive_lookahead,
-        predictive_weight=predictive_weight,
-    )
-    return float(state.total_efficiency()), _copy_cache_state(state)
-
-
 def evaluate_joint_nest_total(
     joint_ctx: Dict[str, Any],
     nest: Sequence[NestItem],
@@ -1131,9 +999,6 @@ def evaluate_joint_nest_total(
     *,
     use_caching: bool,
     v2i_only: bool,
-    cache_policy: str = "paper",
-    predictive_lookahead: int = 5,
-    predictive_weight: float = 1.0,
 ) -> float:
     """Evaluate only the exact total objective for an intermediate nest.
 
@@ -1146,8 +1011,5 @@ def evaluate_joint_nest_total(
         task_order,
         use_caching=use_caching,
         v2i_only=v2i_only,
-        cache_policy=cache_policy,
-        predictive_lookahead=predictive_lookahead,
-        predictive_weight=predictive_weight,
     )
     return float(state.total_efficiency())

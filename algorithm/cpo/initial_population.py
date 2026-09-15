@@ -1,85 +1,80 @@
 from __future__ import annotations
 
 import random
-from typing import Sequence
-
-from .memory import repair_solution
 
 
 GREEDY_RATIO = 0.75
-DIVERSE_RATIO = 0.25
-
-
-def _task_order(context) -> list[int]:
-    order = getattr(context, "task_order", None)
-    if order:
-        return [int(value) for value in order]
-    if isinstance(context, dict) and context.get("task_order"):
-        return [int(value) for value in context["task_order"]]
-    return []
-
-
-def _valid_providers(context, task: int) -> list[int]:
-    validator = getattr(context, "valid_provider", None)
-    if callable(validator):
-        return list(dict.fromkeys(int(value) for value in (validator(int(task)) or [])))
-    if isinstance(context, dict):
-        domains = context.get("task_domains", context.get("providers", {}))
-        if isinstance(domains, dict):
-            values = domains.get(int(task), domains.get(str(int(task)), []))
-            if isinstance(values, dict):
-                values = values.keys()
-            return list(dict.fromkeys(int(value) for value in (values or [])))
-    return []
-
-
-def _balanced_choices(values: Sequence[int], count: int, rng: random.Random):
-    domain = list(dict.fromkeys(int(value) for value in values))
-    if not domain:
-        return []
-    quotient, remainder = divmod(max(0, int(count)), len(domain))
-    result = []
-    for value in domain:
-        result.extend([value] * quotient)
-    extra = list(domain)
-    rng.shuffle(extra)
-    result.extend(extra[:remainder])
-    rng.shuffle(result)
-    return result
-
-
-def _dlhs_population(context, count: int, rng: random.Random):
-    count = max(0, int(count))
-    if count == 0:
-        return []
-    tasks = _task_order(context)
-    if not tasks:
-        raise ValueError("CPO task order is empty")
-    plans = {}
-    for task in tasks:
-        providers = _valid_providers(context, task)
-        if not providers:
-            raise ValueError(f"Task {task} has no valid provider")
-        plans[task] = _balanced_choices(providers, count, rng)
-    return [
-        repair_solution(
-            [(int(task), int(plans[task][row]), position) for position, task in enumerate(tasks)],
-            context,
-        )
-        for row in range(count)
-    ]
 
 
 def create_initial_population(context, size: int, rng=None):
-    """Paper-greedy/DLHS initialization specialized for discrete CPO."""
-    from algorithm.optimizer_initialization import create_mixed_initial_population
-
+    """Build CPO porcupines from greedy schedules and discrete coverage."""
     rng = rng or random.Random()
-    return create_mixed_initial_population(
-        context,
-        int(size),
-        rng,
-        repair_solution,
-        lambda count: _dlhs_population(context, count, rng),
-        greedy_ratio=GREEDY_RATIO,
-    )
+    size = max(2, int(size))
+    tasks = [int(task) for task in context.task_order]
+    if not tasks:
+        raise ValueError("CPO task order is empty")
+
+    greedy_count = min(size, max(1, int(round(size * GREEDY_RATIO))))
+    greedy = [
+        context.repair_solution(solution)
+        for solution in context.greedy_population(greedy_count)
+    ]
+    greedy = [solution for solution in greedy if solution]
+    if not greedy:
+        raise RuntimeError("CPO greedy initialization returned no solution")
+
+    diverse_count = size - greedy_count
+    provider_plans = {}
+    for task in tasks:
+        providers = list(dict.fromkeys(context.valid_provider(task)))
+        if not providers:
+            raise ValueError(f"Task {task} has no valid provider")
+        quotient, remainder = divmod(diverse_count, len(providers))
+        choices = [provider for provider in providers for _ in range(quotient)]
+        extra = list(providers)
+        rng.shuffle(extra)
+        choices.extend(extra[:remainder])
+        rng.shuffle(choices)
+        provider_plans[task] = choices
+
+    diverse = [
+        context.repair_solution(
+            [
+                (task, int(provider_plans[task][row]), position)
+                for position, task in enumerate(tasks)
+            ]
+        )
+        for row in range(diverse_count)
+    ]
+
+    population = []
+    seen = set()
+
+    def append(candidate):
+        key = tuple((int(gene[0]), int(gene[1])) for gene in candidate)
+        if key and key not in seen:
+            seen.add(key)
+            population.append(candidate)
+
+    for index in range(max(len(greedy), len(diverse))):
+        if index < len(greedy):
+            append(greedy[index])
+        if index < len(diverse):
+            append(diverse[index])
+
+    attempts = 0
+    while len(population) < size and attempts < size * 100:
+        attempts += 1
+        append(
+            context.repair_solution(
+                [
+                    (task, int(rng.choice(context.valid_provider(task))), position)
+                    for position, task in enumerate(tasks)
+                ]
+            )
+        )
+    if len(population) != size:
+        raise RuntimeError(
+            f"CPO created {len(population)} unique porcupines; expected {size}"
+        )
+    return population

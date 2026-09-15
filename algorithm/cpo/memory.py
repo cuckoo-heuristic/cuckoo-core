@@ -7,26 +7,6 @@ import math
 DEFENSE_NAMES = ("sight", "sound", "odor", "physical_attack")
 
 
-def _context_value(context, key, default=None):
-    if isinstance(context, dict):
-        return context.get(key, default)
-    return getattr(context, key, default)
-
-
-def repair_solution(solution, context):
-    """Use the benchmark's canonical categorical repair boundary."""
-    repair = getattr(context, "repair_solution", None)
-    if callable(repair):
-        repaired = repair(solution)
-    else:
-        from algorithm.gwo.memory import repair_solution as shared_repair
-
-        repaired = shared_repair(solution, context)
-    if repaired is None:
-        raise RuntimeError("CPO repair_solution returned None")
-    return repaired
-
-
 class DefenseSuccessMemory:
     """Bounded accepted-move memory used only to guide future proposals.
 
@@ -38,7 +18,7 @@ class DefenseSuccessMemory:
     def __init__(self, context, *, evaporation=0.10, provider_weight=0.65):
         self.evaporation = max(0.0, min(0.95, float(evaporation)))
         self.provider_weight = max(0.0, min(1.0, float(provider_weight)))
-        self.task_types = _context_value(context, "task_type_ids", {}) or {}
+        self.task_types = context.get("task_type_ids", {}) or {}
         self.strategy_credit = {name: 1.0 for name in DEFENSE_NAMES}
         self.task_provider = defaultdict(float)
         self.service_provider = defaultdict(float)

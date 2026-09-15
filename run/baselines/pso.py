@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import copy
 from typing import Any, Dict, Optional
 
 from parameter.services import load_params_obj
+from .context import StandaloneOptimizerContext
 
 
 class PSO:
@@ -15,9 +15,7 @@ class PSO:
 
     def run(self, base_ctx: Dict[str, Any], seed: Optional[int] = None):
         from algorithm.pso.core import run_pso
-        ctx = copy.deepcopy(base_ctx)
-        if seed is not None:
-            ctx["seed"] = int(seed)
+        ctx = StandaloneOptimizerContext(base_ctx, seed=seed)
         ctx["scheme"] = self.key
         ctx["use_ranking"] = True
         ctx["use_caching"] = True

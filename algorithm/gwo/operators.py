@@ -5,7 +5,6 @@ import math
 import random
 from typing import Sequence
 
-from .memory import repair_solution
 from .predictive_cache import (
     DEFAULT_PROVIDER_GUIDANCE_WEIGHT,
     build_provider_future_index,
@@ -15,19 +14,12 @@ from .predictive_cache import (
 Gene = tuple[int, int, int]
 
 
-def _context_value(context, key, default=None):
-    if isinstance(context, dict):
-        return context.get(key, default)
-    return getattr(context, key, default)
-
-
 def _provider_guidance_weight(context) -> float:
     try:
         return max(
             0.0,
             float(
-                _context_value(
-                    context,
+                context.get(
                     "predictive_provider_guidance_weight",
                     DEFAULT_PROVIDER_GUIDANCE_WEIGHT,
                 )
@@ -38,17 +30,7 @@ def _provider_guidance_weight(context) -> float:
 
 
 def _valid_providers(context, task: int) -> list[int]:
-    validator = getattr(context, "valid_provider", None)
-    if callable(validator):
-        return list(dict.fromkeys(int(p) for p in (validator(int(task)) or [])))
-    if isinstance(context, dict):
-        domains = context.get("task_domains", context.get("providers", {}))
-        if isinstance(domains, dict):
-            values = domains.get(int(task), [])
-            if isinstance(values, dict):
-                values = values.keys()
-            return list(dict.fromkeys(int(p) for p in (values or [])))
-    return []
+    return list(dict.fromkeys(int(value) for value in context.valid_provider(int(task))))
 
 
 def _provider_map(solution: Sequence) -> dict[int, int]:
@@ -62,13 +44,9 @@ def _provider_map(solution: Sequence) -> dict[int, int]:
 def _get_task_ranks(context) -> dict[int, float]:
     """Use the canonical rank provided by build_context."""
     for key in ("task_rank", "global_ranks"):
-        rank_map = getattr(context, key, None)
+        rank_map = context.get(key)
         if isinstance(rank_map, dict):
             return {int(k): float(v) for k, v in rank_map.items()}
-        if isinstance(context, dict):
-            rank_map = context.get(key)
-            if isinstance(rank_map, dict):
-                return {int(k): float(v) for k, v in rank_map.items()}
     return {}
 
 
@@ -231,7 +209,7 @@ def generate_alpha_neighborhood_children(
         if provider == int(current):
             provider = rng.choice(alternatives)
         child[index] = (int(task), int(provider), int(index))
-        child = repair_solution(child, context)
+        child = context.repair_solution(child)
         if child:
             children.append(child)
     return children
@@ -441,7 +419,7 @@ def generate_adaptive_children(
             a=float(a),
             rng=rng,
         )
-        child = repair_solution(child, context)
+        child = context.repair_solution(child)
         if child:
             children.append(child)
     return children
@@ -489,7 +467,7 @@ def generate_escape_children(
                     int(position),
                 )
 
-        child = repair_solution(source, context)
+        child = context.repair_solution(source)
         if child:
             children.append(child)
     return children

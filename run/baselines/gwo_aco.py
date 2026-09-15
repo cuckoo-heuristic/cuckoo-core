@@ -1,10 +1,10 @@
 
 from __future__ import annotations
 
-import copy
 from typing import Any, Dict, Optional
 
 from parameter.services import load_params_obj
+from .context import StandaloneOptimizerContext
 
 
 
@@ -22,9 +22,7 @@ class GWO_ACO:
     ):
         from algorithm.gwo.core import run_gwo_aco
 
-        ctx = copy.deepcopy(base_ctx)
-        if seed is not None:
-            ctx["seed"] = int(seed)
+        ctx = StandaloneOptimizerContext(base_ctx, seed=seed)
         ctx["scheme"] = self.key
         ctx["use_ranking"] = True
         ctx["use_caching"] = True
@@ -36,7 +34,6 @@ class GWO_ACO:
             ctx,
             population_size=int(params.S),
             iterations=tmax - 1,
-            initial_discard_probability=float(params.p_discard_init),
         )
 
     def run_joint(

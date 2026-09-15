@@ -1,9 +1,6 @@
 from __future__ import annotations
 
 import math
-import random
-
-from .memory import repair_solution
 
 
 DEFENSE_EXPLORATION = ("sight", "sound")
@@ -24,33 +21,21 @@ def provider_map(solution):
 
 
 def valid_providers(context, task: int) -> list[int]:
-    validator = getattr(context, "valid_provider", None)
-    if callable(validator):
-        return list(dict.fromkeys(int(value) for value in (validator(int(task)) or [])))
-    if isinstance(context, dict):
-        domains = context.get("task_domains", context.get("providers", {}))
-        if isinstance(domains, dict):
-            values = domains.get(int(task), domains.get(str(int(task)), []))
-            if isinstance(values, dict):
-                values = values.keys()
-            return list(dict.fromkeys(int(value) for value in (values or [])))
-    return []
+    return list(
+        dict.fromkeys(int(value) for value in context.valid_provider(int(task)))
+    )
 
 
-def _ranks(context):
-    if isinstance(context, dict):
-        return context.get("task_rank", context.get("global_ranks", {})) or {}
-    return getattr(context, "task_rank", getattr(context, "global_ranks", {})) or {}
-
-
-def _task_types(context):
-    if isinstance(context, dict):
-        return context.get("task_type_ids", {}) or {}
-    return getattr(context, "task_type_ids", {}) or {}
+def _energy_opportunity(context, task):
+    table = context.get("task_energy_opportunity", {})
+    return max(
+        0.0,
+        float(table.get(int(task), table.get(str(int(task)), 0.0)) or 0.0),
+    )
 
 
 def _rank_weights(context, tasks):
-    ranks = _ranks(context)
+    ranks = context.get("task_rank", context.get("global_ranks", {})) or {}
     values = {
         int(task): float(ranks.get(int(task), ranks.get(str(int(task)), 0.0)))
         for task in tasks
@@ -115,9 +100,56 @@ def _choose_memory_or_random(task, alternatives, memory, rng, exploration_floor)
     return int(_weighted_sample_without_replacement(weights, 1, rng)[0])
 
 
+def _choose_model_guided_provider(
+    task,
+    alternatives,
+    context,
+    memory,
+    rng,
+    progress,
+    *,
+    exploration_floor,
+):
+    """Use a bounded paper-model prior only to propose an exploitation move."""
+    alternatives = list(dict.fromkeys(int(value) for value in alternatives))
+    if not alternatives:
+        return None
+    table = context.get("task_provider_model_prior", {})
+    model_scores = table.get(int(task), table.get(str(int(task)), {}))
+    model_scores = model_scores if isinstance(model_scores, dict) else {}
+    available_scores = {
+        provider: max(
+            0.0,
+            float(model_scores.get(provider, model_scores.get(str(provider), 0.0))),
+        )
+        for provider in alternatives
+    }
+    max_probability = float(context.get("cpo_model_guidance_max_probability", 0.35))
+    progress = max(0.0, min(1.0, float(progress)))
+    guidance_probability = max(0.0, min(0.50, max_probability)) * (
+        0.55 + 0.45 * progress
+    )
+    if (
+        any(value > 0.0 for value in available_scores.values())
+        and rng.random() < guidance_probability
+    ):
+        weights = [
+            (provider, 0.05 + available_scores[provider])
+            for provider in alternatives
+        ]
+        return int(_weighted_sample_without_replacement(weights, 1, rng)[0])
+    return _choose_memory_or_random(
+        task,
+        alternatives,
+        memory,
+        rng,
+        exploration_floor,
+    )
+
+
 def _force_change(candidate, reference, context, rng, memory=None):
     if solution_key(candidate) != solution_key(reference):
-        return repair_solution(candidate, context)
+        return context.repair_solution(candidate)
     child = [tuple(int(value) for value in gene[:3]) for gene in reference]
     mutable = []
     for index, (task, provider, _position) in enumerate(child):
@@ -125,11 +157,11 @@ def _force_change(candidate, reference, context, rng, memory=None):
         if alternatives:
             mutable.append((index, task, alternatives))
     if not mutable:
-        return repair_solution(child, context)
+        return context.repair_solution(child)
     index, task, alternatives = rng.choice(mutable)
     provider = _choose_memory_or_random(task, alternatives, memory, rng, 0.35)
     child[index] = (int(task), int(provider), int(index))
-    return repair_solution(child, context)
+    return context.repair_solution(child)
 
 
 def _base_task_weights(current, best, peer_a, peer_b, context):
@@ -234,16 +266,21 @@ def odor_defense(current, best, context, progress, rng, memory=None, elite_maps=
     rank = _rank_weights(context, current_map)
     anchors = _weighted_sample_without_replacement(
         [
-            (task, rank.get(task, 1.0) * (2.0 if best_map.get(task) != provider else 0.35))
+            (
+                task,
+                rank.get(task, 1.0)
+                * (2.0 if best_map.get(task) != provider else 0.35)
+                * (1.0 + 0.35 * _energy_opportunity(context, task)),
+            )
             for task, provider in current_map.items()
         ],
         1,
         rng,
     )
     if not anchors:
-        return repair_solution(child, context)
+        return context.repair_solution(child)
     anchor = int(anchors[0])
-    task_types = _task_types(context)
+    task_types = context.get("task_type_ids", {}) or {}
     anchor_type = task_types.get(anchor, task_types.get(str(anchor)))
     same_service = [
         int(task)
@@ -275,8 +312,14 @@ def odor_defense(current, best, context, progress, rng, memory=None, elite_maps=
             if elite_votes and rng.random() < 0.70:
                 provider = int(_weighted_sample_without_replacement(elite_votes.items(), 1, rng)[0])
             else:
-                provider = _choose_memory_or_random(
-                    task, alternatives, memory, rng, 0.20
+                provider = _choose_model_guided_provider(
+                    task,
+                    alternatives,
+                    context,
+                    memory,
+                    rng,
+                    progress,
+                    exploration_floor=0.20,
                 )
         if provider is not None:
             index = index_by_task[task]
@@ -302,21 +345,28 @@ def physical_attack(current, best, context, progress, rng, memory=None, elite_ma
             disagreement = _elite_disagreement(
                 elite_maps, task, provider, domain
             )
-            weight = 0.25 + rank.get(task, 1.0) + 2.25 * disagreement
+            weight = (
+                0.25
+                + rank.get(task, 1.0)
+                + 2.25 * disagreement
+                + 0.75 * _energy_opportunity(context, task)
+            )
             mutable.append(((index, task, alternatives), weight))
     if not mutable:
-        return repair_solution(child, context)
+        return context.repair_solution(child)
     index, task, alternatives = _weighted_sample_without_replacement(mutable, 1, rng)[0]
     elite_votes = _elite_provider_profile(elite_maps, task, alternatives)
     if elite_votes and rng.random() < 0.68:
         provider = int(_weighted_sample_without_replacement(elite_votes.items(), 1, rng)[0])
     else:
-        provider = _choose_memory_or_random(
+        provider = _choose_model_guided_provider(
             task,
             alternatives,
+            context,
             memory,
             rng,
-            0.10 + 0.12 * (1.0 - progress),
+            progress,
+            exploration_floor=0.10 + 0.12 * (1.0 - progress),
         )
     child[index] = (int(task), int(provider), int(index))
     return _force_change(child, current, context, rng, memory)

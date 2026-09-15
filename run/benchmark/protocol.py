@@ -57,7 +57,7 @@ def resolve_experiment_mode(
             raise ValueError(
                 "paper_reproduction accepts only algorithms printed in the "
                 f"selected source figure; unsupported: {unsupported}. Use "
-                "experiment_mode='fair_optimizer_comparison' for GPC/GWO/PSO/CPO."
+                "experiment_mode='fair_optimizer_comparison' for added optimizers."
             )
         if max_function_evaluations is not None:
             raise ValueError(
@@ -74,8 +74,7 @@ def resolve_experiment_mode(
         )
     if not (set(selected) & ADDED_OPTIMIZERS):
         raise ValueError(
-            "fair_optimizer_comparison must include at least one of gpc, "
-            "gwo_aco, pso, or cpo."
+            "fair_optimizer_comparison must include at least one added optimizer."
         )
     if set(selected) & POPULATION_ALGORITHMS and max_function_evaluations is None:
         raise ValueError(

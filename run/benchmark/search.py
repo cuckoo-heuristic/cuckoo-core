@@ -13,12 +13,9 @@ from .evaluator import (
     JointScheduleState,
     NestItem,
     evaluate_joint_nest,
-    evaluate_joint_nest_cache_state,
     evaluate_joint_nest_total,
-    evaluate_joint_nest_total_and_cache,
 )
 from .schemes import (
-    SUPPORTED_JOINT_ALGORITHMS,
     JointScheme,
     get_joint_scheme,
 )
@@ -260,6 +257,38 @@ def _domain(
     if search_cache is not None:
         search_cache.domains[cache_key] = providers
     return providers
+
+
+def _repair_joint_solution(
+    joint_ctx: Dict[str, Any],
+    task_order: Sequence[int],
+    solution,
+) -> List[NestItem]:
+    """Canonical task-provider projection shared by benchmark adapters."""
+    assignments: Dict[int, int] = {}
+    for gene in solution or []:
+        if isinstance(gene, (tuple, list)) and len(gene) >= 2:
+            assignments.setdefault(int(gene[0]), int(gene[1]))
+        elif isinstance(gene, dict):
+            task = gene.get("task")
+            provider = gene.get("provider")
+            if task is not None and provider is not None:
+                assignments.setdefault(int(task), int(provider))
+
+    repaired: List[NestItem] = []
+    for task in task_order:
+        task = int(task)
+        providers = [
+            int(value)
+            for value in joint_ctx.get("task_domains", {}).get(task, [])
+        ]
+        if not providers:
+            raise ValueError(f"Task {task} has no feasible provider")
+        provider = int(assignments.get(task, providers[0]))
+        if provider not in providers:
+            provider = providers[0]
+        repaired.append((task, provider, len(repaired)))
+    return repaired
 
 
 def _initial_provider_ranks(
@@ -533,16 +562,9 @@ def run_joint_gwo_aco(
     from algorithm.gwo.predictive_cache import (
         DEFAULT_DAG_AWARE,
         DEFAULT_LOOKAHEAD,
-        DEFAULT_PREDICTIVE_WEIGHT,
         DEFAULT_PROVIDER_GUIDANCE_WEIGHT,
         DEFAULT_RANK_AWARE,
-        DEFAULT_REGIONAL_CACHE_ENABLED,
-        DEFAULT_REGIONAL_CACHE_SHARE,
-        DEFAULT_REGIONAL_ELITE_RATIO,
-        RegionalCacheMemory,
         build_joint_dag_distance_map,
-        build_joint_regional_provider_maps,
-        build_regional_rsu_service_demand,
     )
     from algorithm.gwo.operators import _rank_weight
 
@@ -573,15 +595,6 @@ def run_joint_gwo_aco(
             )
         ),
     )
-    predictive_weight = max(
-        0.0,
-        float(
-            joint_ctx.get(
-                "predictive_cache_weight",
-                DEFAULT_PREDICTIVE_WEIGHT,
-            )
-        ),
-    )
     predictive_rank_aware = bool(
         joint_ctx.get("predictive_cache_rank_aware", DEFAULT_RANK_AWARE)
     )
@@ -597,77 +610,13 @@ def run_joint_gwo_aco(
             )
         ),
     )
-    regional_cache_enabled = bool(
-        joint_ctx.get("regional_cache_enabled", DEFAULT_REGIONAL_CACHE_ENABLED)
-    )
-    regional_cache_share = max(
-        0.0,
-        min(
-            1.0,
-            float(
-                joint_ctx.get(
-                    "regional_cache_share",
-                    DEFAULT_REGIONAL_CACHE_SHARE,
-                )
-            ),
-        ),
-    )
-    regional_elite_ratio = max(
-        0.0,
-        min(
-            1.0,
-            float(
-                joint_ctx.get(
-                    "regional_cache_elite_ratio",
-                    DEFAULT_REGIONAL_ELITE_RATIO,
-                )
-            ),
-        ),
-    )
-    regional_provider_rsu_ids, regional_provider_types = (
-        build_joint_regional_provider_maps(joint_ctx)
-    )
-    regional_memory = RegionalCacheMemory(
-        regional_provider_rsu_ids,
-        regional_provider_types,
-        elite_ratio=regional_elite_ratio,
-    )
-    regional_profile_evaluations = {"count": 0}
-    # Objective evaluation already materializes the final cache state.  Keep
-    # that tiny by-product for the current regional-memory version so elite
-    # observations do not schedule the same wolf a second time.
-    regional_cache_state_memo: Dict[
-        Tuple[int, Tuple[Tuple[int, int], ...]],
-        Dict[int, set[int]],
-    ] = {}
-
-    def regional_solution_key(solution) -> Tuple[Tuple[int, int], ...]:
-        return tuple(
-            (int(gene[0]), int(gene[1]))
-            for gene in solution
-            if isinstance(gene, (tuple, list)) and len(gene) >= 2
-        )
-
     # Search guidance may estimate future service reuse, but fitness must use
     # the exact same paper cache/evaluator as DCSGA.  Giving GWO a different
     # cache policy would change the problem instead of improving the optimizer.
-    joint_ctx["predictive_cache_enabled"] = False
-    joint_ctx["predictive_cache_policy"] = "paper"
     joint_ctx["predictive_cache_lookahead"] = predictive_lookahead
-    joint_ctx["predictive_cache_weight"] = predictive_weight
     joint_ctx["predictive_cache_rank_aware"] = predictive_rank_aware
     joint_ctx["predictive_cache_dag_aware"] = predictive_dag_aware
     joint_ctx["predictive_provider_guidance_weight"] = provider_guidance_weight
-    joint_ctx["regional_cache_enabled"] = False
-    joint_ctx["regional_cache_share"] = float(regional_cache_share)
-    joint_ctx["regional_cache_elite_ratio"] = float(regional_elite_ratio)
-    joint_ctx["regional_provider_rsu_ids"] = dict(regional_provider_rsu_ids)
-    joint_ctx["regional_provider_types"] = dict(regional_provider_types)
-    joint_ctx["regional_rsu_vehicle_cache_prevalence"] = {}
-    joint_ctx["regional_rsu_assignment_demand"] = {}
-    joint_ctx["regional_rsu_service_popularity"] = {}
-    joint_ctx["regional_cache_version"] = 0
-
     search_cache = _build_search_static_cache(joint_ctx)
     initial_evaluation_memo: Dict[Tuple[Tuple[int, int], ...], float] = {}
     initial_evaluation_counter = {"count": 0}
@@ -683,6 +632,9 @@ def run_joint_gwo_aco(
 
     class ContextAdapter:
         """Adapter between the joint benchmark and the standalone GWO engine."""
+
+        def get(self, key, default=None):
+            return joint_ctx.get(key, default)
 
         @property
         def seed(self):
@@ -733,84 +685,15 @@ def run_joint_gwo_aco(
                 )
             )
 
-        @property
-        def regional_cache_version(self):
-            return int(joint_ctx.get("regional_cache_version", 0))
-
-        @property
-        def regional_profile_evaluations(self):
-            return int(regional_profile_evaluations["count"])
-
-        def update_regional_cache_memory(self, evaluated_rows):
-            if not bool(joint_ctx.get("regional_cache_enabled", False)):
-                return False
-
-            ranked_rows = sorted(
-                list(evaluated_rows or []),
-                key=lambda row: float(row[1]),
-                reverse=True,
-            )
-            elite_count = regional_memory.elite_count(len(ranked_rows))
-            if elite_count <= 0:
-                return False
-
-            cache_states = []
-            demand_states = []
-            version = int(joint_ctx.get("regional_cache_version", 0))
-            for solution, _score in ranked_rows[:elite_count]:
-                memo_key = (version, regional_solution_key(solution))
-                cache_state = regional_cache_state_memo.get(memo_key)
-                if cache_state is None:
-                    # Defensive fallback for externally supplied/pre-evaluated
-                    # wolves.  Normal GWO evaluations always populate the memo.
-                    cache_state = evaluate_joint_nest_cache_state(
-                        joint_ctx,
-                        solution,
-                        joint_ctx["ranked_task_ids"],
-                        use_caching=scheme.use_caching,
-                        v2i_only=scheme.v2i_only,
-                        cache_policy="provider_predictive",
-                        predictive_lookahead=predictive_lookahead,
-                        predictive_weight=predictive_weight,
-                    )
-                    regional_profile_evaluations["count"] += 1
-                cache_states.append(cache_state)
-                demand_states.append(
-                    build_regional_rsu_service_demand(
-                        solution,
-                        joint_ctx.get("task_type_ids", {}),
-                        regional_provider_rsu_ids,
-                        regional_provider_types,
-                    )
-                )
-
-            changed = regional_memory.update_from_observations(
-                cache_states,
-                demand_states,
-            )
-            joint_ctx["regional_rsu_vehicle_cache_prevalence"] = (
-                regional_memory.prevalence_profile()
-            )
-            joint_ctx["regional_rsu_assignment_demand"] = (
-                regional_memory.demand_profile()
-            )
-            joint_ctx["regional_rsu_service_popularity"] = regional_memory.profile()
-            joint_ctx["regional_cache_version"] = int(regional_memory.version)
-            joint_ctx["regional_cache_rounds"] = int(regional_memory.rounds)
-            if changed:
-                # Scores and cache states from the previous profile must never
-                # leak into the next generation; core.py separately versions
-                # the scalar objective memo using the same version counter.
-                regional_cache_state_memo.clear()
-            return bool(changed)
-
         def evaluate(self, solution):
             return evaluator(solution)
 
         def repair_solution(self, solution):
-            from algorithm.gwo.memory import repair_solution as gwo_repair
-
-            return gwo_repair(solution, self)
+            return _repair_joint_solution(
+                joint_ctx,
+                joint_ctx["ranked_task_ids"],
+                solution,
+            )
 
         @property
         def task_order(self):
@@ -861,7 +744,6 @@ def run_joint_gwo_aco(
             else int(load_params_obj().S)
         ),
         iterations=max(0, int(tmax) - 1),
-        initial_discard_probability=float(load_params_obj().p_discard_init),
         max_function_evaluations=max_function_evaluations,
     )
 
@@ -903,7 +785,6 @@ def run_joint_pso(
         v2i_only=scheme.v2i_only,
     )
 
-    from algorithm.gwo.memory import repair_solution
     import random
     initial_evaluation_counter = {"count": 0}
 
@@ -946,7 +827,11 @@ def run_joint_pso(
         def initial_function_evaluations(self):
             return int(initial_evaluation_counter["count"])
         def repair_solution(self, solution):
-            return repair_solution(solution, self)
+            return _repair_joint_solution(
+                joint_ctx,
+                joint_ctx["ranked_task_ids"],
+                solution,
+            )
 
     pso_context = ContextAdapter(
         seed=int(seed),
@@ -1407,6 +1292,13 @@ def run_joint_gpc(
         def initial_function_evaluations(self):
             return int(initial_evaluation_counter["count"])
 
+        def repair_solution(self, solution):
+            return _repair_joint_solution(
+                joint_ctx,
+                joint_ctx["ranked_task_ids"],
+                solution,
+            )
+
     ctx = ContextAdapter(joint_ctx)
     ctx["initial_evaluation_memo"] = {}
 
@@ -1432,6 +1324,69 @@ def run_joint_gpc(
     return best_solution, evaluation, history
 
 
+def _build_cpo_static_model_guidance(
+    joint_ctx: Dict[str, Any],
+    ranked_task_ids: Sequence[int],
+) -> Tuple[Dict[int, Dict[int, float]], Dict[int, float]]:
+    """Return a proposal prior derived from the common paper model.
+
+    This is not a surrogate objective.  It contains only the static
+    computation component; queues, dependency-radio transfers, cache state,
+    candidate acceptance, and final selection remain in the exact evaluator.
+    """
+    from algorithm.greedy_nests import e_comp, e_loc_j, t_comp, t_ref_s
+
+    def benefit_from_cost(costs):
+        values = {int(key): float(value) for key, value in costs.items()}
+        low = min(values.values())
+        high = max(values.values())
+        if high <= low + 1e-18:
+            return {key: 0.5 for key in values}
+        return {
+            key: (high - value) / (high - low)
+            for key, value in values.items()
+        }
+
+    model_prior: Dict[int, Dict[int, float]] = {}
+    energy_opportunity: Dict[int, float] = {}
+    for raw_joint_task_id in ranked_task_ids:
+        joint_task_id = int(raw_joint_task_id)
+        ref = joint_ctx["task_refs"][joint_task_id]
+        app_ctx = joint_ctx["applications"][int(ref.application_id)]
+        providers = [
+            int(value)
+            for value in joint_ctx["task_domains"][joint_task_id]
+        ]
+        time_costs = {
+            provider_id: float(t_comp(app_ctx, provider_id, int(ref.task_id)))
+            for provider_id in providers
+        }
+        energy_costs = {
+            provider_id: float(e_comp(app_ctx, provider_id, int(ref.task_id)))
+            for provider_id in providers
+        }
+        alpha = float(app_ctx["alpha_n"])
+        beta = float(app_ctx["beta_n"])
+        reference_time = float(t_ref_s(app_ctx))
+        local_reference_energy = float(e_loc_j(app_ctx))
+        static_objective_cost = {
+            provider_id: (
+                alpha * time_costs[provider_id] / reference_time
+                + beta * energy_costs[provider_id] / local_reference_energy
+            )
+            for provider_id in providers
+        }
+        model_prior[joint_task_id] = benefit_from_cost(static_objective_cost)
+        energy_values = list(energy_costs.values())
+        energy_opportunity[joint_task_id] = min(
+            1.0,
+            beta
+            * (max(energy_values) - min(energy_values))
+            / max(local_reference_energy, 1e-18),
+        )
+    return model_prior, energy_opportunity
+
+
 def run_joint_cpo(
     joint_ctx: Dict[str, Any],
     *,
@@ -1450,6 +1405,10 @@ def run_joint_cpo(
     joint_ctx["ranked_task_ids"] = list(ranked_task_ids)
     joint_ctx["task_rank"] = dict(task_rank)
     initial_evaluation_counter = {"count": 0}
+    (
+        task_provider_model_prior,
+        task_energy_opportunity,
+    ) = _build_cpo_static_model_guidance(joint_ctx, ranked_task_ids)
 
     class ContextAdapter(dict):
         def evaluate_solution(self, solution):
@@ -1500,12 +1459,22 @@ def run_joint_cpo(
         def initial_function_evaluations(self):
             return int(initial_evaluation_counter["count"])
 
+        def repair_solution(self, solution):
+            return _repair_joint_solution(
+                joint_ctx,
+                joint_ctx["ranked_task_ids"],
+                solution,
+            )
+
     cpo_context = ContextAdapter(
         seed=int(seed),
         task_rank=dict(task_rank),
         global_ranks=dict(task_rank),
         task_order=list(ranked_task_ids),
         task_type_ids=dict(joint_ctx.get("task_type_ids", {})),
+        task_provider_model_prior=task_provider_model_prior,
+        task_energy_opportunity=task_energy_opportunity,
+        cpo_model_guidance_max_probability=0.35,
         initial_evaluation_memo={},
     )
     best_solution, _best_score, history = run_cpo(
@@ -1527,3 +1496,4 @@ def run_joint_cpo(
         v2i_only=scheme.v2i_only,
     )
     return best_solution, evaluation, history
+

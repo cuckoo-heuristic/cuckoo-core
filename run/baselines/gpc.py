@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 from parameter.services import load_params_obj
+from .context import StandaloneOptimizerContext
 
 
 class GPC:
@@ -13,9 +14,7 @@ class GPC:
 
     def run(self, base_ctx: Dict[str, Any], seed: Optional[int] = None):
         from algorithm.gpc.core import run_gpc
-        ctx = dict(base_ctx)
-        if seed is not None:
-            ctx["seed"] = int(seed)
+        ctx = StandaloneOptimizerContext(base_ctx, seed=seed)
         params = load_params_obj()
         return run_gpc(
             ctx,

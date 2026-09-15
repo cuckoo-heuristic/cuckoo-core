@@ -5,7 +5,7 @@ import math
 import random
 
 from .initial_population import create_initial_population
-from .memory import DefenseSuccessMemory, repair_solution
+from .memory import DefenseSuccessMemory
 from .operators import (
     build_defense_schedule,
     choose_defense,
@@ -19,35 +19,6 @@ CPR_CYCLES = 2
 CPR_MINIMUM_RATIO = 0.80
 STAGNATION_RESTART_AFTER = 3
 RESTART_FRACTION = 0.15
-
-
-def _context_value(context, key, default=None):
-    if isinstance(context, dict):
-        return context.get(key, default)
-    return getattr(context, key, default)
-
-
-def _task_order(context, solution=None):
-    for key in ("task_order", "ranked_task_ids"):
-        values = _context_value(context, key, None)
-        if values:
-            return [int(value) for value in values]
-    return [int(gene[0]) for gene in solution or [] if len(gene) >= 2]
-
-
-def _evaluate_objective(context, solution):
-    for name in ("evaluate_solution", "evaluate"):
-        evaluator = getattr(context, name, None)
-        if callable(evaluator):
-            return float(evaluator(solution))
-        if isinstance(context, dict) and callable(context.get(name)):
-            return float(context[name](solution))
-    if isinstance(context, dict):
-        from algorithm.main_dcsga import evaluate_solution_quality
-
-        result = evaluate_solution_quality(context, solution, _task_order(context, solution))
-        return float(result[0] if isinstance(result, tuple) else result)
-    raise AttributeError("CPO context must provide evaluate_solution(solution)")
 
 
 def _sort_unique(rows):
@@ -71,20 +42,6 @@ def _mean_hamming(rows):
         for right in range(left + 1, len(rows))
     ]
     return float(sum(distances) / len(distances)) if distances else 0.0
-
-
-def _cyclic_active_size(iteration, iterations, initial_size, minimum_ratio, cycles):
-    """CPO cyclic population reduction over a retained feasible reservoir."""
-    initial_size = max(2, int(initial_size))
-    minimum_size = max(2, min(initial_size, int(round(initial_size * float(minimum_ratio)))))
-    if iterations <= 1 or initial_size == minimum_size:
-        return initial_size
-    normalized = float(max(0, iteration - 1)) / float(max(1, iterations))
-    phase = (normalized * max(1, int(cycles))) % 1.0
-    return max(
-        minimum_size,
-        min(initial_size, int(math.ceil(initial_size - (initial_size - minimum_size) * phase))),
-    )
 
 
 def _search_progress(function_evaluations, initial_evaluations, budget, iteration, iterations):
@@ -136,8 +93,8 @@ def run_cpo(
     source-exact continuous CPO implementation.
     """
     context = copy.deepcopy(context)
-    seed = _context_value(context, "seed", None) if seed is None else seed
-    if isinstance(context, dict) and seed is not None:
+    seed = context.get("seed") if seed is None else seed
+    if seed is not None:
         context["seed"] = int(seed)
     rng = random.Random(seed)
     size = max(2, int(population_size))
@@ -151,7 +108,7 @@ def run_cpo(
     raw_population = list(initial_population or create_initial_population(context, size, rng))
     population, seen = [], set()
     for raw in raw_population:
-        solution = repair_solution(raw, context)
+        solution = context.repair_solution(raw)
         key = solution_key(solution)
         if key and key not in seen:
             seen.add(key)
@@ -161,22 +118,22 @@ def run_cpo(
     if len(population) < size:
         raise RuntimeError(f"Initial CPO population has {len(population)} unique solutions; expected {size}")
 
-    initial_memo = _context_value(context, "initial_evaluation_memo", {}) or {}
+    initial_memo = context.get("initial_evaluation_memo", {}) or {}
     evaluation_cache = {key: float(value) for key, value in initial_memo.items()}
     function_evaluations = max(
-        len(evaluation_cache), int(_context_value(context, "initial_function_evaluations", 0) or 0)
+        len(evaluation_cache), int(context.initial_function_evaluations or 0)
     )
 
     def evaluate(raw):
         nonlocal function_evaluations
-        solution = repair_solution(raw, context)
+        solution = context.repair_solution(raw)
         key = solution_key(solution)
         if not key:
             return None
         if key not in evaluation_cache:
             if budget is not None and function_evaluations >= budget:
                 return None
-            evaluation_cache[key] = float(_evaluate_objective(context, solution))
+            evaluation_cache[key] = float(context.evaluate_solution(solution))
             function_evaluations += 1
         return solution, float(evaluation_cache[key])
 
@@ -352,4 +309,4 @@ def run_cpo(
         if generated == 0:
             break
 
-    return repair_solution(best_solution, context), float(best_score), history
+    return context.repair_solution(best_solution), float(best_score), history

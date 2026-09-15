@@ -22,12 +22,8 @@ from resource.models import Resource
 from algorithm.gwo.predictive_cache import (
     DEFAULT_DAG_AWARE,
     DEFAULT_LOOKAHEAD,
-    DEFAULT_PREDICTIVE_WEIGHT,
     DEFAULT_PROVIDER_GUIDANCE_WEIGHT,
     DEFAULT_RANK_AWARE,
-    DEFAULT_REGIONAL_CACHE_ENABLED,
-    DEFAULT_REGIONAL_CACHE_SHARE,
-    DEFAULT_REGIONAL_ELITE_RATIO,
 )
 from run.benchmark.protocol import (
     FAIR_OPTIMIZER_COMPARISON,
@@ -1887,6 +1883,16 @@ def _line_panel(axis, rows: Sequence[Dict[str, Any]], metric: str, x_key: str, x
             "marker": "s",
             "linestyle": "--",
         },
+        "gpc": {
+            "color": "#2A9D8F",
+            "marker": "^",
+            "linestyle": "--",
+        },
+        "pso": {
+            "color": "#E76F51",
+            "marker": "D",
+            "linestyle": "--",
+        },
         "cpo": {
             "color": "#D81B60",
             "marker": "X",
@@ -2064,6 +2070,8 @@ def _plot_figure_9(rows: Sequence[Dict[str, Any]],output_base: Path,) -> None:
         "dcsga": "#0072B2",
         "dtosc": "#009E73",
         "gwo_aco": "#7B2CBF",
+        "gpc": "#2A9D8F",
+        "pso": "#E76F51",
         "cpo": "#D81B60",
     }
 
@@ -2152,6 +2160,8 @@ def _plot_figure_10(
         "dcsga": {"color": "#0072B2", "marker": "o"},
         "dtosc": {"color": "#009E73", "marker": "^"},
         "gwo_aco": {"color": "#7B2CBF", "marker": "s"},
+        "gpc": {"color": "#2A9D8F", "marker": "^"},
+        "pso": {"color": "#E76F51", "marker": "D"},
         "cpo": {"color": "#D81B60", "marker": "X"},
     }
 
@@ -3112,7 +3122,6 @@ def run_paper_experiment(
             "fitness_policy": "paper (identical to DCSGA)",
             "search_guidance_only": True,
             "lookahead": int(DEFAULT_LOOKAHEAD),
-            "predictive_weight": float(DEFAULT_PREDICTIVE_WEIGHT),
             "rank_aware": bool(DEFAULT_RANK_AWARE),
             "dag_aware": bool(DEFAULT_DAG_AWARE),
             "rank_weight_model": "0.5+0.5*normalized_seed_aligned_global_rank",
@@ -3125,26 +3134,6 @@ def run_paper_experiment(
                 "only across the current provider candidates"
             ),
             "escape_move_guided": False,
-            "regional_rsu_cache_memory": False,
-            "regional_elite_ratio": float(DEFAULT_REGIONAL_ELITE_RATIO),
-            "regional_cache_share": float(DEFAULT_REGIONAL_CACHE_SHARE),
-            "regional_observation": (
-                "per-RSU prevalence of service types in vehicle-provider final caches "
-                "from the elite fraction of the previous generation, gated by the "
-                "service types those elite wolves actually assign to that RSU/MEC"
-            ),
-            "regional_priority_model": (
-                "running_mean(vehicle_cache_prevalence) * "
-                "running_mean(normalized_elite_rsu_assignment_demand)"
-            ),
-            "regional_history_model": "running mean across completed generations",
-            "regional_cache_state_collection": "disabled for fair comparison",
-            "regional_prefetching": False,
-            "regional_capacity_model": (
-                "up to the configured RSU-cache share protects regionally popular "
-                "services only after they become ordinary legal cache candidates; "
-                "unused reserved capacity returns to predictive cache"
-            ),
             "prefetching": False,
             "final_fitness_bonus": False,
         },
@@ -3344,7 +3333,7 @@ def run_paper_experiment(
             },
             "cpo": {
                 "name": "CA-DCPO",
-                "revision": "nfe-aware-elite-service-v2",
+                "revision": "nfe-aware-objective-model-guided-v3",
                 "reference_doi": "10.1016/j.knosys.2023.111257",
                 "population_size": int(actual_population_size),
                 "greedy_ratio": 0.75,
@@ -3372,6 +3361,9 @@ def run_paper_experiment(
                 "criticality_guidance": "seed-aligned DCSGA task rank used only for neighborhood selection",
                 "elite_disagreement_guidance": "rank-weighted top-8 provider disagreement guides physical attacks",
                 "service_affinity_guidance": "bounded same-service odor blocks and accepted task/service-provider moves guide proposals without changing fitness",
+                "static_model_guidance": "per-task provider prior derived from the common computation-time/energy equations and the article alpha/beta weights; used only for bounded exploitation proposals",
+                "static_model_guidance_max_probability": 0.35,
+                "static_model_guidance_scope": "odor and physical-attack proposals only; queueing, dependency transfers, cache state, acceptance and final selection remain governed by the exact common evaluator",
                 "categorical_move": "domain-valid logarithmic global and 1-to-4-coordinate local neighborhoods; provider IDs are never treated as continuous coordinates",
                 "survival": "elitist parent/archive pool with exact objective-evaluation accounting",
                 "article_exact": False,

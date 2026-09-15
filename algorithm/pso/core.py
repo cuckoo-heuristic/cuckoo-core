@@ -3,10 +3,9 @@ from __future__ import annotations
 import copy
 import math
 import random
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Sequence, Tuple
 
 from .initial_population import create_initial_population
-from .memory import repair_solution
 
 
 # Classical PSO defaults (kept explicit so later variants/innovations can be
@@ -35,12 +34,6 @@ Gene = Tuple[int, int, int]
 Velocity = Dict[int, Dict[int, float]]
 
 
-def _context_value(context, key, default=None):
-    if isinstance(context, dict) and key in context:
-        return context.get(key, default)
-    return getattr(context, key, default)
-
-
 def _solution_key(solution: Sequence) -> tuple[tuple[int, int], ...]:
     return tuple(
         (int(gene[0]), int(gene[1]))
@@ -57,17 +50,6 @@ def _provider_map(solution: Sequence) -> dict[int, int]:
     }
 
 
-def _task_order(context, solution=None) -> list[int]:
-    order = _context_value(context, "task_order", None)
-    if order:
-        return [int(x) for x in order]
-    return [
-        int(gene[0])
-        for gene in (solution or [])
-        if isinstance(gene, (tuple, list)) and len(gene) >= 2
-    ]
-
-
 def _task_priority_weights(context, tasks: Sequence[int]) -> dict[int, float]:
     """Rank/DAG guided importance weights for discrete PSO task updates.
 
@@ -78,9 +60,9 @@ def _task_priority_weights(context, tasks: Sequence[int]) -> dict[int, float]:
     if not tasks:
         return {}
 
-    rank_data = _context_value(context, "task_rank", None)
+    rank_data = context.get("task_rank")
     if not rank_data:
-        rank_data = _context_value(context, "global_ranks", {})
+        rank_data = context.get("global_ranks", {})
 
     raw = {}
     for task in tasks:
@@ -101,44 +83,7 @@ def _task_priority_weights(context, tasks: Sequence[int]) -> dict[int, float]:
 
 
 def _valid_providers(context, task: int) -> list[int]:
-    validator = getattr(context, "valid_provider", None)
-    if callable(validator):
-        return list(dict.fromkeys(int(p) for p in (validator(int(task)) or [])))
-
-    if isinstance(context, dict):
-        domains = context.get("task_domains", context.get("providers", {}))
-        if isinstance(domains, dict):
-            values = domains.get(int(task), [])
-            if isinstance(values, dict):
-                values = values.keys()
-            return list(dict.fromkeys(int(p) for p in (values or [])))
-    return []
-
-
-def _repair(context, solution):
-    repair = getattr(context, "repair_solution", None)
-    if callable(repair):
-        return repair(solution)
-    return repair_solution(solution, context)
-
-
-def _evaluate(context, solution) -> float:
-    """Use the project's authoritative evaluator; PSO never defines a new Q."""
-    evaluator = getattr(context, "evaluate", None)
-    if callable(evaluator):
-        return float(evaluator(solution))
-
-    if isinstance(context, dict):
-        from algorithm.main_dcsga import evaluate_solution_quality
-
-        result = evaluate_solution_quality(
-            context,
-            solution,
-            _task_order(context, solution),
-        )
-        return float(result[0] if isinstance(result, tuple) else result)
-
-    raise TypeError("PSO context must expose evaluate(solution)")
+    return list(dict.fromkeys(int(value) for value in context.valid_provider(int(task))))
 
 
 def _sort_unique(rows):
@@ -180,7 +125,7 @@ def _initial_velocity(context, solution: Sequence, rng: random.Random) -> Veloci
     PSO update while keeping the published task-provider encoding unchanged.
     """
     velocity: Velocity = {}
-    for task in _task_order(context, solution):
+    for task in context.task_order:
         providers = _valid_providers(context, int(task))
         if not providers:
             continue
@@ -285,7 +230,7 @@ def _update_particle(
 
     new_velocity: Velocity = {}
     updated: list[Gene] = []
-    task_order = _task_order(context, particle)
+    task_order = [int(task) for task in context.task_order]
 
     vmax = max(1e-12, float(velocity_limit))
     w = float(inertia_weight)
@@ -385,7 +330,7 @@ def _update_particle(
         new_velocity[task] = task_velocity
         updated.append((task, int(selected_provider), int(position)))
 
-    return _repair(context, updated), new_velocity
+    return context.repair_solution(updated), new_velocity
 
 
 def adaptive_inertia_weight(
@@ -459,7 +404,7 @@ def _mutate_particle(solution, context, rng, probability, priority_weights):
     index, alternatives, _weight = selected
     task, _provider, position = result[index]
     result[index] = (int(task), int(rng.choice(alternatives)), int(position))
-    return _repair(context, result)
+    return context.repair_solution(result)
 
 
 def _restart_particle(best, context, rng, strength=0.20):
@@ -490,7 +435,7 @@ def _restart_particle(best, context, rng, strength=0.20):
     for index, alternatives in rng.sample(mutable, min(count, len(mutable))):
         task, _provider, position = result[index]
         result[index] = (int(task), int(rng.choice(alternatives)), int(position))
-    return _repair(context, result)
+    return context.repair_solution(result)
 
 
 def _swarm_guided_best_neighbor(best, personal_best, context, rng, priority_weights):
@@ -498,7 +443,7 @@ def _swarm_guided_best_neighbor(best, personal_best, context, rng, priority_weig
     result = [tuple(int(value) for value in gene[:3]) for gene in best]
     best_map = _provider_map(best)
     pbest_maps = [_provider_map(solution) for solution in personal_best]
-    task_types = _context_value(context, "task_type_ids", {}) or {}
+    task_types = context.get("task_type_ids", {}) or {}
     service_frequency = {}
     for solution in personal_best:
         for task, provider, *_ in solution:
@@ -541,7 +486,7 @@ def _swarm_guided_best_neighbor(best, personal_best, context, rng, priority_weig
                 break
     task, _provider, position = result[index]
     result[index] = (int(task), int(selected_provider), int(position))
-    return _repair(context, result)
+    return context.repair_solution(result)
 
 
 def run_pso(
@@ -549,7 +494,6 @@ def run_pso(
     population_size: int = 20,
     iterations: int = 50,
     initial_population=None,
-    initial_discard_probability: float = 0.0,
     *,
     inertia_weight: float = DEFAULT_INERTIA_WEIGHT,
     cognitive_coefficient: float = DEFAULT_COGNITIVE_COEFFICIENT,
@@ -562,20 +506,13 @@ def run_pso(
 ):
     """Run the base discrete PSO on the project's task-provider search space.
 
-    This first implementation intentionally contains only the PSO essentials:
-      * the same feasible initial-population mechanism as the current GWO;
-      * particle positions using the existing task-provider schedule encoding;
-      * one categorical velocity vector per task;
-      * personal-best and global-best memory;
-      * the unchanged project evaluator as the sole fitness source.
-
-    The first adaptive extension is enabled through a linearly decreasing
-    inertia controller. Other PSO enhancements remain intentionally disabled.
+    The categorical velocity equation, personal/global best memories,
+    adaptive coefficients, bounded mutation, local refinement, and restart
+    logic operate only on feasible task-provider assignments. Fitness always
+    comes from the benchmark context.
     """
-    del initial_discard_probability  # retained only for future adapter parity
-
     context = copy.deepcopy(context)
-    seed = _context_value(context, "seed", None)
+    seed = context.get("seed")
     rng = random.Random(seed)
 
     size = max(3, int(population_size))
@@ -596,26 +533,26 @@ def run_pso(
         size,
         rng=rng,
     )
-    population = [_repair(context, solution) for solution in population]
+    population = [context.repair_solution(solution) for solution in population]
     population = [solution for solution in population if solution][:size]
     if len(population) < size:
         raise RuntimeError(
             f"Initial population is {len(population)}, expected {size}"
         )
 
-    initial_memo = _context_value(context, "initial_evaluation_memo", {}) or {}
+    initial_memo = context.get("initial_evaluation_memo", {}) or {}
     evaluation_cache = {
         key: float(score)
         for key, score in initial_memo.items()
     }
     function_evaluations_total = max(
         len(evaluation_cache),
-        int(_context_value(context, "initial_function_evaluations", 0) or 0),
+        int(context.initial_function_evaluations or 0),
     )
 
     def evaluate_one(raw):
         nonlocal function_evaluations_total
-        solution = _repair(context, raw)
+        solution = context.repair_solution(raw)
         if not solution:
             raise ValueError("Cannot evaluate an empty PSO particle")
         key = _solution_key(solution)
@@ -625,7 +562,7 @@ def run_pso(
                 and function_evaluations_total >= evaluation_budget
             ):
                 raise _EvaluationBudgetReached
-            evaluation_cache[key] = float(_evaluate(context, solution))
+            evaluation_cache[key] = float(context.evaluate(solution))
             function_evaluations_total += 1
         return solution, float(evaluation_cache[key])
 
@@ -686,7 +623,7 @@ def run_pso(
 
     task_priority_weights = _task_priority_weights(
         context,
-        _task_order(context, particles[0] if particles else None),
+        context.task_order,
     )
 
     for iteration in range(1, iterations + 1):
@@ -869,4 +806,4 @@ def run_pso(
         if budget_exhausted:
             break
 
-    return _repair(context, global_best), float(global_best_score), history
+    return context.repair_solution(global_best), float(global_best_score), history
