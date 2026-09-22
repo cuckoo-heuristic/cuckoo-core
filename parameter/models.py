@@ -12,4 +12,3 @@ class Parameter(models.Model):
     value = models.JSONField()
     unit = models.CharField(max_length=16, blank=True, default="")
     value_type = models.CharField(max_length=16, choices=ValueType.choices, default=ValueType.JSON)
-    # is_editable = models.BooleanField(default=True)
