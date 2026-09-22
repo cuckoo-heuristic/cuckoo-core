@@ -28,9 +28,13 @@ SCHEMES: Dict[str, JointScheme] = {
     "to_wo_c": JointScheme("to_wo_c", True, False, False, "all"),
     "to_wo_r": JointScheme("to_wo_r", False, True, False, "all"),
     "gwo_aco": JointScheme("gwo_aco", True, True, False, "all"),
-    "pso": JointScheme("pso", True, True, False, "all"),
+    "gwo": JointScheme("gwo", True, True, False, "all"),
     "gpc": JointScheme("gpc", True, True, False, "all"),
     "cpo": JointScheme("cpo", True, True, False, "all"),
+    "dcpo_base": JointScheme("dcpo_base", True, True, False, "all"),
+    "dcpo_criticality": JointScheme("dcpo_criticality", True, True, False, "all"),
+    "dcpo_cache": JointScheme("dcpo_cache", True, True, False, "all"),
+    "puma": JointScheme("puma", True, True, False, "all"),
 }
 
 

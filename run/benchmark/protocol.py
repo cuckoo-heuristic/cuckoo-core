@@ -10,9 +10,14 @@ EXPERIMENT_MODES = (PAPER_REPRODUCTION, FAIR_OPTIMIZER_COMPARISON)
 # DTOSC is deterministic here. The remaining schemes execute a population
 # search (DCSGA itself, a DCSGA ablation, or an added optimizer).
 POPULATION_ALGORITHMS = frozenset(
-    {"dcsga", "to_v2i", "to_wo_c", "to_wo_r", "gpc", "gwo_aco", "pso", "cpo"}
+    {
+        "dcsga", "to_v2i", "to_wo_c", "to_wo_r", "gpc", "gwo", "gwo_aco",
+        "cpo", "dcpo_base", "dcpo_criticality", "dcpo_cache", "puma",
+    }
 )
-ADDED_OPTIMIZERS = frozenset({"gpc", "gwo_aco", "pso", "cpo"})
+ADDED_OPTIMIZERS = frozenset(
+    {"gpc", "gwo", "gwo_aco", "cpo", "dcpo_base", "dcpo_criticality", "dcpo_cache", "puma"}
+)
 
 
 def resolve_experiment_mode(

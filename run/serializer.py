@@ -84,9 +84,13 @@ class BenchmarkRequestSerializer(StrictFieldsSerializer):
                 "to_wo_c",
                 "to_wo_r",
                 "gwo_aco",
-                "pso",
+                "gwo",
                 "gpc",
                 "cpo",
+                "dcpo_base",
+                "dcpo_criticality",
+                "dcpo_cache",
+                "puma",
             ]
         ),
         required=False,
@@ -130,18 +134,17 @@ class BenchmarkRequestSerializer(StrictFieldsSerializer):
         default=False,
     )
 
-
     def validate(self, attrs):
         algorithms = attrs.get("algorithms") or []
         population_size = attrs.get("population_size")
         if (
             population_size is not None
-            and "gwo_aco" in algorithms
+            and ({"gwo", "gwo_aco"} & set(algorithms))
             and int(population_size) < 3
         ):
             raise serializers.ValidationError({
                 "population_size": [
-                    "gwo_aco requires population_size >= 3 for alpha, beta, and delta leaders."
+                    "gwo requires population_size >= 3 for alpha, beta, and delta leaders."
                 ]
             })
         return attrs
@@ -167,9 +170,13 @@ class PaperExperimentRequestSerializer(StrictFieldsSerializer):
                 "to_wo_c",
                 "to_wo_r",
                 "gwo_aco",
-                "pso",
+                "gwo",
                 "gpc",
                 "cpo",
+                "dcpo_base",
+                "dcpo_criticality",
+                "dcpo_cache",
+                "puma",
             ]
         ),
         required=False,
@@ -246,12 +253,12 @@ class PaperExperimentRequestSerializer(StrictFieldsSerializer):
 
         if (
             population_size is not None
-            and "gwo_aco" in algorithms
+            and ({"gwo", "gwo_aco"} & set(algorithms))
             and int(population_size) < 3
         ):
             raise serializers.ValidationError({
                 "population_size": [
-                    "gwo_aco requires population_size >= 3 for alpha, beta, and delta leaders."
+                    "gwo requires population_size >= 3 for alpha, beta, and delta leaders."
                 ]
             })
 
@@ -291,11 +298,14 @@ class PaperExperimentRequestSerializer(StrictFieldsSerializer):
                 ]
             })
 
-        added_optimizers = {"gpc", "gwo_aco", "pso", "cpo"}
+        added_optimizers = {
+            "gpc", "gwo", "gwo_aco", "cpo", "dcpo_base",
+            "dcpo_criticality", "dcpo_cache", "puma",
+        }
         if experiment_mode == "paper_reproduction" and set(algorithms) & added_optimizers:
             raise serializers.ValidationError({
                 "experiment_mode": [
-                    "GPC/GWO/PSO/CPO are extensions, not algorithms printed in the original figure. Use fair_optimizer_comparison."
+                    "Added optimizers and CPO ablations are not algorithms printed in the original figure. Use fair_optimizer_comparison."
                 ]
             })
         if (

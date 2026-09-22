@@ -149,6 +149,7 @@ def rank_guided_discrete_mutation(
     context,
     rng,
     mutation_probability=0.15,
+    rank_guided=True,
 ):
     """
     Phase 3: Rank-guided adaptive discrete mutation (RADM).
@@ -167,7 +168,7 @@ def rank_guided_discrete_mutation(
     if rng.random() > float(mutation_probability):
         return result
 
-    rank_map = _rank_map(context)
+    rank_map = _rank_map(context) if bool(rank_guided) else {}
 
     def providers(task):
         return _valid_providers(context, int(task))

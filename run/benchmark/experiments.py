@@ -19,12 +19,6 @@ from object.models import RSU, ServiceProvider, Vehicle
 from parameter.services import load_params_obj
 from resource.models import Resource
 
-from algorithm.gwo.predictive_cache import (
-    DEFAULT_DAG_AWARE,
-    DEFAULT_LOOKAHEAD,
-    DEFAULT_PROVIDER_GUIDANCE_WEIGHT,
-    DEFAULT_RANK_AWARE,
-)
 from run.benchmark.protocol import (
     FAIR_OPTIMIZER_COMPARISON,
     PAPER_REPRODUCTION,
@@ -49,10 +43,14 @@ ALGORITHM_LABELS = {
     "to_v2i": "TO-V2I",
     "to_wo_c": "TO-w.o.-C",
     "to_wo_r": "TO-w.o.-R",
-    "gwo_aco": "PC-ADGWO",
-    "pso": "MA-CDPSO",
-    "gpc": "SAM-ADGPC",
-    "cpo": "CA-DCPO",
+    "gwo_aco": "D-GWO",
+    "gwo": "D-GWO",
+    "gpc": "D-GPC",
+    "cpo": "DCC-DCPO",
+    "dcpo_base": "DCPO-base",
+    "dcpo_criticality": "DCPO+C",
+    "dcpo_cache": "DCPO+K",
+    "puma": "D-PO",
 }
 PAPER_FIGURE_ALGORITHMS = {
     "figure_6": ("dcsga",),
@@ -953,25 +951,45 @@ def _assignments(
     mission_rng.shuffle(mission_order)
     mission_order = mission_order[:pool_count]
 
-    deadline_order = list(DEADLINES_MS)
+    # Non-uniform deadline distribution:
+    # strict and loose deadlines are less frequent, while normal QoS
+    # requirements are more frequent. The weights follow a Gaussian-like
+    # symmetric distribution:
+    # 30/100 -> 5%, 40/90 -> 10%, 50/80 -> 15%, 60/70 -> 20%.
+    deadline_weights = {
+        30: 5,
+        40: 10,
+        50: 15,
+        60: 20,
+        70: 20,
+        80: 15,
+        90: 10,
+        100: 5,
+    }
+
+    weighted_deadlines: List[int] = []
+    for deadline in DEADLINES_MS:
+        weighted_deadlines.extend([int(deadline)] * deadline_weights[int(deadline)])
+
+    deadline_order = list(weighted_deadlines)
     dag_order = list(dag_type_ids)
+
     pair_rng.shuffle(deadline_order)
     pair_rng.shuffle(dag_order)
 
     assignment_pairs: List[Tuple[int, int]] = []
-    round_index = 0
     while len(assignment_pairs) < pool_count:
-        mapping_round = round_index % len(DEADLINES_MS)
-        round_pairs = [
-            (
-                int(deadline_order[index]),
-                int(dag_order[(index + mapping_round) % len(dag_order)]),
+        for index, deadline in enumerate(deadline_order):
+            assignment_pairs.append(
+                (
+                    int(deadline),
+                    int(dag_order[index % len(dag_order)]),
+                )
             )
-            for index in range(len(DEADLINES_MS))
-        ]
-        pair_rng.shuffle(round_pairs)
-        assignment_pairs.extend(round_pairs)
-        round_index += 1
+            if len(assignment_pairs) >= pool_count:
+                break
+        pair_rng.shuffle(deadline_order)
+        pair_rng.shuffle(dag_order)
 
     rows: List[Dict[str, int]] = []
     for index in range(mission_vehicle_count):
@@ -1462,7 +1480,13 @@ def _iteration_diagnostics(item: Dict[str, Any]) -> Dict[str, Any]:
             None,
         )
     defenses = item.get("defense_trials", {}) or {}
-    for name in ("sight", "sound", "odor", "physical_attack", "restart"):
+    for name in (
+        "sight",
+        "sound",
+        "odor",
+        "physical_attack",
+        "stagnation_escape",
+    ):
         result[f"cpo_{name}_trials"] = int(defenses.get(name, 0) or 0)
     return result
 
@@ -1652,9 +1676,13 @@ def _plot_figure_6(rows: Sequence[Dict[str, Any]],output_base: Path,) -> None:
     styles = {
         "dcsga": {"color": "#0072B2", "marker": "o"},
         "gwo_aco": {"color": "#7B2CBF", "marker": "s"},
+        "gwo": {"color": "#7B2CBF", "marker": "s"},
         "gpc": {"color": "#2A9D8F", "marker": "^"},
-        "pso": {"color": "#E76F51", "marker": "D"},
         "cpo": {"color": "#D81B60", "marker": "P"},
+        "dcpo_base": {"color": "#6C757D", "marker": "x"},
+        "dcpo_criticality": {"color": "#F4A261", "marker": "v"},
+        "dcpo_cache": {"color": "#00A896", "marker": ">"},
+        "puma": {"color": "#E76F51", "marker": "D"},
     }
 
     figure, axis = plt.subplots(figsize=(8.0, 5.2))
@@ -1796,9 +1824,13 @@ def _plot_figure_6_nfe(
     styles = {
         "dcsga": {"color": "#0072B2", "marker": "o"},
         "gwo_aco": {"color": "#7B2CBF", "marker": "s"},
+        "gwo": {"color": "#7B2CBF", "marker": "s"},
         "gpc": {"color": "#2A9D8F", "marker": "^"},
-        "pso": {"color": "#E76F51", "marker": "D"},
         "cpo": {"color": "#D81B60", "marker": "P"},
+        "dcpo_base": {"color": "#6C757D", "marker": "x"},
+        "dcpo_criticality": {"color": "#F4A261", "marker": "v"},
+        "dcpo_cache": {"color": "#00A896", "marker": ">"},
+        "puma": {"color": "#E76F51", "marker": "D"},
     }
     figure, axis = plt.subplots(figsize=(8.0, 5.2))
     for algorithm in _algorithms_from_rows(rows):
@@ -1838,6 +1870,95 @@ def _plot_figure_6_nfe(
     figure.tight_layout()
     figure.savefig(output_base.with_suffix(".png"), dpi=300)
     figure.savefig(output_base.with_suffix(".pdf"))
+    plt.close(figure)
+
+
+def _figure_6_final_seed_rows(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Extract one final incumbent per paired algorithm/seed run."""
+    grouped: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+    for row in rows:
+        if str(row.get("point_type", "")).strip().lower() != "population":
+            continue
+        key = (str(row.get("algorithm", "")), int(row.get("seed", 0)))
+        grouped.setdefault(key, []).append(dict(row))
+    result = []
+    for (algorithm, seed), selected in sorted(grouped.items()):
+        final_iteration = max(int(row.get("iteration", 0)) for row in selected)
+        final_rows = [
+            row for row in selected
+            if int(row.get("iteration", 0)) == final_iteration
+        ]
+        if not final_rows:
+            continue
+        result.append({
+            "algorithm": algorithm,
+            "seed": int(seed),
+            "final_iteration": int(final_iteration),
+            "function_evaluations": max(
+                int(row.get("function_evaluations", 0) or 0)
+                for row in final_rows
+            ),
+            "final_best_total_efficiency": max(
+                float(row.get("total_efficiency", 0.0)) for row in final_rows
+            ),
+        })
+    return result
+
+
+def _plot_figure_6_final_distribution(
+    final_rows: Sequence[Dict[str, Any]], output_base: Path
+) -> None:
+    """Plot the seed distribution; meaningful for the final multi-seed run."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    algorithms = _algorithms_from_rows(final_rows)
+    values = [
+        [
+            float(row["final_best_total_efficiency"])
+            for row in final_rows
+            if row["algorithm"] == algorithm
+        ]
+        for algorithm in algorithms
+    ]
+    if not algorithms or any(not group for group in values):
+        return
+    figure, axis = plt.subplots(figsize=(8.0, 5.2))
+    tick_labels = [ALGORITHM_LABELS.get(name, name) for name in algorithms]
+    boxplot_options = {
+        "showmeans": True,
+        "meanline": True,
+    }
+    # Matplotlib 3.9 renamed ``labels`` to ``tick_labels`` and 3.10 removed
+    # the old keyword.  Keep the benchmark export compatible with both the
+    # older server environment and current laptop installations.
+    try:
+        axis.boxplot(values, tick_labels=tick_labels, **boxplot_options)
+    except TypeError as exc:
+        if "tick_labels" not in str(exc):
+            raise
+        axis.boxplot(values, labels=tick_labels, **boxplot_options)
+    for x_position, group in enumerate(values, start=1):
+        offsets = [
+            0.0 if len(group) == 1 else -0.12 + 0.24 * index / (len(group) - 1)
+            for index in range(len(group))
+        ]
+        axis.scatter(
+            [x_position + offset for offset in offsets],
+            group,
+            s=16,
+            color="black",
+            alpha=0.55,
+            linewidths=0,
+        )
+    axis.set_xlabel("Algorithm")
+    axis.set_ylabel("Final total offloading efficiency")
+    axis.grid(axis="y", alpha=0.25)
+    figure.tight_layout()
+    figure.savefig(output_base.with_suffix(".png"), dpi=300, bbox_inches="tight")
+    figure.savefig(output_base.with_suffix(".pdf"), bbox_inches="tight")
     plt.close(figure)
 
 def _line_panel(axis, rows: Sequence[Dict[str, Any]], metric: str, x_key: str, x_label: str, y_label: str,
@@ -1883,12 +2004,17 @@ def _line_panel(axis, rows: Sequence[Dict[str, Any]], metric: str, x_key: str, x
             "marker": "s",
             "linestyle": "--",
         },
+        "gwo": {
+            "color": "#7B2CBF",
+            "marker": "s",
+            "linestyle": "--",
+        },
         "gpc": {
             "color": "#2A9D8F",
             "marker": "^",
             "linestyle": "--",
         },
-        "pso": {
+        "puma": {
             "color": "#E76F51",
             "marker": "D",
             "linestyle": "--",
@@ -1898,6 +2024,9 @@ def _line_panel(axis, rows: Sequence[Dict[str, Any]], metric: str, x_key: str, x
             "marker": "X",
             "linestyle": "--",
         },
+        "dcpo_base": {"color": "#6C757D", "marker": "x", "linestyle": ":"},
+        "dcpo_criticality": {"color": "#F4A261", "marker": "v", "linestyle": "-."},
+        "dcpo_cache": {"color": "#00A896", "marker": ">", "linestyle": "-."},
     }
 
     all_x_values = set()
@@ -2070,9 +2199,13 @@ def _plot_figure_9(rows: Sequence[Dict[str, Any]],output_base: Path,) -> None:
         "dcsga": "#0072B2",
         "dtosc": "#009E73",
         "gwo_aco": "#7B2CBF",
+        "gwo": "#7B2CBF",
         "gpc": "#2A9D8F",
-        "pso": "#E76F51",
         "cpo": "#D81B60",
+        "dcpo_base": "#6C757D",
+        "dcpo_criticality": "#F4A261",
+        "dcpo_cache": "#00A896",
+        "puma": "#E76F51",
     }
 
     for algorithm_index, algorithm in enumerate(algorithms):
@@ -2160,9 +2293,13 @@ def _plot_figure_10(
         "dcsga": {"color": "#0072B2", "marker": "o"},
         "dtosc": {"color": "#009E73", "marker": "^"},
         "gwo_aco": {"color": "#7B2CBF", "marker": "s"},
+        "gwo": {"color": "#7B2CBF", "marker": "s"},
         "gpc": {"color": "#2A9D8F", "marker": "^"},
-        "pso": {"color": "#E76F51", "marker": "D"},
         "cpo": {"color": "#D81B60", "marker": "X"},
+        "dcpo_base": {"color": "#6C757D", "marker": "x"},
+        "dcpo_criticality": {"color": "#F4A261", "marker": "v"},
+        "dcpo_cache": {"color": "#00A896", "marker": ">"},
+        "puma": {"color": "#E76F51", "marker": "D"},
     }
 
     for algorithm in _algorithms_from_rows(rows):
@@ -2366,36 +2503,13 @@ def _export_experiment(
         / run_id
     )
     output_dir.mkdir(parents=True, exist_ok=False)
-    raw_path = output_dir / "raw_results.csv"
     summary_path = output_dir / "summary_results.csv"
-    application_path = output_dir / "application_results.csv"
     metadata_path = output_dir / "metadata.json"
     nfe_summary_path = output_dir / "nfe_summary_results.csv"
-    # All comparison figures keep NFE diagnostics. Figure 6 additionally uses
-    # NFE as convergence axis; figures 7-10 use it only to verify equal budget.
-    nfe_diagnostic_path = output_dir / "nfe_diagnostic_results.csv"
-    _write_csv(raw_path, raw_rows)
+
+    # خروجی های حجیم و مخصوص دیباگ (raw/application/audit/distribution)
+    # در نسخه گزارش نگه داشته نمی شوند تا پوشه نتایج تمیز بماند.
     _write_csv(summary_path, summary_rows)
-    _write_csv(application_path, application_rows)
-    _write_csv(
-        nfe_diagnostic_path,
-        [
-            {
-                "figure": row.get("figure"),
-                "scenario_id": row.get("scenario_id"),
-                "seed": row.get("seed"),
-                "algorithm": row.get("algorithm"),
-                "function_evaluations": row.get("function_evaluations", 0),
-                "max_function_evaluations": row.get("max_function_evaluations"),
-                "evaluation_budget_exhausted": row.get(
-                    "evaluation_budget_exhausted", False
-                ),
-                "executed_iterations": row.get("executed_iterations", 0),
-                "runtime_seconds": row.get("runtime_seconds", 0.0),
-            }
-            for row in metadata.get("execution_audit", [])
-        ],
-    )
     with metadata_path.open("w", encoding="utf-8") as stream:
         json.dump(metadata, stream, ensure_ascii=False, indent=2, default=str)
     figure_base = output_dir / figure
@@ -2417,11 +2531,8 @@ def _export_experiment(
     return {
         "run_id": run_id,
         "output_directory": _relative_path(output_dir),
-        "raw_csv": _relative_path(raw_path),
         "summary_csv": _relative_path(summary_path),
-        "application_csv": _relative_path(application_path),
         "metadata_json": _relative_path(metadata_path),
-        "nfe_diagnostic_csv": _relative_path(nfe_diagnostic_path),
         "nfe_summary_csv": (
             _relative_path(nfe_summary_path) if figure == "figure_6" else None
         ),
@@ -2586,11 +2697,11 @@ def run_paper_experiment(
         raise ValueError(f"Unsupported comparison algorithms: {unknown_algorithms}")
     if (
         population_size is not None
-        and "gwo_aco" in selected_algorithms
+        and ({"gwo", "gwo_aco"} & set(selected_algorithms))
         and int(population_size) < 3
     ):
         raise ValueError(
-            "gwo_aco requires population_size >= 3 for alpha, beta, and delta leaders"
+            "gwo requires population_size >= 3 for alpha, beta, and delta leaders"
         )
     if figure == "figure_6" and "dtosc" in selected_algorithms:
         raise ValueError("DTOSC has no population convergence history for Figure 6")
@@ -3118,24 +3229,23 @@ def run_paper_experiment(
         ],
         "dcsga_rank_seed_aligned": True,
         "dcsga_rank_recomputed_per_run": True,
-        "proposed_algorithm_cache": {
-            "fitness_policy": "paper (identical to DCSGA)",
-            "search_guidance_only": True,
-            "lookahead": int(DEFAULT_LOOKAHEAD),
-            "rank_aware": bool(DEFAULT_RANK_AWARE),
-            "dag_aware": bool(DEFAULT_DAG_AWARE),
-            "rank_weight_model": "0.5+0.5*normalized_seed_aligned_global_rank",
-            "dag_weight_model": "1+1/shortest_descendant_distance",
-            "provider_selection_guidance": True,
-            "provider_guidance_weight": float(DEFAULT_PROVIDER_GUIDANCE_WEIGHT),
-            "provider_guidance_model": (
-                "same-provider future reuse of the current service type, "
-                "weighted by the existing rank/DAG factors and normalized "
-                "only across the current provider candidates"
-            ),
-            "escape_move_guided": False,
+        "proposed_method_guidance": {
+            "algorithm": "cpo",
+            "name": "DCC-DCPO",
+            "fitness_policy": "paper evaluator shared unchanged with every comparator",
+            "structural_criticality": "0.65 normalized seeded HEFT rank + 0.35 normalized transitive DAG reach; protected during exploration and targeted during exploitation",
+            "cache_coupling": "capacity-feasible causal forward same-service reuse used only in odor proposals; block members follow the anchor provider actually selected",
+            "success_memory": "accepted objective-improving moves only",
+            "static_model_prior": "bounded proposal prior; never a fitness bonus",
             "prefetching": False,
             "final_fitness_bonus": False,
+        },
+        "baseline_isolation": {
+            "gpc": "no CPO criticality, cache affinity, success memory, or model prior",
+            "gwo": "D-GWO without pheromone, rank, or predictive-cache guidance",
+            "gwo_aco": "deprecated compatibility alias for the same isolated D-GWO execution",
+            "puma": "no CPO criticality, cache affinity, success memory, or model prior",
+            "common_components": "scenario, feasible domains, task order, repair, exact evaluator, seed, population size, and NFE budget",
         },
         "algorithms": list(algorithms),
         "comparison_mode": comparison_mode,
@@ -3273,7 +3383,7 @@ def run_paper_experiment(
                 "initialization": "paper greedy plus one second-best task mutation per nest",
             },
             "gpc": {
-                "name": "SAM-ADGPC",
+                "name": "D-GPC",
                 "population_size": int(actual_population_size),
                 "greedy_ratio": 0.70,
                 "diverse_dlhs_ratio": 0.30,
@@ -3286,13 +3396,15 @@ def run_paper_experiment(
                 "stagnation_escape_after": 5,
                 "restart_fraction": 0.15,
                 "elite_ratio": 0.20,
-                "service_affinity_memory_weight": 0.65,
-                "service_affinity_memory_evaporation": 0.08,
-                "domain_guidance": "rank-aware mutation plus accepted-move service-affinity memory and service-reuse cache locality",
+                "service_affinity_memory": False,
+                "rank_guidance": False,
+                "cache_guidance": False,
+                "domain_guidance": "none; comparator retains physical GPC controls and feasible categorical projection only",
                 "categorical_move": "dimension-normalised sparse physical GPC projection",
             },
-            "gwo_aco": {
-                "name": "PC-ADGWO",
+            "gwo": {
+                "name": "D-GWO",
+                "reference_doi": "10.1016/j.advengsoft.2013.12.007",
                 "population_size": int(actual_population_size),
                 "greedy_ratio": 0.90,
                 "diverse_dlhs_ratio": 0.10,
@@ -3300,40 +3412,34 @@ def run_paper_experiment(
                 "a_schedule": "nonlinear 2-to-0 with bounded diversity/stagnation correction",
                 "stagnation_escape_after": 5,
                 "escape_fraction": 0.15,
-                "pheromone_elite_ratio": 0.20,
-                "pheromone_evaporation": 0.10,
-                "provider_guidance_weight": float(
-                    DEFAULT_PROVIDER_GUIDANCE_WEIGHT
-                ),
-                "alpha_neighborhood": "one-coordinate leader/pheromone/reuse-guided with phase-dependent exploration floor",
+                "pheromone_guidance": False,
+                "rank_guidance": False,
+                "cache_guidance": False,
+                "alpha_neighborhood": "one-coordinate alpha/beta/delta-guided with a phase-dependent exploration floor",
                 "categorical_move": "alpha-beta-delta encircling inside an O(sqrt(D)) trust region",
+                "article_exact": False,
             },
-            "pso": {
-                "name": "MA-CDPSO",
+            "puma": {
+                "name": "D-PO",
+                "reference_doi": "10.1007/s10586-023-04221-5",
                 "population_size": int(actual_population_size),
-                "greedy_ratio": 0.70,
-                "diverse_dlhs_ratio": 0.30,
-                "sparse_near_greedy_fallback": True,
-                "inertia_start": 0.90,
-                "inertia_end": 0.40,
-                "cognitive_start": 2.50,
-                "cognitive_end": 0.50,
-                "social_start": 0.50,
-                "social_end": 2.50,
-                "temperature_start": 1.20,
-                "temperature_end": 0.25,
-                "velocity_limit": 4.0,
-                "stagnation_restart_after": 5,
-                "restart_fraction": 0.15,
-                "local_refinement_fraction": 0.15,
-                "particle_survival": "elitist current-vs-candidate",
-                "local_refinement": "pbest-frequency plus service-type back-off around gbest",
-                "categorical_move": "one-hot velocity with an O(sqrt(D)) projection trust region",
-                "position_acceptance": "standard PSO movement; pbest/gbest retain elitism",
+                "greedy_ratio": 0.0,
+                "categorical_coverage_ratio": 1.0,
+                "unexperienced_iterations": 3,
+                "phase_weights": [0.50, 0.50, 0.30],
+                "mega_exploration": 0.99,
+                "mega_exploitation": 0.99,
+                "initial_crossover_probability": 0.20,
+                "exploitation_q": 0.67,
+                "exploitation_beta": 2.0,
+                "phase_selection": "rolling improvement and improvement-per-NFE hyper-heuristic",
+                "categorical_move": "domain-valid random-global/six-peer differential exploration and best/peer/consensus exploitation",
+                "survival": "greedy phase survival and best-N pooled survival in the first three learning iterations",
+                "article_exact": False,
             },
             "cpo": {
-                "name": "CA-DCPO",
-                "revision": "nfe-aware-objective-model-guided-v3",
+                "name": "DCC-DCPO",
+                "revision": "deadline-dependency-cache-coupled-v7",
                 "reference_doi": "10.1016/j.knosys.2023.111257",
                 "population_size": int(actual_population_size),
                 "greedy_ratio": 0.75,
@@ -3357,16 +3463,22 @@ def run_paper_experiment(
                 "elite_profile_size": 8,
                 "physical_archive_probability": 0.88,
                 "exploration_radius": "ceil(2 + (ceil(log2(D+1))-2)*(1-progress))",
-                "exploitation_radius": "ceil(1 + 3*(1-progress)); physical attack changes one coordinate",
-                "criticality_guidance": "seed-aligned DCSGA task rank used only for neighborhood selection",
+                "exploitation_radius": "odor uses 1-to-4 coordinates but keeps the minimum meaningful two-task block when prospective same-service reuse exists; physical attack changes one coordinate",
+                "criticality_guidance": "0.70 structural criticality plus 0.30 normalized owning-application deadline pressure; structural criticality is 0.65 normalized seeded HEFT rank plus 0.35 normalized transitive DAG reach; proposal selection only",
                 "elite_disagreement_guidance": "rank-weighted top-8 provider disagreement guides physical attacks",
-                "service_affinity_guidance": "bounded same-service odor blocks and accepted task/service-provider moves guide proposals without changing fitness",
+                "service_affinity_guidance": "capacity-feasible causal forward-only same-service reuse; odor retains an anchor-plus-one-future-request block at late NFE and selected later block members deterministically follow the feasible provider actually chosen by the anchor; exact common evaluation accepts or rejects the block",
                 "static_model_guidance": "per-task provider prior derived from the common computation-time/energy equations and the article alpha/beta weights; used only for bounded exploitation proposals",
                 "static_model_guidance_max_probability": 0.35,
                 "static_model_guidance_scope": "odor and physical-attack proposals only; queueing, dependency transfers, cache state, acceptance and final selection remain governed by the exact common evaluator",
                 "categorical_move": "domain-valid logarithmic global and 1-to-4-coordinate local neighborhoods; provider IDs are never treated as continuous coordinates",
                 "survival": "elitist parent/archive pool with exact objective-evaluation accounting",
                 "article_exact": False,
+            },
+            "cpo_ablations": {
+                "dcpo_base": "four categorical defenses plus CPR; no structural/cache/model/memory guidance",
+                "dcpo_criticality": "base plus structural DAG criticality only",
+                "dcpo_cache": "base plus capacity-feasible cache coupling only",
+                "comparison_contract": "same objective, scenario, repair, initialization family, seed, population and NFE budget as DCC-DCPO",
             },
         },
         "declared_limitations": [

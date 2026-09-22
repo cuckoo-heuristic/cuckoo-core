@@ -6,10 +6,10 @@ from .context import StandaloneOptimizerContext
 
 
 class GPC:
-    name = "SAM-ADGPC"
+    name = "D-GPC"
     key = "gpc"
     article_exact = False
-    implementation = "service-affinity-memory-adaptive-discrete-gpc"
+    implementation = "reference-physics-categorical-gpc"
     reference_doi = "10.1007/s12065-020-00451-3"
 
     def run(self, base_ctx: Dict[str, Any], seed: Optional[int] = None):
@@ -21,6 +21,8 @@ class GPC:
             population_size=int(params.S),
             iterations=max(0, int(ctx.get("tmax", 10)) - 1),
             seed=seed,
+            service_memory_enabled=False,
+            problem_guidance=False,
         )
 
     def run_joint(self, joint_ctx: Dict[str, Any], *, seed: int, tmax: int, population_size: int | None = None, max_function_evaluations: int | None = None):

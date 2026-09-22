@@ -14,7 +14,18 @@ from .predictive_cache import (
 Gene = tuple[int, int, int]
 
 
+def _context_flag(context, key: str, default=False) -> bool:
+    """Read flags from either dict-like or attribute-only context adapters."""
+    if hasattr(context, key):
+        return bool(getattr(context, key))
+    if isinstance(context, dict) and key in context:
+        return bool(context[key])
+    return bool(context.get(key, default))
+
+
 def _provider_guidance_weight(context) -> float:
+    if not _context_flag(context, "gwo_cache_guidance", False):
+        return 0.0
     try:
         return max(
             0.0,
@@ -43,6 +54,8 @@ def _provider_map(solution: Sequence) -> dict[int, int]:
 
 def _get_task_ranks(context) -> dict[int, float]:
     """Use the canonical rank provided by build_context."""
+    if not _context_flag(context, "gwo_rank_guidance", False):
+        return {}
     for key in ("task_rank", "global_ranks"):
         rank_map = context.get(key)
         if isinstance(rank_map, dict):
@@ -99,7 +112,7 @@ def _normalized_pheromone(pheromone, task: int, providers: Sequence[int]) -> dic
     if not providers:
         return {}
     if not pheromone:
-        return {provider: 0.5 for provider in providers}
+        return {provider: 0.0 for provider in providers}
     values = [float(pheromone.get((int(task), provider), 1.0)) for provider in providers]
     lo, hi = min(values), max(values)
     if hi <= lo:
@@ -163,7 +176,11 @@ def generate_alpha_neighborhood_children(
         return []
     beta, delta = beta or alpha, delta or alpha
     alpha_map = _provider_map(alpha)
-    future_index = build_provider_future_index(context, alpha_map)
+    future_index = (
+        build_provider_future_index(context, alpha_map)
+        if _context_flag(context, "gwo_cache_guidance", False)
+        else {}
+    )
     task_ranks = _get_task_ranks(context)
     rank_values = list(task_ranks.values())
     rank_lo, rank_hi = (min(rank_values), max(rank_values)) if rank_values else (0.0, 0.0)
@@ -356,7 +373,11 @@ def discrete_adaptive_move(
 
     source = [(int(g[0]), int(g[1]), index) for index, g in enumerate(current)]
     source_map = _provider_map(source)
-    future_index = build_provider_future_index(context, source_map)
+    future_index = (
+        build_provider_future_index(context, source_map)
+        if _context_flag(context, "gwo_cache_guidance", False)
+        else {}
+    )
     task_ranks = _get_task_ranks(context)
     budget = _change_budget(source, alpha, beta, delta, a=float(a), rng=rng)
     selected = set(

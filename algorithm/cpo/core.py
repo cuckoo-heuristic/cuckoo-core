@@ -83,16 +83,28 @@ def run_cpo(
     restart_fraction=RESTART_FRACTION,
     memory_evaporation=0.10,
     provider_memory_weight=0.65,
+    criticality_guidance=True,
+    cache_coupling=True,
+    success_memory=True,
+    model_guidance=True,
+    deadline_guidance=True,
     max_function_evaluations=None,
 ):
-    """Run criticality-aware discrete CPO in the task-provider search space.
+    """Run the discrete CPO family in the task-provider search space.
 
     The four defensive mechanisms and cyclic population reduction are retained
     from CPO.  Continuous displacements are replaced by domain-valid
     categorical neighborhoods; this is explicitly an adapted algorithm, not a
-    source-exact continuous CPO implementation.
+    source-exact continuous CPO implementation.  The four guidance switches
+    define reproducible ablations of the proposed method; none changes the
+    objective, feasibility rules, repair operator, or evaluation budget.
     """
     context = copy.deepcopy(context)
+    context["cpo_criticality_guidance"] = bool(criticality_guidance)
+    context["cpo_cache_coupling"] = bool(cache_coupling)
+    context["cpo_model_guidance"] = bool(model_guidance)
+    context["cpo_success_memory"] = bool(success_memory)
+    context["cpo_deadline_guidance"] = bool(deadline_guidance)
     seed = context.get("seed") if seed is None else seed
     if seed is not None:
         context["seed"] = int(seed)
@@ -143,8 +155,14 @@ def run_cpo(
     evaluated = evaluated[:size]
     initial_function_evaluations = int(function_evaluations)
     best_solution, best_score = copy.deepcopy(evaluated[0][0]), float(evaluated[0][1])
-    memory = DefenseSuccessMemory(
-        context, evaporation=memory_evaporation, provider_weight=provider_memory_weight
+    memory = (
+        DefenseSuccessMemory(
+            context,
+            evaporation=memory_evaporation,
+            provider_weight=provider_memory_weight,
+        )
+        if bool(success_memory)
+        else None
     )
     history = []
     stagnation = 0
@@ -159,7 +177,12 @@ def run_cpo(
         progress=0.0,
         best_improved=False,
     ):
-        profile = memory.profile()
+        profile = memory.profile() if memory is not None else {
+            "cpo_strategy_credit": {},
+            "cpo_accepted_by_strategy": {},
+            "cpo_task_provider_memory_entries": 0,
+            "cpo_service_provider_memory_entries": 0,
+        }
         history.append(
             {
                 "iteration": int(iteration),
@@ -179,6 +202,11 @@ def run_cpo(
                 "stagnation_generations": int(stagnation),
                 "search_progress": float(progress),
                 "best_improved": bool(best_improved),
+                "cpo_variant": str(context.get("cpo_variant", "dcc_dcpo")),
+                "criticality_guidance": bool(criticality_guidance),
+                "cache_coupling": bool(cache_coupling),
+                "success_memory": bool(success_memory),
+                "model_guidance": bool(model_guidance),
                 "defense_trials": dict(strategy_counts or {}),
                 "function_evaluations": int(function_evaluations),
                 **profile,
@@ -199,7 +227,8 @@ def run_cpo(
         active_size = _cyclic_active_size_at_progress(
             progress, size, cpr_minimum_ratio, cpr_cycles
         )
-        memory.begin_generation()
+        if memory is not None:
+            memory.begin_generation()
         current_rows = list(evaluated)
         current_population = [solution for solution, _score in current_rows]
         # CPR changes the number of porcupines that move, while a reservoir is
@@ -216,7 +245,16 @@ def run_cpo(
         accepted = 0
         attempts = 0
         generated = 0
-        strategy_counts = {name: 0 for name in ("sight", "sound", "odor", "physical_attack", "restart")}
+        strategy_counts = {
+            name: 0
+            for name in (
+                "sight",
+                "sound",
+                "odor",
+                "physical_attack",
+                "stagnation_escape",
+            )
+        }
         target_new_evaluations = min(
             active_size,
             (budget - function_evaluations) if budget is not None else active_size,
@@ -239,10 +277,13 @@ def run_cpo(
             parent_index = active_indices[cursor % len(active_indices)]
             cursor += 1
             parent, parent_score = current_rows[parent_index]
-            restart = stagnation >= max(1, int(stagnation_restart_after)) and rng.random() < min(0.50, float(restart_fraction))
-            if restart:
+            stagnation_escape = (
+                stagnation >= max(1, int(stagnation_restart_after))
+                and rng.random() < min(0.50, float(restart_fraction))
+            )
+            if stagnation_escape:
                 strategy = "sight"
-                strategy_counts["restart"] += 1
+                strategy_counts["stagnation_escape"] += 1
             else:
                 completed = function_evaluations - new_evaluations_before
                 strategy = (
@@ -282,8 +323,11 @@ def run_cpo(
         evaluated = selection_pool[:size]
         surviving_keys = {solution_key(solution) for solution, _score in evaluated}
         for key, strategy, child, parent, gain in improvement_records:
-            if key in surviving_keys and memory.reward(strategy, child, parent, gain):
-                accepted += 1
+            if key not in surviving_keys:
+                continue
+            accepted += 1
+            if memory is not None:
+                memory.reward(strategy, child, parent, gain)
         if float(evaluated[0][1]) > best_score + 1e-12:
             best_solution = copy.deepcopy(evaluated[0][0])
             best_score = float(evaluated[0][1])

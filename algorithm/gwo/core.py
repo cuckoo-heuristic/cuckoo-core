@@ -17,6 +17,14 @@ STAGNATION_ESCAPE_AFTER = 5
 ESCAPE_FRACTION = 0.15
 
 
+def _set_context_flag(context, key, value):
+    """Set an optimizer-local flag on mapping and object adapters safely."""
+    try:
+        context[key] = value
+    except (AttributeError, TypeError):
+        setattr(context, key, value)
+
+
 def _solution_key(solution):
     return tuple(
         (int(gene[0]), int(gene[1]))
@@ -75,9 +83,12 @@ def run_gwo_aco(
     escape_fraction=ESCAPE_FRACTION,
     pheromone_elite_ratio=0.20,
     pheromone_evaporation=0.10,
+    use_pheromone=False,
+    use_rank_guidance=False,
+    use_cache_guidance=False,
     max_function_evaluations=None,
 ):
-    """Lean discrete adaptive GWO + bounded ACO + predictive cache guidance.
+    """Run a categorical GWO baseline with optional legacy enhancements.
 
     Deliberately removed from the search loop:
       * historical leader archive,
@@ -91,6 +102,8 @@ def run_gwo_aco(
     of the final Q fitness.
     """
     context = copy.deepcopy(context)
+    _set_context_flag(context, "gwo_rank_guidance", bool(use_rank_guidance))
+    _set_context_flag(context, "gwo_cache_guidance", bool(use_cache_guidance))
     seed = context.get("seed")
     rng = random.Random(seed)
 
@@ -112,14 +125,24 @@ def run_gwo_aco(
     if len(population) < size:
         raise RuntimeError(f"Initial population is {len(population)}, expected {size}")
 
-    initial_memo = context.get("initial_evaluation_memo", {}) or {}
+    # Joint benchmark adapters expose these as properties while their ``get``
+    # method intentionally delegates to the immutable problem context.  Read
+    # the explicit optimizer contract first so greedy-constructor evaluations
+    # are neither recomputed nor omitted from the fair NFE budget.
+    initial_memo = getattr(context, "initial_evaluation_memo", None)
+    if initial_memo is None:
+        initial_memo = context.get("initial_evaluation_memo", {})
+    initial_memo = initial_memo or {}
     evaluation_cache = {
         key: float(score)
         for key, score in initial_memo.items()
     }
+    initial_count = getattr(context, "initial_function_evaluations", None)
+    if initial_count is None:
+        initial_count = context.get("initial_function_evaluations", 0)
     function_evaluations_total = max(
         len(evaluation_cache),
-        int(context.get("initial_function_evaluations", 0)),
+        int(initial_count or 0),
     )
 
     def evaluate_batch(batch):
@@ -150,16 +173,17 @@ def run_gwo_aco(
 
     task_order = [int(task) for task in context.task_order]
     pheromone: dict[tuple[int, int], float] = {}
-    initialize_pheromone(
-        pheromone,
-        {task: context.valid_provider(task) for task in task_order},
-    )
-    update_pheromone(
-        pheromone,
-        evaluated,
-        elite_ratio=float(pheromone_elite_ratio),
-        evaporation=max(0.0, float(pheromone_evaporation) - 0.02),
-    )
+    if use_pheromone:
+        initialize_pheromone(
+            pheromone,
+            {task: context.valid_provider(task) for task in task_order},
+        )
+        update_pheromone(
+            pheromone,
+            evaluated,
+            elite_ratio=float(pheromone_elite_ratio),
+            evaporation=max(0.0, float(pheromone_evaporation) - 0.02),
+        )
 
     best_solution, best_score = evaluated[0]
     history = []
@@ -268,13 +292,14 @@ def run_gwo_aco(
         else:
             stagnation_count = 0 if trigger_escape else stagnation_count + 1
 
-        update_pheromone(
-            pheromone,
-            evaluated,
-            evaporation=float(pheromone_evaporation) + 0.04 * (1.0 - a / 2.0),
-            elite_ratio=float(pheromone_elite_ratio),
-            stagnation=stagnation_count,
-        )
+        if use_pheromone:
+            update_pheromone(
+                pheromone,
+                evaluated,
+                evaporation=float(pheromone_evaporation) + 0.04 * (1.0 - a / 2.0),
+                elite_ratio=float(pheromone_elite_ratio),
+                stagnation=stagnation_count,
+            )
         record(iteration)
         if (
             evaluation_budget is not None

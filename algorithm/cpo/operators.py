@@ -27,6 +27,8 @@ def valid_providers(context, task: int) -> list[int]:
 
 
 def _energy_opportunity(context, task):
+    if not bool(context.get("cpo_model_guidance", True)):
+        return 0.0
     table = context.get("task_energy_opportunity", {})
     return max(
         0.0,
@@ -34,8 +36,49 @@ def _energy_opportunity(context, task):
     )
 
 
-def _rank_weights(context, tasks):
-    ranks = context.get("task_rank", context.get("global_ranks", {})) or {}
+def _deadline_urgency_weights(context, tasks):
+    """Return normalized deadline pressure when the benchmark exposes it.
+
+    Deadline guidance is intentionally a proposal bias only. It never changes
+    the evaluator or fitness. Missing task-level deadlines keep the old
+    structural-only behaviour.
+    """
+    if not bool(context.get("cpo_deadline_guidance", False)):
+        return {int(task): 0.0 for task in tasks}
+
+    deadlines = (
+        context.get("task_deadline_s")
+        or context.get("task_deadlines_s")
+        or context.get("deadline_by_task")
+        or {}
+    )
+    if not deadlines:
+        return {int(task): 0.0 for task in tasks}
+
+    values = {}
+    for task in tasks:
+        value = deadlines.get(int(task), deadlines.get(str(int(task))))
+        if value is not None:
+            values[int(task)] = 1.0 / max(float(value), 1e-9)
+
+    if not values:
+        return {int(task): 0.0 for task in tasks}
+
+    low, high = min(values.values()), max(values.values())
+    if high <= low:
+        return {task: 1.0 for task in values}
+    return {task: (value-low)/(high-low) for task, value in values.items()}
+
+
+def _criticality_weights(context, tasks):
+    """Return combined structural and deadline-aware criticality."""
+    if not bool(context.get("cpo_criticality_guidance", True)):
+        return {int(task): 1.0 for task in tasks}
+    ranks = (
+        context.get("task_structural_criticality")
+        or context.get("task_rank", context.get("global_ranks", {}))
+        or {}
+    )
     values = {
         int(task): float(ranks.get(int(task), ranks.get(str(int(task)), 0.0)))
         for task in tasks
@@ -44,8 +87,22 @@ def _rank_weights(context, tasks):
         return {}
     low, high = min(values.values()), max(values.values())
     if high <= low:
-        return {task: 1.0 for task in values}
-    return {task: 0.25 + 0.75 * (value - low) / (high - low) for task, value in values.items()}
+        # Equal structural ranks are neutral evidence, not an early exit:
+        # deadline pressure must still distinguish applications.
+        structural = {task: 1.0 for task in values}
+    else:
+        structural = {
+            task: 0.25 + 0.75 * (value - low) / (high - low)
+            for task, value in values.items()
+        }
+
+    deadline = _deadline_urgency_weights(context, tasks)
+    if bool(context.get("cpo_deadline_guidance", False)):
+        return {
+            task: 0.7 * structural.get(task, 1.0) + 0.3 * deadline.get(task, 0.0)
+            for task in values
+        }
+    return structural
 
 
 def hamming_distance(left, right):
@@ -114,6 +171,10 @@ def _choose_model_guided_provider(
     alternatives = list(dict.fromkeys(int(value) for value in alternatives))
     if not alternatives:
         return None
+    if not bool(context.get("cpo_model_guidance", True)):
+        return _choose_memory_or_random(
+            task, alternatives, memory, rng, exploration_floor
+        )
     table = context.get("task_provider_model_prior", {})
     model_scores = table.get(int(task), table.get(str(int(task)), {}))
     model_scores = model_scores if isinstance(model_scores, dict) else {}
@@ -164,14 +225,38 @@ def _force_change(candidate, reference, context, rng, memory=None):
     return context.repair_solution(child)
 
 
-def _base_task_weights(current, best, peer_a, peer_b, context):
+def _exploration_task_weights(current, best, peer_a, peer_b, context):
+    """Prioritize disagreement while protecting settled critical tasks.
+
+    Critical DAG coordinates are expensive to disturb indiscriminately: a
+    poor provider change can delay every descendant.  During the two global
+    CPO defenses we therefore explore low-criticality coordinates first, and
+    let population disagreement override that protection.  The exploitative
+    defenses retain their existing high-criticality focus.
+
+    When criticality guidance is disabled the expression is exactly the
+    former neutral weighting, preserving the DCPO-base ablation.
+    """
     current_map = provider_map(current)
     maps = [provider_map(best), provider_map(peer_a), provider_map(peer_b)]
-    rank = _rank_weights(context, current_map)
+    rank = _criticality_weights(context, current_map)
+    guided = bool(context.get("cpo_criticality_guidance", True))
     rows = []
     for task, provider in current_map.items():
         disagreement = sum(mapping.get(task, provider) != provider for mapping in maps)
-        rows.append((int(task), 1.0 + 1.15 * disagreement + 0.85 * rank.get(task, 1.0)))
+        if guided:
+            # rank is in [0.25, 1.0].  Reversing only this bounded term keeps
+            # exploration broad without allowing criticality to overwhelm
+            # the stronger population-disagreement evidence.
+            structural_weight = 1.25 - rank.get(task, 1.0)
+        else:
+            structural_weight = 1.0
+        rows.append(
+            (
+                int(task),
+                1.0 + 1.15 * disagreement + 0.85 * structural_weight,
+            )
+        )
     return rows
 
 
@@ -200,7 +285,7 @@ def sight_defense(current, best, peer, context, progress, rng, memory=None):
     current_map, best_map, peer_map = provider_map(current), provider_map(best), provider_map(peer)
     budget = _changed_task_budget(len(child), progress, exploration=True)
     tasks = _weighted_sample_without_replacement(
-        _base_task_weights(current, best, peer, peer, context), budget, rng
+        _exploration_task_weights(current, best, peer, peer, context), budget, rng
     )
     index_by_task = {int(gene[0]): index for index, gene in enumerate(child)}
     for task in tasks:
@@ -229,7 +314,7 @@ def sound_defense(current, best, peer_a, peer_b, context, progress, rng, memory=
     maps = [provider_map(peer_a), provider_map(peer_b), provider_map(best)]
     budget = _changed_task_budget(len(child), progress, exploration=True)
     tasks = _weighted_sample_without_replacement(
-        _base_task_weights(current, best, peer_a, peer_b, context), budget, rng
+        _exploration_task_weights(current, best, peer_a, peer_b, context), budget, rng
     )
     index_by_task = {int(gene[0]): index for index, gene in enumerate(child)}
     for task in tasks:
@@ -263,7 +348,7 @@ def odor_defense(current, best, context, progress, rng, memory=None, elite_maps=
     child = [tuple(int(value) for value in gene[:3]) for gene in current]
     current_map, best_map = provider_map(current), provider_map(best)
     budget = _changed_task_budget(len(child), progress, exploration=False)
-    rank = _rank_weights(context, current_map)
+    rank = _criticality_weights(context, current_map)
     anchors = _weighted_sample_without_replacement(
         [
             (
@@ -282,27 +367,74 @@ def odor_defense(current, best, context, progress, rng, memory=None, elite_maps=
     anchor = int(anchors[0])
     task_types = context.get("task_type_ids", {}) or {}
     anchor_type = task_types.get(anchor, task_types.get(str(anchor)))
+    ordered_tasks = list(current_map)
+    anchor_position = ordered_tasks.index(anchor)
+    # Cache placement can only benefit tasks that have not yet been scheduled.
+    # Coupling an anchor to an earlier same-service task spent search effort on
+    # a reuse that the sequential evaluator can no longer realize.
     same_service = [
         int(task)
-        for task in current_map
+        for task in ordered_tasks[anchor_position + 1 :]
         if task != anchor
         and anchor_type is not None
         and task_types.get(int(task), task_types.get(str(int(task)))) == anchor_type
-    ]
+    ] if bool(context.get("cpo_cache_coupling", True)) else []
+    # A useful cache-reuse proposal needs the placement anchor plus at least
+    # one later request, even after exploitation contracts late in the run.
+    extra_count = max(0, budget - 1)
+    if same_service:
+        extra_count = max(1, extra_count)
     extra = _weighted_sample_without_replacement(
         [(task, 0.40 + rank.get(task, 1.0)) for task in same_service],
-        max(0, budget - 1),
+        extra_count,
         rng,
     )
     tasks = [anchor] + extra
     index_by_task = {int(gene[0]): index for index, gene in enumerate(child)}
     anchor_target = best_map.get(anchor)
+    # The cache block must follow the provider that the anchor actually
+    # selects.  In the previous implementation, later same-service tasks kept
+    # following ``best_map[anchor]`` even when cache affinity or success/model
+    # memory moved the anchor somewhere else.  That split the intended block
+    # across providers and could not realise the proposed forward reuse.
+    selected_anchor_provider = None
     for task in tasks:
         current_provider = current_map[task]
         domain = valid_providers(context, task)
         elite_provider = best_map.get(task)
-        shared_provider = anchor_target if anchor_target in domain else None
-        if shared_provider is not None and shared_provider != current_provider and rng.random() < 0.55:
+        shared_target = (
+            selected_anchor_provider
+            if task != anchor and selected_anchor_provider is not None
+            else anchor_target
+        )
+        shared_provider = shared_target if shared_target in domain else None
+        cache_affinity = context.get("task_provider_cache_affinity", {}) or {}
+        task_affinity = cache_affinity.get(int(task), cache_affinity.get(str(int(task)), {}))
+        affinity_target = None
+        if bool(context.get("cpo_cache_coupling", True)) and isinstance(task_affinity, dict):
+            feasible_affinity = {
+                int(candidate): float(value)
+                for candidate, value in task_affinity.items()
+                if int(candidate) in domain and int(candidate) != int(current_provider)
+            }
+            if feasible_affinity:
+                best_affinity = max(feasible_affinity.values())
+                if best_affinity > 0.0:
+                    affinity_target = int(rng.choice([
+                        candidate for candidate, value in feasible_affinity.items()
+                        if abs(value - best_affinity) <= 1e-12
+                    ]))
+        if (
+            task != anchor
+            and selected_anchor_provider is not None
+            and selected_anchor_provider in domain
+        ):
+            # Keep the selected forward reuse block on the anchor's actual
+            # provider. The unchanged evaluator accepts or rejects the move.
+            provider = int(selected_anchor_provider)
+        elif affinity_target is not None and rng.random() < 0.45:
+            provider = affinity_target
+        elif shared_provider is not None and shared_provider != current_provider and rng.random() < 0.55:
             provider = int(shared_provider)
         elif elite_provider in domain and elite_provider != current_provider and rng.random() < 0.80:
             provider = int(elite_provider)
@@ -324,6 +456,10 @@ def odor_defense(current, best, context, progress, rng, memory=None, elite_maps=
         if provider is not None:
             index = index_by_task[task]
             child[index] = (int(task), int(provider), int(index))
+            if task == anchor:
+                selected_anchor_provider = int(provider)
+        elif task == anchor:
+            selected_anchor_provider = int(current_provider)
     return _force_change(child, current, context, rng, memory)
 
 
@@ -336,7 +472,7 @@ def physical_attack(current, best, context, progress, rng, memory=None, elite_ma
     """
     base = best if rng.random() < 0.88 else current
     child = [tuple(int(value) for value in gene[:3]) for gene in base]
-    rank = _rank_weights(context, [int(gene[0]) for gene in child])
+    rank = _criticality_weights(context, [int(gene[0]) for gene in child])
     mutable = []
     for index, (task, provider, _position) in enumerate(child):
         domain = valid_providers(context, task)

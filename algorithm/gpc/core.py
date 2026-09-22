@@ -73,15 +73,21 @@ def _deduplicate_ranked(rows):
     return result
 
 
-def _local_pharaoh_candidate(pharaoh, context, rng, memory=None):
+def _local_pharaoh_candidate(
+    pharaoh, context, rng, memory=None, *, problem_guidance=False
+):
     """One feasible single-task neighborhood move around the best worker."""
     result = [tuple(int(value) for value in gene[:3]) for gene in pharaoh]
-    learned = success_memory_mutation(result, context, rng, memory, probability=1.0, exploration_floor=0.10)
-    if _solution_key(learned) != _solution_key(result):
-        return context.repair_solution(learned)
-    guided = cache_aware_mutation(result, context, rng, probability=1.0)
-    if _solution_key(guided) != _solution_key(result):
-        return context.repair_solution(guided)
+    if problem_guidance:
+        learned = success_memory_mutation(
+            result, context, rng, memory,
+            probability=1.0, exploration_floor=0.10,
+        )
+        if _solution_key(learned) != _solution_key(result):
+            return context.repair_solution(learned)
+        guided = cache_aware_mutation(result, context, rng, probability=1.0)
+        if _solution_key(guided) != _solution_key(result):
+            return context.repair_solution(guided)
     mutable = []
     for index, (task, provider, _position) in enumerate(result):
         alternatives = [
@@ -99,7 +105,15 @@ def _local_pharaoh_candidate(pharaoh, context, rng, memory=None):
     return context.repair_solution(result)
 
 
-def _restart_from_pharaoh(pharaoh, context, rng, stagnation_counter, memory=None):
+def _restart_from_pharaoh(
+    pharaoh,
+    context,
+    rng,
+    stagnation_counter,
+    memory=None,
+    *,
+    problem_guidance=False,
+):
     """Generate a bounded long jump instead of a destructive full random nest."""
     candidate = adaptive_levy_escape(
         pharaoh,
@@ -113,11 +127,19 @@ def _restart_from_pharaoh(pharaoh, context, rng, stagnation_counter, memory=None
         context,
         rng,
         mutation_probability=1.0,
+        rank_guided=bool(problem_guidance),
     )
-    candidate = success_memory_mutation(candidate, context, rng, memory, probability=0.65, exploration_floor=0.35)
+    if problem_guidance:
+        candidate = success_memory_mutation(
+            candidate, context, rng, memory,
+            probability=0.65, exploration_floor=0.35,
+        )
     candidate = context.repair_solution(candidate)
     if _solution_key(candidate) == _solution_key(pharaoh):
-        candidate = _local_pharaoh_candidate(pharaoh, context, rng, memory)
+        candidate = _local_pharaoh_candidate(
+            pharaoh, context, rng, memory,
+            problem_guidance=problem_guidance,
+        )
     return candidate
 
 
@@ -133,7 +155,8 @@ def run_gpc(
     friction_min=DEFAULT_FRICTION_MIN,
     friction_max=DEFAULT_FRICTION_MAX,
     substitution_probability=DEFAULT_SUBSTITUTION_PROBABILITY,
-    service_memory_enabled=True,
+    service_memory_enabled=False,
+    problem_guidance=False,
     service_memory_weight=0.65,
     service_memory_evaporation=0.08,
     max_function_evaluations=None,
@@ -325,11 +348,13 @@ def run_gpc(
                 context,
                 rng,
                 mutation_probability,
+                rank_guided=bool(problem_guidance),
             )
-            moved = success_memory_mutation(
-                moved, context, rng, service_memory,
-                probability=min(0.45, 0.10 + 0.60 * mutation_probability),
-            )
+            if problem_guidance:
+                moved = success_memory_mutation(
+                    moved, context, rng, service_memory,
+                    probability=min(0.45, 0.10 + 0.60 * mutation_probability),
+                )
             moved = adaptive_levy_escape(
                 moved,
                 context,
@@ -337,12 +362,13 @@ def run_gpc(
                 stagnation_counter,
                 probability=min(0.45, 0.12 + 0.04 * stagnation_counter),
             )
-            moved = cache_aware_mutation(
-                moved,
-                context,
-                rng,
-                probability=0.5 * mutation_probability,
-            )
+            if problem_guidance:
+                moved = cache_aware_mutation(
+                    moved,
+                    context,
+                    rng,
+                    probability=0.5 * mutation_probability,
+                )
             try:
                 moved, moved_score = evaluate(moved)
             except _EvaluationBudgetReached:
@@ -362,6 +388,7 @@ def run_gpc(
                     rng,
                     stagnation_counter,
                     service_memory,
+                    problem_guidance=problem_guidance,
                 )
                 try:
                     replacement, replacement_score = evaluate(replacement)
@@ -386,7 +413,13 @@ def run_gpc(
         completed_local_trials = 0
         if not budget_exhausted:
             for _ in range(local_refinement_trials):
-                neighbor = _local_pharaoh_candidate(global_pharaoh, context, rng, service_memory)
+                neighbor = _local_pharaoh_candidate(
+                    global_pharaoh,
+                    context,
+                    rng,
+                    service_memory,
+                    problem_guidance=problem_guidance,
+                )
                 try:
                     neighbor, neighbor_score = evaluate(neighbor)
                     candidates.append((neighbor, neighbor_score))
@@ -417,6 +450,7 @@ def run_gpc(
                 rng,
                 stagnation_counter,
                 service_memory,
+                problem_guidance=problem_guidance,
             )
             key = _solution_key(replacement)
             if not key or key in pool_keys:
