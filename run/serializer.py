@@ -83,14 +83,6 @@ class BenchmarkRequestSerializer(StrictFieldsSerializer):
                 "to_v2i",
                 "to_wo_c",
                 "to_wo_r",
-                "gwo_aco",
-                "gwo",
-                "gpc",
-                "cpo",
-                "dcpo_base",
-                "dcpo_criticality",
-                "dcpo_cache",
-                "puma",
             ]
         ),
         required=False,
@@ -134,20 +126,6 @@ class BenchmarkRequestSerializer(StrictFieldsSerializer):
         default=False,
     )
 
-    def validate(self, attrs):
-        algorithms = attrs.get("algorithms") or []
-        population_size = attrs.get("population_size")
-        if (
-            population_size is not None
-            and ({"gwo", "gwo_aco"} & set(algorithms))
-            and int(population_size) < 3
-        ):
-            raise serializers.ValidationError({
-                "population_size": [
-                    "gwo requires population_size >= 3 for alpha, beta, and delta leaders."
-                ]
-            })
-        return attrs
 
 class PaperExperimentRequestSerializer(StrictFieldsSerializer):
     figure = serializers.ChoiceField(
@@ -169,14 +147,6 @@ class PaperExperimentRequestSerializer(StrictFieldsSerializer):
                 "to_v2i",
                 "to_wo_c",
                 "to_wo_r",
-                "gwo_aco",
-                "gwo",
-                "gpc",
-                "cpo",
-                "dcpo_base",
-                "dcpo_criticality",
-                "dcpo_cache",
-                "puma",
             ]
         ),
         required=False,
@@ -244,23 +214,12 @@ class PaperExperimentRequestSerializer(StrictFieldsSerializer):
     def validate(self, attrs):
         figure = attrs.get("figure")
         algorithms = attrs.get("algorithms") or []
-        population_size = attrs.get("population_size")
         diagnostic_vehicle_count = attrs.get("diagnostic_vehicle_count")
         diagnostic_road_vehicle_count = attrs.get("diagnostic_road_vehicle_count")
         diagnostic_sweep_values = attrs.get("diagnostic_sweep_values")
         experiment_mode = attrs.get("experiment_mode")
         max_function_evaluations = attrs.get("max_function_evaluations")
 
-        if (
-            population_size is not None
-            and ({"gwo", "gwo_aco"} & set(algorithms))
-            and int(population_size) < 3
-        ):
-            raise serializers.ValidationError({
-                "population_size": [
-                    "gwo requires population_size >= 3 for alpha, beta, and delta leaders."
-                ]
-            })
 
         if figure in {"all", "*"} and (
             diagnostic_vehicle_count is not None
@@ -298,21 +257,8 @@ class PaperExperimentRequestSerializer(StrictFieldsSerializer):
                 ]
             })
 
-        added_optimizers = {
-            "gpc", "gwo", "gwo_aco", "cpo", "dcpo_base",
-            "dcpo_criticality", "dcpo_cache", "puma",
-        }
-        if experiment_mode == "paper_reproduction" and set(algorithms) & added_optimizers:
-            raise serializers.ValidationError({
-                "experiment_mode": [
-                    "Added optimizers and CPO ablations are not algorithms printed in the original figure. Use fair_optimizer_comparison."
-                ]
-            })
         if (
-            (
-                experiment_mode == "fair_optimizer_comparison"
-                or set(algorithms) & added_optimizers
-            )
+            experiment_mode == "fair_optimizer_comparison"
             and max_function_evaluations is None
         ):
             raise serializers.ValidationError({

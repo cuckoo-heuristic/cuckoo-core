@@ -7,16 +7,10 @@ PAPER_REPRODUCTION = "paper_reproduction"
 FAIR_OPTIMIZER_COMPARISON = "fair_optimizer_comparison"
 EXPERIMENT_MODES = (PAPER_REPRODUCTION, FAIR_OPTIMIZER_COMPARISON)
 
-# DTOSC is deterministic here. The remaining schemes execute a population
-# search (DCSGA itself, a DCSGA ablation, or an added optimizer).
+# DTOSC is deterministic here. The remaining paper schemes execute DCSGA's
+# population search and can therefore be stopped by a common NFE budget.
 POPULATION_ALGORITHMS = frozenset(
-    {
-        "dcsga", "to_v2i", "to_wo_c", "to_wo_r", "gpc", "gwo", "gwo_aco",
-        "cpo", "dcpo_base", "dcpo_criticality", "dcpo_cache", "puma",
-    }
-)
-ADDED_OPTIMIZERS = frozenset(
-    {"gpc", "gwo", "gwo_aco", "cpo", "dcpo_base", "dcpo_criticality", "dcpo_cache", "puma"}
+    {"dcsga", "to_v2i", "to_wo_c", "to_wo_r"}
 )
 
 
@@ -31,8 +25,8 @@ def resolve_experiment_mode(
     """Resolve and enforce the scientific benchmark contract.
 
     Paper reproduction keeps the algorithm set and generation stopping rule of
-    the source figure. Added optimizer comparisons instead require one exact
-    objective-evaluation budget; equal generations are not equal compute.
+    the source figure. Fair comparisons instead require one exact objective-
+    evaluation budget; equal generations are not equal compute.
     """
     selected = tuple(
         dict.fromkeys(str(name).strip().lower() for name in selected_algorithms)
@@ -41,15 +35,11 @@ def resolve_experiment_mode(
         dict.fromkeys(str(name).strip().lower() for name in paper_algorithms)
     )
 
-    if requested_mode is None:
-        mode = (
-            FAIR_OPTIMIZER_COMPARISON
-            if set(selected) & ADDED_OPTIMIZERS
-            else PAPER_REPRODUCTION
-        )
-    else:
-        mode = str(requested_mode).strip().lower()
-
+    mode = (
+        PAPER_REPRODUCTION
+        if requested_mode is None
+        else str(requested_mode).strip().lower()
+    )
     if mode not in EXPERIMENT_MODES:
         raise ValueError(
             "experiment_mode must be 'paper_reproduction' or "
@@ -62,7 +52,8 @@ def resolve_experiment_mode(
             raise ValueError(
                 "paper_reproduction accepts only algorithms printed in the "
                 f"selected source figure; unsupported: {unsupported}. Use "
-                "experiment_mode='fair_optimizer_comparison' for added optimizers."
+                "experiment_mode='fair_optimizer_comparison' for a custom "
+                "NFE-controlled comparison."
             )
         if max_function_evaluations is not None:
             raise ValueError(
@@ -77,13 +68,14 @@ def resolve_experiment_mode(
             "fair_optimizer_comparison must be run one figure at a time because "
             "Figures 6-10 have different scenarios and source baselines."
         )
-    if not (set(selected) & ADDED_OPTIMIZERS):
+    if not (set(selected) & POPULATION_ALGORITHMS):
         raise ValueError(
-            "fair_optimizer_comparison must include at least one added optimizer."
+            "fair_optimizer_comparison must include at least one population "
+            "algorithm."
         )
-    if set(selected) & POPULATION_ALGORITHMS and max_function_evaluations is None:
+    if max_function_evaluations is None:
         raise ValueError(
             "fair_optimizer_comparison requires max_function_evaluations so "
-            "population optimizers use the same objective-call budget."
+            "population algorithms use the same objective-call budget."
         )
     return mode
