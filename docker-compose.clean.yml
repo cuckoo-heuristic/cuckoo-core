@@ -1,0 +1,28 @@
+﻿name: cuckoo_clean
+
+services:
+  db:
+    image: postgres:16
+    container_name: cuckoo_clean_db
+    environment:
+      POSTGRES_DB: cuckoo
+      POSTGRES_USER: cuckoo
+      POSTGRES_PASSWORD: cuckoo
+    ports:
+      - "5433:5432"
+    volumes:
+      - cuckoo_clean_pgdata:/var/lib/postgresql/data
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: cuckoo_clean_pgadmin
+    ports:
+      - "5051:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ali@example.com
+      PGADMIN_DEFAULT_PASSWORD: password
+    restart: unless-stopped
+
+volumes:
+  cuckoo_clean_pgdata:
+    name: cuckoo_clean_pgdata
