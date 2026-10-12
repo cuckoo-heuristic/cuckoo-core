@@ -126,10 +126,35 @@ def _v2i_pathloss_db(distance_m: float) -> float:
     return float(128.1 + 37.6 * log10(distance_km))
 
 
-def _winner_b1_los_pathloss_db(distance_m: float) -> float:
-    distance_m = max(float(distance_m), 10.0)
-    carrier_ghz = 2.0
-    return float(22.7 * log10(distance_m) + 41.0 + 20.0 * log10(carrier_ghz / 5.0))
+def _winner_b1_los_pathloss_db(
+    distance_m: float,
+    *,
+    tx_height_m: float = 1.5,
+    rx_height_m: float = 1.5,
+    carrier_ghz: float = 2.0,
+) -> float:
+    """WINNER+ B1 LOS path loss used by the paper's cited channel source [33].
+
+    The reference implementation is piecewise with a 3 m floor and a
+    breakpoint d_bp = 4(h_tx-1)(h_rx-1)fc/c.  The previous reconstruction
+    accidentally applied only the first-slope expression to all V2V links.
+    """
+    d = max(float(distance_m), 0.0)
+    h_tx = float(tx_height_m)
+    h_rx = float(rx_height_m)
+    f_ghz = float(carrier_ghz)
+    a, b, c = 22.7, 41.0, 20.0
+    d_bp = 4.0 * (h_tx - 1.0) * (h_rx - 1.0) * f_ghz * 1e9 / 3e8
+    if d <= 3.0:
+        return float(a * log10(3.0) + b + c * log10(f_ghz / 5.0))
+    if d <= d_bp:
+        return float(a * log10(d) + b + c * log10(f_ghz / 5.0))
+    return float(
+        40.0 * log10(d)
+        + 9.45
+        - 17.3 * log10((h_tx - 1.0) * (h_rx - 1.0))
+        + 2.7 * log10(f_ghz / 5.0)
+    )
 
 
 def channel_gain(ctx, sp_id: int, dst_sp_id: int | None = None) -> float:
@@ -159,12 +184,25 @@ def channel_gain(ctx, sp_id: int, dst_sp_id: int | None = None) -> float:
     is_v2i = src_type == "rsu" or dst_type == "rsu"
     sigma_db = float(params.sigma_v2i if is_v2i else params.sigma_v2v)
     distance_m = link_distance(ctx, src_sp_id, dst_sp_id)
-    pathloss_db = _v2i_pathloss_db(distance_m) if is_v2i else _winner_b1_los_pathloss_db(distance_m)
+    if is_v2i:
+        pathloss_db = _v2i_pathloss_db(distance_m)
+    else:
+        pathloss_db = _winner_b1_los_pathloss_db(
+            distance_m,
+            tx_height_m=_provider_height(ctx, src_sp_id),
+            rx_height_m=_provider_height(ctx, dst_sp_id),
+            carrier_ghz=2.0,
+        )
 
     src_gain_db = float(params.G_rsu if src_type == "rsu" else params.G_vehicle)
     dst_gain_db = float(params.G_rsu if dst_type == "rsu" else params.G_vehicle)
+    receiver_noise_figure_db = float(
+        params.rec_noi_rsu if dst_type == "rsu" else params.rec_noi_vehicle
+    )
     shadowing_linear, rayleigh_power = _fading_factors(ctx, src_sp_id, dst_sp_id, sigma_db)
-    mean_path_gain = 10.0 ** ((src_gain_db + dst_gain_db - pathloss_db) / 10.0)
+    mean_path_gain = 10.0 ** (
+        (src_gain_db + dst_gain_db - receiver_noise_figure_db - pathloss_db) / 10.0
+    )
 
     value = float(max(mean_path_gain * shadowing_linear * rayleigh_power, 1e-30))
     gain_cache[cache_key] = value

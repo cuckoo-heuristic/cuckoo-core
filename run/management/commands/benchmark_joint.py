@@ -41,7 +41,7 @@ class Command(BaseCommand):
             type=int,
             default=[1],
         )
-        parser.add_argument("--tmax", type=int, default=10)
+        parser.add_argument("--tmax", type=int, default=15)
         parser.add_argument(
             "--population-size",
             type=int,
@@ -105,7 +105,7 @@ class Command(BaseCommand):
                     application_ids,
                     algorithms=options.get("algorithms"),
                     seeds=options.get("seeds"),
-                    tmax=options.get("tmax", 10),
+                    tmax=options.get("tmax", 15),
                     population_size=options.get("population_size"),
                     max_function_evaluations=options.get(
                         "max_function_evaluations"

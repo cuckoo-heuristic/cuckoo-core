@@ -40,7 +40,7 @@ def v2i_channel_gain_for_access(
 
     The gain follows the same physical ingredients used elsewhere in the
     project: Table-III V2I path loss, log-normal shadowing, Rayleigh fast
-    fading, and vehicle/RSU antenna gains.
+    fading, vehicle/RSU antenna gains, and the RSU receiver noise figure.
     """
     vx, vy, vh = (float(position_xyz[0]), float(position_xyz[1]), float(position_xyz[2]))
     distance_m = float(
@@ -63,6 +63,7 @@ def v2i_channel_gain_for_access(
         (
             float(params.G_vehicle)
             + float(params.G_rsu)
+            - float(params.rec_noi_rsu)
             - pathloss_db
         )
         / 10.0

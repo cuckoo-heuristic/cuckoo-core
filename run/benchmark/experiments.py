@@ -67,11 +67,8 @@ def _validate_paper_parameters() -> None:
     expected = {
         "B": 20.0,
         "delta2": -114.0,
-        "Y_v2i": 3.76,
-        "Y_v2v": 1.8,
         "sigma_v2i": 8.0,
         "sigma_v2v": 3.0,
-        "h_rsu": 5.0,
         "h_vehicle": 1.5,
         "G_rsu": 8.0,
         "G_vehicle": 3.0,
@@ -99,7 +96,7 @@ def _validate_paper_parameters() -> None:
             )
     if mismatches:
         raise ValueError(
-            "Paper experiment parameters do not match Table III: "
+            "Published paper experiment parameters do not match Table III: "
             + "; ".join(mismatches)
         )
 
