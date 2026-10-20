@@ -1,7 +1,7 @@
 # CUCKOO CORE
+![header](https://github.com/user-attachments/assets/c30c5a48-8e34-4736-a26e-3bcbe1840e68)
 
-![CUCKOO CORE header](https://github.com/user-attachments/assets/056b0512-4708-4bc7-8331-1a4cf728caa1)
-
+## Description
 CUCKOO CORE is a research-oriented Django implementation of the task-scheduling and service-cache optimization framework presented in **“Cuckoo Search-Enabled Task Scheduling and Cache Updating in Vehicular Edge-Fog Computing.”**
 
 The repository focuses on reproducing the paper's system model, optimization workflow, and experimental benchmarks for vehicular edge–fog computing. It supports dependency-aware application scheduling, local/V2V/V2I execution, service-cache decisions, and reproducible evaluation of the resulting schedules.
@@ -32,7 +32,7 @@ Additional experimental optimization work is maintained separately until its acc
 
 Creating a virtual environment is recommended.
 
-## Installation
+## Usage
 
 ### 1. Clone the repository
 
